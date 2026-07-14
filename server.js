@@ -1,6 +1,21 @@
-import cors from "cors";
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
 
-app.use(cors({
-  origin: "http://localhost:5173",
-  credentials: true
-}));
+const authRoutes = require("./routes/auth");
+const timeEntryRoutes = require("./routes/timeEntries");
+const timesheetRoutes = require("./routes/timesheets");
+
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+app.use("/api/auth", authRoutes);
+app.use("/api/time-entries", timeEntryRoutes);
+app.use("/api/timesheets", timesheetRoutes);
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Site Clock API listening on port ${PORT}`));
