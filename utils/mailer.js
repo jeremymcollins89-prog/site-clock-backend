@@ -1,19 +1,10 @@
-const nodemailer = require("nodemailer");
-
-// Configure via env vars — works with SMTP (e.g. Google Workspace, Postmark,
-// SendGrid SMTP relay, etc). Swap for an HTTP-based provider SDK if you'd
-// rather avoid SMTP.
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || 587),
-  secure: process.env.SMTP_SECURE === "true",
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
-
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const OWNER_EMAIL = process.env.PAYROLL_EMAIL; // where timesheets get sent
+
+// Resend's shared sending address — works immediately with no domain setup.
+// Once you verify your own domain on resend.com, swap this for something
+// like "timesheets@yourdomain.com".
+const FROM_ADDRESS = process.env.RESEND_FROM || "Site Clock <onboarding@resend.dev>";
 
 function fmtDuration(totalSeconds) {
   const totalMin = Math.round(totalSeconds / 60);
@@ -67,13 +58,25 @@ async function sendTimesheetEmail({ employee, period, entries }) {
     </div>
   `;
 
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
-    to: OWNER_EMAIL,
-    cc: employee.email, // employee gets a copy of what was submitted
-    subject: `Timesheet — ${employee.name} — ${fmtDate(period.start)} to ${fmtDate(period.end)}`,
-    html,
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: FROM_ADDRESS,
+      to: [OWNER_EMAIL],
+      cc: [employee.email],
+      subject: `Timesheet — ${employee.name} — ${fmtDate(period.start)} to ${fmtDate(period.end)}`,
+      html,
+    }),
   });
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`Resend API error (${res.status}): ${errBody}`);
+  }
 }
 
 module.exports = { sendTimesheetEmail };
