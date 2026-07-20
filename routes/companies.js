@@ -4,8 +4,6 @@ const db = require("../db");
 const bcrypt = require("bcrypt");
 const { signAdminToken } = require("../utils/adminAuth");
 
-// POST /api/companies/signup
-// Body: { company_name, admin_email, admin_password }
 router.post("/signup", async (req, res) => {
   const { company_name, admin_email, admin_password } = req.body;
   if (!company_name || !admin_email || !admin_password) {

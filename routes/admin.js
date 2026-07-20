@@ -1,12 +1,10 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
-const { signAdminToken } = require("../utils/adminAuth");
+const { loginAdmin } = require("../utils/adminAuth");
 const { hashPin } = require("../utils/auth");
 const requireAdmin = require("../middleware/requireAdmin");
 const { getPayPeriod } = require("../utils/payPeriod");
-
-const { loginAdmin } = require("../utils/adminAuth");
 
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
@@ -25,7 +23,8 @@ router.use(requireAdmin);
 
 router.get("/employees", async (req, res) => {
   const result = await db.query(
-    `SELECT id, name, email, active, created_at FROM employees ORDER BY name`
+    `SELECT id, name, email, active, created_at FROM employees WHERE company_id = $1 ORDER BY name`,
+    [req.companyId]
   );
   res.json(result.rows);
 });
@@ -36,12 +35,19 @@ router.post("/employees", async (req, res) => {
     return res.status(400).json({ error: "name, email, and pin are required" });
   }
   const pin_hash = await hashPin(pin);
-  const result = await db.query(
-    `INSERT INTO employees (name, email, pin_hash) VALUES ($1, $2, $3)
-     RETURNING id, name, email, active, created_at`,
-    [name, email, pin_hash]
-  );
-  res.status(201).json(result.rows[0]);
+  try {
+    const result = await db.query(
+      `INSERT INTO employees (name, email, pin_hash, company_id) VALUES ($1, $2, $3, $4)
+       RETURNING id, name, email, active, created_at`,
+      [name, email, pin_hash, req.companyId]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(409).json({ error: "An employee with that email already exists" });
+    }
+    throw err;
+  }
 });
 
 router.patch("/employees/:id", async (req, res) => {
@@ -50,16 +56,16 @@ router.patch("/employees/:id", async (req, res) => {
 
   const fields = [];
   const values = [];
- if (name !== undefined) { values.push(name); fields.push(`name = $${values.length}`); }
+  if (name !== undefined) { values.push(name); fields.push(`name = $${values.length}`); }
   if (email !== undefined) { values.push(email); fields.push(`email = $${values.length}`); }
   if (active !== undefined) { values.push(active); fields.push(`active = $${values.length}`); }
   if (pin) { values.push(await hashPin(pin)); fields.push(`pin_hash = $${values.length}`); }
 
   if (fields.length === 0) return res.status(400).json({ error: "Nothing to update" });
 
-  values.push(id);
+  values.push(id, req.companyId);
   const result = await db.query(
-    `UPDATE employees SET ${fields.join(", ")} WHERE id = $${values.length}
+    `UPDATE employees SET ${fields.join(", ")} WHERE id = $${values.length - 1} AND company_id = $${values.length}
      RETURNING id, name, email, active, created_at`,
     values
   );
@@ -69,19 +75,18 @@ router.patch("/employees/:id", async (req, res) => {
 
 router.get("/time-entries", async (req, res) => {
   const { start, end, employee_id } = req.query;
-  const conditions = [];
-  const params = [];
+  const conditions = [`e.company_id = $1`];
+  const params = [req.companyId];
 
   if (start) { params.push(start); conditions.push(`d.clock_in >= $${params.length}`); }
   if (end) { params.push(end); conditions.push(`d.clock_in <= $${params.length}`); }
   if (employee_id) { params.push(employee_id); conditions.push(`d.employee_id = $${params.length}`); }
 
-  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   const result = await db.query(
     `SELECT d.*, e.name AS employee_name
      FROM time_entry_durations d
      JOIN employees e ON e.id = d.employee_id
-     ${where}
+     WHERE ${conditions.join(" AND ")}
      ORDER BY d.clock_in DESC`,
     params
   );
@@ -91,6 +96,13 @@ router.get("/time-entries", async (req, res) => {
 router.patch("/time-entries/:id", async (req, res) => {
   const { id } = req.params;
   const { job_name, location_type, clock_in, clock_out } = req.body;
+
+  const owns = await db.query(
+    `SELECT te.id FROM time_entries te JOIN employees e ON e.id = te.employee_id
+     WHERE te.id = $1 AND e.company_id = $2`,
+    [id, req.companyId]
+  );
+  if (owns.rowCount === 0) return res.status(404).json({ error: "Time entry not found" });
 
   const fields = [];
   const values = [];
@@ -106,20 +118,7 @@ router.patch("/time-entries/:id", async (req, res) => {
     `UPDATE time_entries SET ${fields.join(", ")} WHERE id = $${values.length} RETURNING *`,
     values
   );
-  if (result.rowCount === 0) return res.status(404).json({ error: "Time entry not found" });
   res.json(result.rows[0]);
-});
-
-router.get("/live-locations", async (req, res) => {
-  const result = await db.query(
-    `SELECT e.id AS employee_id, e.name, l.lat, l.lng, l.recorded_at, te.job_name, te.location_type
-     FROM employees e
-     JOIN time_entries te ON te.employee_id = e.id AND te.clock_out IS NULL
-     LEFT JOIN employee_locations l ON l.employee_id = e.id
-     WHERE l.recorded_at > now() - interval '15 minutes'
-     ORDER BY e.name`
-  );
-  res.json(result.rows);
 });
 
 router.get("/overview", async (req, res) => {
@@ -138,16 +137,20 @@ router.get("/overview", async (req, res) => {
      LEFT JOIN time_entries open_te ON open_te.employee_id = e.id AND open_te.clock_out IS NULL
      LEFT JOIN employee_locations l ON l.employee_id = e.id
      LEFT JOIN time_entry_durations d ON d.employee_id = e.id
-       AND d.clock_in >= $1 AND d.clock_in <= $2
+       AND d.clock_in >= $2 AND d.clock_in <= $3
+     WHERE e.company_id = $1
      GROUP BY e.id, e.name, e.active, open_te.id, open_te.job_name, open_te.location_type, open_te.clock_in, l.lat, l.lng, l.recorded_at
      ORDER BY e.active DESC, e.name`,
-    [period.start, period.end]
+    [req.companyId, period.start, period.end]
   );
   res.json({ period, employees: result.rows });
 });
 
 router.post("/employees/:id/request-ping", async (req, res) => {
   const { id } = req.params;
+  const owns = await db.query(`SELECT id FROM employees WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+  if (owns.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+
   const openShift = await db.query(
     `SELECT id FROM time_entries WHERE employee_id = $1 AND clock_out IS NULL`,
     [id]
@@ -162,4 +165,5 @@ router.post("/employees/:id/request-ping", async (req, res) => {
   );
   res.json({ requested: true });
 });
+
 module.exports = router;

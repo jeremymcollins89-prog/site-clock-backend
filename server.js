@@ -2,7 +2,6 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const companyRoutes = require("./routes/companies");
-
 const authRoutes = require("./routes/auth");
 const timeEntryRoutes = require("./routes/timeEntries");
 const timesheetRoutes = require("./routes/timesheets");

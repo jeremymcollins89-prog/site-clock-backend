@@ -9,14 +9,14 @@ const { signToken, hashPin, comparePin } = require("../utils/auth");
 // Returns a long-lived token the app stores locally so they never have
 // to re-enter their PIN on that device again.
 router.post("/login", async (req, res) => {
-  const { name, pin } = req.body;
+  const { email, pin } = req.body;
   if (!name || !pin) {
     return res.status(400).json({ error: "name and pin are required" });
   }
 
   const result = await db.query(
-    `SELECT * FROM employees WHERE name = $1 AND active = true`,
-    [name]
+    `SELECT * FROM employees WHERE email = $1 AND active = true`,
+[email]
   );
   if (result.rowCount === 0) {
     return res.status(401).json({ error: "Unknown employee name" });

@@ -5,7 +5,8 @@ function requireAdmin(req, res, next) {
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: "Missing token" });
   try {
-    verifyAdminToken(token);
+    const payload = verifyAdminToken(token);
+    req.companyId = payload.company_id;
     next();
   } catch {
     return res.status(401).json({ error: "Invalid or expired admin token" });

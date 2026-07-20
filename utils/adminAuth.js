@@ -14,7 +14,6 @@ function verifyAdminToken(token) {
   return payload;
 }
 
-// Real login: email + password, checked against a specific company's admin record
 async function loginAdmin(email, password) {
   const result = await db.query(`SELECT * FROM companies WHERE admin_email = $1`, [email]);
   if (result.rowCount === 0) throw new Error("Invalid email or password");
