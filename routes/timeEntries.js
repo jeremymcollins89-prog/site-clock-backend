@@ -111,7 +111,7 @@ router.get("/", async (req, res) => {
   );
   res.json(result.rows);
 });
-
+// cache-bust redeploy
 router.post("/ping-location", async (req, res) => {
   const employee_id = req.employee.employee_id;
   const { lat, lng } = req.body;
@@ -119,14 +119,7 @@ router.post("/ping-location", async (req, res) => {
     return res.status(400).json({ error: "lat and lng are required numbers" });
   }
 
-  const now = new Date();
-  const hour = now.getHours();
-  const minute = now.getMinutes();
-  const withinBusinessHours = hour > 8 || (hour === 8 && minute >= 0);
-  const beforeClose = hour < 16 || (hour === 16 && minute <= 30);
-  if (!withinBusinessHours || !beforeClose) {
-    return res.json({ stored: false, reason: "outside business hours" });
-  }
+  
 
   const openShift = await db.query(
     `SELECT id FROM time_entries WHERE employee_id = $1 AND clock_out IS NULL`,
