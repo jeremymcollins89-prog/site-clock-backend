@@ -6,12 +6,19 @@ const { hashPin } = require("../utils/auth");
 const requireAdmin = require("../middleware/requireAdmin");
 const { getPayPeriod } = require("../utils/payPeriod");
 
+const { loginAdmin } = require("../utils/adminAuth");
+
 router.post("/login", async (req, res) => {
-  const { admin_key } = req.body;
-  if (admin_key !== process.env.ADMIN_KEY) {
-    return res.status(401).json({ error: "Incorrect admin key" });
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: "email and password are required" });
   }
-  res.json({ token: signAdminToken() });
+  try {
+    const result = await loginAdmin(email, password);
+    res.json(result);
+  } catch (err) {
+    res.status(401).json({ error: err.message });
+  }
 });
 
 router.use(requireAdmin);

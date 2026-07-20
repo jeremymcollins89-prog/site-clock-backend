@@ -1,6 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const companyRoutes = require("./routes/companies");
 
 const authRoutes = require("./routes/auth");
 const timeEntryRoutes = require("./routes/timeEntries");
@@ -18,6 +19,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/time-entries", timeEntryRoutes);
 app.use("/api/timesheets", timesheetRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/companies", companyRoutes);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Site Clock API listening on port ${PORT}`));
