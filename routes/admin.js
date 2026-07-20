@@ -124,18 +124,21 @@ router.get("/overview", async (req, res) => {
        open_te.job_name AS open_job_name,
        open_te.location_type AS open_location_type,
        open_te.clock_in AS open_clock_in,
+       l.lat, l.lng, l.recorded_at AS location_recorded_at,
        COALESCE(SUM(d.worked_seconds) FILTER (WHERE d.location_type = 'in_town'), 0) AS regular_seconds,
        COALESCE(SUM(d.worked_seconds) FILTER (WHERE d.location_type = 'traveling'), 0) AS travel_seconds
      FROM employees e
      LEFT JOIN time_entries open_te ON open_te.employee_id = e.id AND open_te.clock_out IS NULL
+     LEFT JOIN employee_locations l ON l.employee_id = e.id
      LEFT JOIN time_entry_durations d ON d.employee_id = e.id
        AND d.clock_in >= $1 AND d.clock_in <= $2
-     GROUP BY e.id, e.name, e.active, open_te.id, open_te.job_name, open_te.location_type, open_te.clock_in
+     GROUP BY e.id, e.name, e.active, open_te.id, open_te.job_name, open_te.location_type, open_te.clock_in, l.lat, l.lng, l.recorded_at
      ORDER BY e.active DESC, e.name`,
     [period.start, period.end]
   );
   res.json({ period, employees: result.rows });
 });
+
 router.post("/employees/:id/request-ping", async (req, res) => {
   const { id } = req.params;
   const openShift = await db.query(
