@@ -138,6 +138,13 @@ router.get("/overview", async (req, res) => {
 });
 router.post("/employees/:id/request-ping", async (req, res) => {
   const { id } = req.params;
+  const openShift = await db.query(
+    `SELECT id FROM time_entries WHERE employee_id = $1 AND clock_out IS NULL`,
+    [id]
+  );
+  if (openShift.rowCount === 0) {
+    return res.status(400).json({ error: "Employee is not currently clocked in" });
+  }
   await db.query(
     `INSERT INTO ping_requests (employee_id, requested_at) VALUES ($1, now())
      ON CONFLICT (employee_id) DO UPDATE SET requested_at = now()`,
