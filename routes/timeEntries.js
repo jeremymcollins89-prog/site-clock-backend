@@ -145,4 +145,18 @@ router.post("/ping-location", async (req, res) => {
   res.json({ stored: true });
 });
 
-module.exports = router;
+router.get("/ping-status", async (req, res) => {
+  const employee_id = req.employee.employee_id;
+  const result = await db.query(
+    `SELECT pr.requested_at, l.recorded_at
+     FROM ping_requests pr
+     LEFT JOIN employee_locations l ON l.employee_id = pr.employee_id
+     WHERE pr.employee_id = $1`,
+    [employee_id]
+  );
+  if (result.rowCount === 0) return res.json({ shouldPing: false });
+  const { requested_at, recorded_at } = result.rows[0];
+  const shouldPing = !recorded_at || new Date(requested_at) > new Date(recorded_at);
+  res.json({ shouldPing });
+});
+module.exports = router;  

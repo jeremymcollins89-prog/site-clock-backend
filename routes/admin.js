@@ -136,5 +136,13 @@ router.get("/overview", async (req, res) => {
   );
   res.json({ period, employees: result.rows });
 });
-
+router.post("/employees/:id/request-ping", async (req, res) => {
+  const { id } = req.params;
+  await db.query(
+    `INSERT INTO ping_requests (employee_id, requested_at) VALUES ($1, now())
+     ON CONFLICT (employee_id) DO UPDATE SET requested_at = now()`,
+    [id]
+  );
+  res.json({ requested: true });
+});
 module.exports = router;
