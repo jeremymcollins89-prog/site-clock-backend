@@ -181,13 +181,20 @@ router.patch("/employees/:id", async (req, res) => {
   if (fields.length === 0) return res.status(400).json({ error: "Nothing to update" });
 
   values.push(id, req.companyId);
-  const result = await db.query(
-    `UPDATE employees SET ${fields.join(", ")} WHERE id = $${values.length - 1} AND company_id = $${values.length}
-     RETURNING id, name, email, active, created_at`,
-    values
-  );
-  if (result.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
-  res.json(result.rows[0]);
+  try {
+    const result = await db.query(
+      `UPDATE employees SET ${fields.join(", ")} WHERE id = $${values.length - 1} AND company_id = $${values.length}
+       RETURNING id, name, email, active, created_at`,
+      values
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    res.json(result.rows[0]);
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(409).json({ error: "An employee with that email already exists" });
+    }
+    throw err;
+  }
 });
 
 router.get("/time-entries", async (req, res) => {
