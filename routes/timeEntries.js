@@ -109,7 +109,21 @@ router.get("/", async (req, res) => {
     `SELECT * FROM time_entry_durations ${where} ORDER BY clock_in DESC`,
     params
   );
-  res.json(result.rows);
+  const rows = result.rows;
+
+  // If the currently open shift also has an open break, attach when that
+  // break started — the app uses this to restore "on break" (rather than
+  // just "working") when it's closed and reopened mid-break.
+  const openRow = rows.find((r) => !r.clock_out);
+  if (openRow) {
+    const breakResult = await db.query(
+      `SELECT break_start FROM time_entry_breaks WHERE time_entry_id = $1 AND break_end IS NULL`,
+      [openRow.time_entry_id]
+    );
+    openRow.open_break_start = breakResult.rowCount > 0 ? breakResult.rows[0].break_start : null;
+  }
+
+  res.json(rows);
 });
 // cache-bust redeploy
 router.post("/ping-location", async (req, res) => {
