@@ -12,11 +12,23 @@ const requireAuth = require("../middleware/requireAuth");
 router.post("/submit", requireAuth, async (req, res) => {
   const employee_id = req.employee.employee_id;
 
-  const employeeResult = await db.query(`SELECT * FROM employees WHERE id = $1`, [employee_id]);
+  const employeeResult = await db.query(
+    `SELECT e.*, c.payroll_email
+     FROM employees e
+     LEFT JOIN companies c ON c.id = e.company_id
+     WHERE e.id = $1`,
+    [employee_id]
+  );
   if (employeeResult.rowCount === 0) {
     return res.status(404).json({ error: "Employee not found" });
   }
   const employee = employeeResult.rows[0];
+
+  if (!employee.payroll_email) {
+    return res.status(400).json({
+      error: "Payroll email hasn't been set up for your company yet. Ask your admin to set it in the desktop app's Settings tab.",
+    });
+  }
 
   const period = getPayPeriod(new Date());
 
@@ -34,7 +46,7 @@ router.post("/submit", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "No unsubmitted hours in the current pay period" });
   }
 
-  await sendTimesheetEmail({ employee, period, entries: entriesResult.rows });
+  await sendTimesheetEmail({ employee, period, entries: entriesResult.rows, payrollEmail: employee.payroll_email });
 
   const ids = entriesResult.rows.map((e) => e.time_entry_id);
   await db.query(

@@ -1,5 +1,4 @@
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const OWNER_EMAIL = process.env.PAYROLL_EMAIL; // where timesheets get sent
 
 // Resend's shared sending address — works immediately with no domain setup.
 // Once you verify your own domain on resend.com, swap this for something
@@ -25,8 +24,11 @@ function fmtTime(d) {
   return new Date(d).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
 }
 
-// entries: rows from time_entry_durations for one employee + pay period
-async function sendTimesheetEmail({ employee, period, entries }) {
+// entries: rows from time_entry_durations for one employee + pay period.
+// payrollEmail: this employee's own company's payroll inbox — never a
+// global fallback, since that would risk sending one company's timesheet
+// data to a different company's owner.
+async function sendTimesheetEmail({ employee, period, entries, payrollEmail }) {
   const totalSeconds = entries.reduce((s, e) => s + Number(e.worked_seconds || 0), 0);
 
   const rows = entries
@@ -70,7 +72,7 @@ async function sendTimesheetEmail({ employee, period, entries }) {
     },
     body: JSON.stringify({
       from: FROM_ADDRESS,
-      to: [OWNER_EMAIL],
+      to: [payrollEmail],
       cc: [employee.email],
       subject: `Timesheet — ${employee.name} — ${fmtDate(period.start)} to ${fmtDate(period.end)}`,
       html,

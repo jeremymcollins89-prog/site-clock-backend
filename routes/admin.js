@@ -130,6 +130,29 @@ router.post("/change-email", async (req, res) => {
   }
 });
 
+// GET /api/admin/payroll-email
+// Returns this company's payroll inbox — where "Submit Hours for Payroll"
+// sends timesheet emails. Null until the admin sets it here.
+router.get("/payroll-email", async (req, res) => {
+  const result = await db.query(`SELECT payroll_email FROM companies WHERE id = $1`, [req.companyId]);
+  if (result.rowCount === 0) return res.status(404).json({ error: "Company not found" });
+  res.json(result.rows[0]);
+});
+
+// PATCH /api/admin/payroll-email
+// Body: { payroll_email }
+router.patch("/payroll-email", async (req, res) => {
+  const { payroll_email } = req.body;
+  if (!payroll_email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payroll_email)) {
+    return res.status(400).json({ error: "A valid payroll_email is required" });
+  }
+  const result = await db.query(
+    `UPDATE companies SET payroll_email = $1 WHERE id = $2 RETURNING payroll_email`,
+    [payroll_email, req.companyId]
+  );
+  res.json(result.rows[0]);
+});
+
 // GET /api/admin/shop-location
 // Returns this company's shop coordinates and auto clock-out cutoff time,
 // used by the employee app for geo-based auto clock-in/out. shop_lat/shop_lng
