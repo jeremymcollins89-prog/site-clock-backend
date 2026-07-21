@@ -103,6 +103,33 @@ router.post("/change-password", async (req, res) => {
   res.json({ message: "Password updated" });
 });
 
+// POST /api/admin/change-email
+// Body: { new_email, current_password }
+// Authenticated — requires the current password as proof, since the email
+// doubles as the admin login username.
+router.post("/change-email", async (req, res) => {
+  const { new_email, current_password } = req.body;
+  if (!new_email || !current_password) {
+    return res.status(400).json({ error: "new_email and current_password are required" });
+  }
+
+  const result = await db.query(`SELECT admin_password_hash FROM companies WHERE id = $1`, [req.companyId]);
+  if (result.rowCount === 0) return res.status(404).json({ error: "Company not found" });
+
+  const valid = await bcrypt.compare(current_password, result.rows[0].admin_password_hash);
+  if (!valid) return res.status(401).json({ error: "Current password is incorrect" });
+
+  try {
+    await db.query(`UPDATE companies SET admin_email = $1 WHERE id = $2`, [new_email, req.companyId]);
+    res.json({ message: "Email updated" });
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(409).json({ error: "Another account already uses that email" });
+    }
+    throw err;
+  }
+});
+
 // GET /api/admin/shop-location
 // Returns this company's shop coordinates, used by the employee app for
 // geo-based auto clock-in/out. shop_lat/shop_lng are null until the admin
