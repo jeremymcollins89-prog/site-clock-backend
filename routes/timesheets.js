@@ -46,7 +46,12 @@ router.post("/submit", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "No unsubmitted hours in the current pay period" });
   }
 
-  await sendTimesheetEmail({ employee, period, entries: entriesResult.rows, payrollEmail: employee.payroll_email });
+  try {
+    await sendTimesheetEmail({ employee, period, entries: entriesResult.rows, payrollEmail: employee.payroll_email });
+  } catch (err) {
+    console.error("Failed to send timesheet email:", err.message);
+    return res.status(502).json({ error: `Couldn't send the timesheet email: ${err.message}` });
+  }
 
   const ids = entriesResult.rows.map((e) => e.time_entry_id);
   await db.query(
