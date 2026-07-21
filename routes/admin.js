@@ -131,12 +131,13 @@ router.post("/change-email", async (req, res) => {
 });
 
 // GET /api/admin/shop-location
-// Returns this company's shop coordinates, used by the employee app for
-// geo-based auto clock-in/out. shop_lat/shop_lng are null until the admin
-// sets them here.
+// Returns this company's shop coordinates and auto clock-out cutoff time,
+// used by the employee app for geo-based auto clock-in/out. shop_lat/shop_lng
+// are null until the admin sets them here; auto_clockout_time defaults to
+// 4:30pm until changed.
 router.get("/shop-location", async (req, res) => {
   const result = await db.query(
-    `SELECT shop_lat, shop_lng, shop_radius_m FROM companies WHERE id = $1`,
+    `SELECT shop_lat, shop_lng, shop_radius_m, auto_clockout_time FROM companies WHERE id = $1`,
     [req.companyId]
   );
   if (result.rowCount === 0) return res.status(404).json({ error: "Company not found" });
@@ -144,9 +145,10 @@ router.get("/shop-location", async (req, res) => {
 });
 
 // PATCH /api/admin/shop-location
-// Body: { shop_lat, shop_lng, shop_radius_m }
+// Body: { shop_lat, shop_lng, shop_radius_m, auto_clockout_time }
+// auto_clockout_time is optional and expected as "HH:MM" (24-hour).
 router.patch("/shop-location", async (req, res) => {
-  const { shop_lat, shop_lng, shop_radius_m } = req.body;
+  const { shop_lat, shop_lng, shop_radius_m, auto_clockout_time } = req.body;
   if (shop_lat == null || shop_lng == null) {
     return res.status(400).json({ error: "shop_lat and shop_lng are required" });
   }
@@ -156,11 +158,22 @@ router.patch("/shop-location", async (req, res) => {
   if (!Number.isFinite(lat) || !Number.isFinite(lng) || !Number.isFinite(radius)) {
     return res.status(400).json({ error: "shop_lat, shop_lng, and shop_radius_m must be numbers" });
   }
+  if (auto_clockout_time != null && !/^\d{1,2}:\d{2}(:\d{2})?$/.test(auto_clockout_time)) {
+    return res.status(400).json({ error: "auto_clockout_time must be in HH:MM format" });
+  }
+
+  const fields = ["shop_lat = $1", "shop_lng = $2", "shop_radius_m = $3"];
+  const values = [lat, lng, radius];
+  if (auto_clockout_time) {
+    values.push(auto_clockout_time);
+    fields.push(`auto_clockout_time = $${values.length}`);
+  }
+  values.push(req.companyId);
 
   const result = await db.query(
-    `UPDATE companies SET shop_lat = $1, shop_lng = $2, shop_radius_m = $3 WHERE id = $4
-     RETURNING shop_lat, shop_lng, shop_radius_m`,
-    [lat, lng, radius, req.companyId]
+    `UPDATE companies SET ${fields.join(", ")} WHERE id = $${values.length}
+     RETURNING shop_lat, shop_lng, shop_radius_m, auto_clockout_time`,
+    values
   );
   res.json(result.rows[0]);
 });
