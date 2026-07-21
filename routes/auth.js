@@ -17,7 +17,10 @@ router.post("/login", async (req, res) => {
   }
 
   const result = await db.query(
-    `SELECT * FROM employees WHERE email = $1 AND active = true`,
+    `SELECT e.*, c.shop_lat, c.shop_lng, c.shop_radius_m
+     FROM employees e
+     LEFT JOIN companies c ON c.id = e.company_id
+     WHERE e.email = $1 AND e.active = true`,
     [email]
   );
   if (result.rowCount === 0) {
@@ -31,7 +34,17 @@ router.post("/login", async (req, res) => {
   }
 
   const token = signToken(employee);
-  res.json({ token, employee: { id: employee.id, name: employee.name, email: employee.email } });
+  res.json({
+    token,
+    employee: {
+      id: employee.id,
+      name: employee.name,
+      email: employee.email,
+      shop_lat: employee.shop_lat,
+      shop_lng: employee.shop_lng,
+      shop_radius_m: employee.shop_radius_m,
+    },
+  });
 });
 
 // POST /api/auth/forgot-pin
@@ -93,9 +106,13 @@ router.post("/reset-pin", async (req, res) => {
 // on launch, and get fresh employee info, without re-prompting for a PIN.
 const requireAuth = require("../middleware/requireAuth");
 router.get("/me", requireAuth, async (req, res) => {
-  const result = await db.query(`SELECT id, name, email FROM employees WHERE id = $1`, [
-    req.employee.employee_id,
-  ]);
+  const result = await db.query(
+    `SELECT e.id, e.name, e.email, c.shop_lat, c.shop_lng, c.shop_radius_m
+     FROM employees e
+     LEFT JOIN companies c ON c.id = e.company_id
+     WHERE e.id = $1`,
+    [req.employee.employee_id]
+  );
   if (result.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
   res.json(result.rows[0]);
 });

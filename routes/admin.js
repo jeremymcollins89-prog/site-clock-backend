@@ -103,6 +103,41 @@ router.post("/change-password", async (req, res) => {
   res.json({ message: "Password updated" });
 });
 
+// GET /api/admin/shop-location
+// Returns this company's shop coordinates, used by the employee app for
+// geo-based auto clock-in/out. shop_lat/shop_lng are null until the admin
+// sets them here.
+router.get("/shop-location", async (req, res) => {
+  const result = await db.query(
+    `SELECT shop_lat, shop_lng, shop_radius_m FROM companies WHERE id = $1`,
+    [req.companyId]
+  );
+  if (result.rowCount === 0) return res.status(404).json({ error: "Company not found" });
+  res.json(result.rows[0]);
+});
+
+// PATCH /api/admin/shop-location
+// Body: { shop_lat, shop_lng, shop_radius_m }
+router.patch("/shop-location", async (req, res) => {
+  const { shop_lat, shop_lng, shop_radius_m } = req.body;
+  if (shop_lat == null || shop_lng == null) {
+    return res.status(400).json({ error: "shop_lat and shop_lng are required" });
+  }
+  const lat = Number(shop_lat);
+  const lng = Number(shop_lng);
+  const radius = shop_radius_m != null ? Number(shop_radius_m) : 152;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || !Number.isFinite(radius)) {
+    return res.status(400).json({ error: "shop_lat, shop_lng, and shop_radius_m must be numbers" });
+  }
+
+  const result = await db.query(
+    `UPDATE companies SET shop_lat = $1, shop_lng = $2, shop_radius_m = $3 WHERE id = $4
+     RETURNING shop_lat, shop_lng, shop_radius_m`,
+    [lat, lng, radius, req.companyId]
+  );
+  res.json(result.rows[0]);
+});
+
 router.get("/employees", async (req, res) => {
   const result = await db.query(
     `SELECT id, name, email, active, created_at FROM employees WHERE company_id = $1 ORDER BY name`,
