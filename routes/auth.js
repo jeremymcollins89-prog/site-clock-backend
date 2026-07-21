@@ -2,6 +2,8 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const { signToken, hashPin, comparePin } = require("../utils/auth");
+const { generateResetToken, hashResetToken } = require("../utils/resetToken");
+const { sendEmployeePinResetEmail } = require("../utils/mailer");
 
 // POST /api/auth/login
 // Body: { name, pin }
@@ -30,6 +32,61 @@ router.post("/login", async (req, res) => {
 
   const token = signToken(employee);
   res.json({ token, employee: { id: employee.id, name: employee.name, email: employee.email } });
+});
+
+// POST /api/auth/forgot-pin
+// Body: { email }
+// Public — no auth required, since the whole point is recovering access.
+// Always responds the same way whether or not the email exists, so this
+// endpoint can't be used to find out which emails have accounts.
+router.post("/forgot-pin", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email is required" });
+
+  const result = await db.query(
+    `SELECT id, name FROM employees WHERE email = $1 AND active = true`,
+    [email]
+  );
+  if (result.rowCount > 0) {
+    const employee = result.rows[0];
+    const { token, tokenHash } = generateResetToken();
+    await db.query(
+      `UPDATE employees SET reset_token_hash = $1, reset_token_expires = now() + interval '1 hour' WHERE id = $2`,
+      [tokenHash, employee.id]
+    );
+    try {
+      await sendEmployeePinResetEmail({ to: email, name: employee.name, token });
+    } catch (err) {
+      console.error("Failed to send PIN reset email:", err.message);
+    }
+  }
+  res.json({ message: "If that email has an account, a reset link has been sent." });
+});
+
+// POST /api/auth/reset-pin
+// Body: { token, new_pin }
+// Public — the token itself (emailed via forgot-pin) is the proof of identity.
+router.post("/reset-pin", async (req, res) => {
+  const { token, new_pin } = req.body;
+  if (!token || !new_pin) {
+    return res.status(400).json({ error: "token and new_pin are required" });
+  }
+
+  const tokenHash = hashResetToken(token);
+  const result = await db.query(
+    `SELECT id FROM employees WHERE reset_token_hash = $1 AND reset_token_expires > now()`,
+    [tokenHash]
+  );
+  if (result.rowCount === 0) {
+    return res.status(400).json({ error: "This reset link is invalid or has expired" });
+  }
+
+  const pin_hash = await hashPin(new_pin);
+  await db.query(
+    `UPDATE employees SET pin_hash = $1, reset_token_hash = NULL, reset_token_expires = NULL WHERE id = $2`,
+    [pin_hash, result.rows[0].id]
+  );
+  res.json({ message: "PIN updated. You can now log in." });
 });
 
 // GET /api/auth/me  — lets the app verify a stored token is still valid

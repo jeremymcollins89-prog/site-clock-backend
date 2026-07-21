@@ -6,6 +6,10 @@ const OWNER_EMAIL = process.env.PAYROLL_EMAIL; // where timesheets get sent
 // like "timesheets@yourdomain.com".
 const FROM_ADDRESS = process.env.RESEND_FROM || "Site Clock <onboarding@resend.dev>";
 
+// Where the employee PWA (and its static reset pages) are hosted. Used to
+// build clickable links in reset emails.
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://site-clock-frontend-production.up.railway.app";
+
 function fmtDuration(totalSeconds) {
   const totalMin = Math.round(totalSeconds / 60);
   const h = Math.floor(totalMin / 60);
@@ -79,4 +83,70 @@ async function sendTimesheetEmail({ employee, period, entries }) {
   }
 }
 
-module.exports = { sendTimesheetEmail };
+// Sent when a company admin requests a password reset. The link opens a
+// static page in the frontend site where they set a new password.
+async function sendAdminPasswordResetEmail({ to, token }) {
+  const resetUrl = `${FRONTEND_URL}/admin-reset-password.html?token=${token}`;
+  const html = `
+    <div style="font-family: -apple-system, sans-serif;">
+      <h2>Reset your Site Clock admin password</h2>
+      <p>Click the link below to set a new password. This link expires in 1 hour.</p>
+      <p><a href="${resetUrl}">${resetUrl}</a></p>
+      <p style="color:#8A8578; font-size:13px;">If you didn't request this, you can safely ignore this email.</p>
+    </div>
+  `;
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: FROM_ADDRESS,
+      to: [to],
+      subject: "Reset your Site Clock password",
+      html,
+    }),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`Resend API error (${res.status}): ${errBody}`);
+  }
+}
+
+// Sent when an employee requests a PIN reset. The link opens a static page
+// in the frontend site where they set a new PIN.
+async function sendEmployeePinResetEmail({ to, name, token }) {
+  const resetUrl = `${FRONTEND_URL}/reset-pin.html?token=${token}`;
+  const html = `
+    <div style="font-family: -apple-system, sans-serif;">
+      <h2>Reset your Site Clock PIN</h2>
+      <p>Hi ${name}, click the link below to set a new PIN. This link expires in 1 hour.</p>
+      <p><a href="${resetUrl}">${resetUrl}</a></p>
+      <p style="color:#8A8578; font-size:13px;">If you didn't request this, you can safely ignore this email.</p>
+    </div>
+  `;
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: FROM_ADDRESS,
+      to: [to],
+      subject: "Reset your Site Clock PIN",
+      html,
+    }),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`Resend API error (${res.status}): ${errBody}`);
+  }
+}
+
+module.exports = { sendTimesheetEmail, sendAdminPasswordResetEmail, sendEmployeePinResetEmail };

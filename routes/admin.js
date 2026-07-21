@@ -1,8 +1,11 @@
 const express = require("express");
 const router = express.Router();
+const bcrypt = require("bcrypt");
 const db = require("../db");
 const { loginAdmin } = require("../utils/adminAuth");
 const { hashPin } = require("../utils/auth");
+const { generateResetToken, hashResetToken } = require("../utils/resetToken");
+const { sendAdminPasswordResetEmail } = require("../utils/mailer");
 const requireAdmin = require("../middleware/requireAdmin");
 const { getPayPeriod } = require("../utils/payPeriod");
 
@@ -19,7 +22,86 @@ router.post("/login", async (req, res) => {
   }
 });
 
+// POST /api/admin/forgot-password
+// Body: { email }
+// Public — no auth required, since the whole point is recovering access.
+// Always responds the same way whether or not the email exists, so this
+// endpoint can't be used to find out which emails have accounts.
+router.post("/forgot-password", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email is required" });
+
+  const result = await db.query(`SELECT id FROM companies WHERE admin_email = $1`, [email]);
+  if (result.rowCount > 0) {
+    const { token, tokenHash } = generateResetToken();
+    await db.query(
+      `UPDATE companies SET reset_token_hash = $1, reset_token_expires = now() + interval '1 hour' WHERE id = $2`,
+      [tokenHash, result.rows[0].id]
+    );
+    try {
+      await sendAdminPasswordResetEmail({ to: email, token });
+    } catch (err) {
+      console.error("Failed to send admin password reset email:", err.message);
+    }
+  }
+  res.json({ message: "If that email has an account, a reset link has been sent." });
+});
+
+// POST /api/admin/reset-password
+// Body: { token, new_password }
+// Public — the token itself (emailed via forgot-password) is the proof of
+// identity here.
+router.post("/reset-password", async (req, res) => {
+  const { token, new_password } = req.body;
+  if (!token || !new_password) {
+    return res.status(400).json({ error: "token and new_password are required" });
+  }
+  if (new_password.length < 8) {
+    return res.status(400).json({ error: "Password must be at least 8 characters" });
+  }
+
+  const tokenHash = hashResetToken(token);
+  const result = await db.query(
+    `SELECT id FROM companies WHERE reset_token_hash = $1 AND reset_token_expires > now()`,
+    [tokenHash]
+  );
+  if (result.rowCount === 0) {
+    return res.status(400).json({ error: "This reset link is invalid or has expired" });
+  }
+
+  const password_hash = await bcrypt.hash(new_password, 12);
+  await db.query(
+    `UPDATE companies SET admin_password_hash = $1, reset_token_hash = NULL, reset_token_expires = NULL WHERE id = $2`,
+    [password_hash, result.rows[0].id]
+  );
+  res.json({ message: "Password updated. You can now log in." });
+});
+
 router.use(requireAdmin);
+
+// POST /api/admin/change-password
+// Body: { current_password, new_password }
+// Authenticated — for an admin who's already logged in and knows their
+// current password, but wants to update it.
+router.post("/change-password", async (req, res) => {
+  const { current_password, new_password } = req.body;
+  if (!current_password || !new_password) {
+    return res.status(400).json({ error: "current_password and new_password are required" });
+  }
+  if (new_password.length < 8) {
+    return res.status(400).json({ error: "New password must be at least 8 characters" });
+  }
+
+  const result = await db.query(`SELECT admin_password_hash FROM companies WHERE id = $1`, [req.companyId]);
+  if (result.rowCount === 0) return res.status(404).json({ error: "Company not found" });
+
+  const valid = await bcrypt.compare(current_password, result.rows[0].admin_password_hash);
+  if (!valid) return res.status(401).json({ error: "Current password is incorrect" });
+
+  const password_hash = await bcrypt.hash(new_password, 12);
+  await db.query(`UPDATE companies SET admin_password_hash = $1 WHERE id = $2`, [password_hash, req.companyId]);
+  res.json({ message: "Password updated" });
+});
 
 router.get("/employees", async (req, res) => {
   const result = await db.query(
