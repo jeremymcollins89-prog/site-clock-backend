@@ -10,16 +10,16 @@ const { signToken, hashPin, comparePin } = require("../utils/auth");
 // to re-enter their PIN on that device again.
 router.post("/login", async (req, res) => {
   const { email, pin } = req.body;
-  if (!name || !pin) {
-    return res.status(400).json({ error: "name and pin are required" });
+  if (!email || !pin) {
+    return res.status(400).json({ error: "email and pin are required" });
   }
 
   const result = await db.query(
     `SELECT * FROM employees WHERE email = $1 AND active = true`,
-[email]
+    [email]
   );
   if (result.rowCount === 0) {
-    return res.status(401).json({ error: "Unknown employee name" });
+    return res.status(401).json({ error: "Unknown employee email" });
   }
 
   const employee = result.rows[0];
