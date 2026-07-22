@@ -119,13 +119,19 @@ async function sendAdminPasswordResetEmail({ to, token }) {
 }
 
 // Sent when an employee requests a PIN reset. The link opens a static page
-// in the frontend site where they set a new PIN.
-async function sendEmployeePinResetEmail({ to, name, token }) {
+// in the frontend site where they set a new PIN. companyName is only passed
+// in when this same email matched employees at more than one company, so the
+// message can make clear which account this particular link resets.
+async function sendEmployeePinResetEmail({ to, name, token, companyName }) {
   const resetUrl = `${FRONTEND_URL}/reset-pin.html?token=${token}`;
+  const companyLine = companyName
+    ? `<p>This link resets your PIN for your account at <strong>${companyName}</strong>. If you have accounts at more than one company using this same email, you'll get a separate email for each.</p>`
+    : "";
   const html = `
     <div style="font-family: -apple-system, sans-serif;">
-      <h2>Reset your Site Clock PIN</h2>
+      <h2>Reset your Coll Timeclock PIN</h2>
       <p>Hi ${name}, click the link below to set a new PIN. This link expires in 1 hour.</p>
+      ${companyLine}
       <p><a href="${resetUrl}">${resetUrl}</a></p>
       <p style="color:#8A8578; font-size:13px;">If you didn't request this, you can safely ignore this email.</p>
     </div>

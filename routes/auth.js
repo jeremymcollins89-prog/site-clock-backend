@@ -27,9 +27,17 @@ router.post("/login", async (req, res) => {
     return res.status(401).json({ error: "Unknown employee email" });
   }
 
-  const employee = result.rows[0];
-  const valid = await comparePin(pin, employee.pin_hash);
-  if (!valid) {
+  // The same email can belong to employees at more than one company (emails
+  // are only unique within a single company's roster), so check each
+  // candidate's PIN rather than assuming the first row returned is correct.
+  let employee = null;
+  for (const candidate of result.rows) {
+    if (await comparePin(pin, candidate.pin_hash)) {
+      employee = candidate;
+      break;
+    }
+  }
+  if (!employee) {
     return res.status(401).json({ error: "Incorrect PIN" });
   }
 
@@ -57,19 +65,31 @@ router.post("/forgot-pin", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: "email is required" });
 
+  // An email can now match employees at more than one company, so every
+  // matching employee gets their own reset token and their own email --
+  // tagged with the company name when there's more than one, so it's clear
+  // which account each link resets.
   const result = await db.query(
-    `SELECT id, name FROM employees WHERE email = $1 AND active = true`,
+    `SELECT e.id, e.name, c.name AS company_name
+     FROM employees e
+     LEFT JOIN companies c ON c.id = e.company_id
+     WHERE e.email = $1 AND e.active = true`,
     [email]
   );
-  if (result.rowCount > 0) {
-    const employee = result.rows[0];
+
+  for (const employee of result.rows) {
     const { token, tokenHash } = generateResetToken();
     await db.query(
       `UPDATE employees SET reset_token_hash = $1, reset_token_expires = now() + interval '1 hour' WHERE id = $2`,
       [tokenHash, employee.id]
     );
     try {
-      await sendEmployeePinResetEmail({ to: email, name: employee.name, token });
+      await sendEmployeePinResetEmail({
+        to: email,
+        name: employee.name,
+        token,
+        companyName: result.rows.length > 1 ? employee.company_name : null,
+      });
     } catch (err) {
       console.error("Failed to send PIN reset email:", err.message);
     }
