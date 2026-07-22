@@ -40,6 +40,13 @@ app.use(express.json());
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
+// Temporary route to confirm Sentry is wired up correctly. Visiting this
+// throws an error on purpose so it shows up in the Sentry dashboard. Safe
+// to delete once you've confirmed it works.
+app.get("/api/debug-sentry", () => {
+  throw new Error("Test error - confirming Sentry is receiving errors");
+});
+
 app.use("/api/auth", authRoutes);
 app.use("/api/time-entries", timeEntryRoutes);
 app.use("/api/timesheets", timesheetRoutes);
