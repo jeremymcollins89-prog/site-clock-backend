@@ -13,7 +13,7 @@ router.post("/submit", requireAuth, async (req, res) => {
   const employee_id = req.employee.employee_id;
 
   const employeeResult = await db.query(
-    `SELECT e.*, c.payroll_email
+    `SELECT e.*, c.payroll_email, c.pay_frequency, c.pay_period_anchor, c.pay_period_custom_days
      FROM employees e
      LEFT JOIN companies c ON c.id = e.company_id
      WHERE e.id = $1`,
@@ -30,7 +30,11 @@ router.post("/submit", requireAuth, async (req, res) => {
     });
   }
 
-  const period = getPayPeriod(new Date());
+  const period = getPayPeriod(new Date(), {
+    pay_frequency: employee.pay_frequency,
+    pay_period_anchor: employee.pay_period_anchor,
+    pay_period_custom_days: employee.pay_period_custom_days,
+  });
 
   const entriesResult = await db.query(
     `SELECT * FROM time_entry_durations

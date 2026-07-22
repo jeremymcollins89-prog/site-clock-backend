@@ -7,7 +7,7 @@ const { hashPin } = require("../utils/auth");
 const { generateResetToken, hashResetToken } = require("../utils/resetToken");
 const { sendAdminPasswordResetEmail } = require("../utils/mailer");
 const requireAdmin = require("../middleware/requireAdmin");
-const { getPayPeriod } = require("../utils/payPeriod");
+const { getPayPeriod, PAY_FREQUENCIES } = require("../utils/payPeriod");
 
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
@@ -201,6 +201,59 @@ router.patch("/shop-location", async (req, res) => {
   res.json(result.rows[0]);
 });
 
+// GET /api/admin/pay-schedule
+// Returns this company's pay frequency and (if applicable) the anchor date
+// and custom period length used to calculate pay periods.
+router.get("/pay-schedule", async (req, res) => {
+  const result = await db.query(
+    `SELECT pay_frequency, pay_period_anchor, pay_period_custom_days FROM companies WHERE id = $1`,
+    [req.companyId]
+  );
+  if (result.rowCount === 0) return res.status(404).json({ error: "Company not found" });
+  res.json(result.rows[0]);
+});
+
+// PATCH /api/admin/pay-schedule
+// Body: { pay_frequency, pay_period_anchor, pay_period_custom_days }
+// pay_period_anchor (a "YYYY-MM-DD" date) is required for biweekly, weekly,
+// and custom -- it's the start date of any one known pay period, used to
+// calculate every period going forward and backward from it.
+// pay_period_custom_days is required (and must be a positive integer) only
+// when pay_frequency is "custom".
+router.patch("/pay-schedule", async (req, res) => {
+  const { pay_frequency, pay_period_anchor, pay_period_custom_days } = req.body;
+
+  if (!PAY_FREQUENCIES.includes(pay_frequency)) {
+    return res.status(400).json({
+      error: `pay_frequency must be one of: ${PAY_FREQUENCIES.join(", ")}`,
+    });
+  }
+
+  const needsAnchor = ["biweekly", "weekly", "custom"].includes(pay_frequency);
+  if (needsAnchor && !pay_period_anchor) {
+    return res.status(400).json({
+      error: "pay_period_anchor (the start date of a known pay period) is required for this frequency",
+    });
+  }
+
+  let customDays = null;
+  if (pay_frequency === "custom") {
+    customDays = Number(pay_period_custom_days);
+    if (!Number.isInteger(customDays) || customDays < 1) {
+      return res.status(400).json({ error: "pay_period_custom_days must be a positive whole number" });
+    }
+  }
+
+  const result = await db.query(
+    `UPDATE companies
+     SET pay_frequency = $1, pay_period_anchor = $2, pay_period_custom_days = $3
+     WHERE id = $4
+     RETURNING pay_frequency, pay_period_anchor, pay_period_custom_days`,
+    [pay_frequency, needsAnchor ? pay_period_anchor : null, customDays, req.companyId]
+  );
+  res.json(result.rows[0]);
+});
+
 router.get("/employees", async (req, res) => {
   const result = await db.query(
     `SELECT id, name, email, active, created_at FROM employees WHERE company_id = $1 ORDER BY name`,
@@ -309,7 +362,11 @@ router.patch("/time-entries/:id", async (req, res) => {
 });
 
 router.get("/overview", async (req, res) => {
-  const period = getPayPeriod(new Date());
+  const companyResult = await db.query(
+    `SELECT pay_frequency, pay_period_anchor, pay_period_custom_days FROM companies WHERE id = $1`,
+    [req.companyId]
+  );
+  const period = getPayPeriod(new Date(), companyResult.rows[0] || {});
   const result = await db.query(
     `SELECT
        e.id, e.name, e.active,
