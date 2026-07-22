@@ -1,9 +1,9 @@
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 
-// Resend's shared sending address — works immediately with no domain setup.
-// Once you verify your own domain on resend.com, swap this for something
-// like "timesheets@yourdomain.com".
-const FROM_ADDRESS = process.env.RESEND_FROM || "Site Clock <onboarding@resend.dev>";
+// Falls back to Resend's shared sandbox address if RESEND_FROM isn't set in
+// the environment, but production should always set RESEND_FROM to an
+// address on the verified collbusinesssolutions.com domain.
+const FROM_ADDRESS = process.env.RESEND_FROM || "Coll Timeclock <timesheets@collbusinesssolutions.com>";
 
 // Where the employee PWA (and its static reset pages) are hosted. Used to
 // build clickable links in reset emails.
