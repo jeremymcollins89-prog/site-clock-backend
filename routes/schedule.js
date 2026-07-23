@@ -37,4 +37,25 @@ router.get("/me", requireAuth, async (req, res) => {
   }
 });
 
+// GET /api/schedule/customers
+// Read-only customer directory for the logged-in employee's company --
+// employees can look someone up (name/phone/email/address) but can't
+// add, edit, or delete customers; that stays admin-only.
+router.get("/customers", requireAuth, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT c.id, c.name, c.phone, c.email, c.street, c.city, c.state, c.zip, c.notes
+       FROM customers c
+       JOIN employees e ON e.company_id = c.company_id
+       WHERE e.id = $1
+       ORDER BY c.name`,
+      [req.employee.employee_id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /schedule/customers failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load customers." });
+  }
+});
+
 module.exports = router;
