@@ -561,7 +561,7 @@ async function notifyAssigned(employeeIds, job) {
   await Promise.all(
     employeeIds.map((employeeId) =>
       sendPushToEmployee(employeeId, {
-        title: "New job scheduled",
+        title: "New event scheduled",
         body: `${job.title} — ${dateRange}`,
         url: "/schedule",
       }).catch((err) => console.error("Failed to send job notification:", err.message))
@@ -642,7 +642,7 @@ router.post("/jobs", async (req, res) => {
     res.status(201).json(job);
   } catch (err) {
     console.error("POST /admin/jobs failed:", err);
-    res.status(500).json({ error: err.message || "Couldn't create job." });
+    res.status(500).json({ error: err.message || "Couldn't create event." });
   }
 });
 
@@ -658,7 +658,7 @@ router.patch("/jobs/:id", async (req, res) => {
     const { title, notes, start_date, end_date, color, employee_ids, crew_ids } = req.body;
 
     const owns = await db.query(`SELECT * FROM jobs WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
-    if (owns.rowCount === 0) return res.status(404).json({ error: "Job not found" });
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Event not found" });
 
     const fields = [];
     const values = [];
@@ -708,7 +708,7 @@ router.patch("/jobs/:id", async (req, res) => {
     res.json(job);
   } catch (err) {
     console.error("PATCH /admin/jobs/:id failed:", err);
-    res.status(500).json({ error: err.message || "Couldn't update job." });
+    res.status(500).json({ error: err.message || "Couldn't update event." });
   }
 });
 
@@ -721,7 +721,7 @@ router.delete("/jobs/:id", async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /admin/jobs/:id failed:", err);
-    res.status(500).json({ error: err.message || "Couldn't delete job." });
+    res.status(500).json({ error: err.message || "Couldn't delete event." });
   }
 });
 
