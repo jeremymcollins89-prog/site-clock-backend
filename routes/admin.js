@@ -11,6 +11,8 @@ const { getPayPeriod, PAY_FREQUENCIES } = require("../utils/payPeriod");
 const { JOB_COLORS } = require("../utils/jobColors");
 const { sendPushToEmployee } = require("../utils/webPush");
 
+const EVENT_TYPES = ["job", "personal", "other"];
+
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
@@ -582,7 +584,7 @@ router.get("/jobs", async (req, res) => {
     if (end) { params.push(end); conditions.push(`j.start_date <= $${params.length}`); }
 
     const result = await db.query(
-      `SELECT j.id, j.title, j.notes, j.start_date, j.end_date, j.color, j.created_at,
+      `SELECT j.id, j.title, j.notes, j.start_date, j.end_date, j.color, j.event_type, j.created_at,
               COALESCE(
                 json_agg(
                   json_build_object('id', e.id, 'name', e.name, 'crew_id', ja.assigned_via_crew_id)
@@ -608,7 +610,7 @@ router.get("/jobs", async (req, res) => {
 // Body: { title, notes?, start_date, end_date, color, employee_ids?, crew_ids? }
 router.post("/jobs", async (req, res) => {
   try {
-    const { title, notes, start_date, end_date, color, employee_ids, crew_ids } = req.body;
+    const { title, notes, start_date, end_date, color, event_type, employee_ids, crew_ids } = req.body;
     if (!title || !start_date || !end_date) {
       return res.status(400).json({ error: "title, start_date, and end_date are required" });
     }
@@ -616,12 +618,16 @@ router.post("/jobs", async (req, res) => {
     if (!JOB_COLORS[jobColor]) {
       return res.status(400).json({ error: `color must be one of: ${Object.keys(JOB_COLORS).join(", ")}` });
     }
+    const eventType = event_type || "job";
+    if (!EVENT_TYPES.includes(eventType)) {
+      return res.status(400).json({ error: `event_type must be one of: ${EVENT_TYPES.join(", ")}` });
+    }
 
     const jobResult = await db.query(
-      `INSERT INTO jobs (company_id, title, notes, start_date, end_date, color)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, title, notes, start_date, end_date, color, created_at`,
-      [req.companyId, title, notes || null, start_date, end_date, jobColor]
+      `INSERT INTO jobs (company_id, title, notes, start_date, end_date, color, event_type)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, title, notes, start_date, end_date, color, event_type, created_at`,
+      [req.companyId, title, notes || null, start_date, end_date, jobColor, eventType]
     );
     const job = jobResult.rows[0];
 
@@ -655,7 +661,7 @@ router.post("/jobs", async (req, res) => {
 router.patch("/jobs/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, notes, start_date, end_date, color, employee_ids, crew_ids } = req.body;
+    const { title, notes, start_date, end_date, color, event_type, employee_ids, crew_ids } = req.body;
 
     const owns = await db.query(`SELECT * FROM jobs WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
     if (owns.rowCount === 0) return res.status(404).json({ error: "Event not found" });
@@ -672,13 +678,19 @@ router.patch("/jobs/:id", async (req, res) => {
       }
       values.push(color); fields.push(`color = $${values.length}`);
     }
+    if (event_type !== undefined) {
+      if (!EVENT_TYPES.includes(event_type)) {
+        return res.status(400).json({ error: `event_type must be one of: ${EVENT_TYPES.join(", ")}` });
+      }
+      values.push(event_type); fields.push(`event_type = $${values.length}`);
+    }
 
     let job = owns.rows[0];
     if (fields.length > 0) {
       values.push(id);
       const result = await db.query(
         `UPDATE jobs SET ${fields.join(", ")} WHERE id = $${values.length}
-         RETURNING id, title, notes, start_date, end_date, color, created_at`,
+         RETURNING id, title, notes, start_date, end_date, color, event_type, created_at`,
         values
       );
       job = result.rows[0];

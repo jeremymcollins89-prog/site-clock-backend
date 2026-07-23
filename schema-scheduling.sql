@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   start_date DATE NOT NULL,
   end_date DATE NOT NULL,
   color TEXT NOT NULL DEFAULT 'rust',
+  event_type TEXT NOT NULL DEFAULT 'job' CHECK (event_type IN ('job', 'personal', 'other')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

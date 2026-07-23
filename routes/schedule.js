@@ -19,7 +19,7 @@ router.get("/me", requireAuth, async (req, res) => {
   }
 
   const result = await db.query(
-    `SELECT j.id, j.title, j.notes, j.start_date, j.end_date, j.color
+    `SELECT j.id, j.title, j.notes, j.start_date, j.end_date, j.color, j.event_type
      FROM jobs j
      JOIN job_assignments ja ON ja.job_id = j.id
      WHERE ja.employee_id = $1 AND j.end_date >= $2 AND j.start_date <= $3
