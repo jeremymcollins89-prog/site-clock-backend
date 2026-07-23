@@ -4,9 +4,13 @@ const db = require("../db");
 const requireAuth = require("../middleware/requireAuth");
 
 // GET /api/schedule/me?start=YYYY-MM-DD&end=YYYY-MM-DD
-// Returns jobs the logged-in employee is assigned to, overlapping the given
-// range. If start/end are omitted, defaults to today through 30 days out --
-// this is what the employee app's Schedule view uses.
+// Returns every job for the logged-in employee's company (not just ones
+// they're personally assigned to), overlapping the given range, so everyone
+// can see the full shared calendar. If start/end are omitted, defaults to
+// today through 30 days out -- this is what the employee app's Schedule
+// view uses. Push notifications for new/updated jobs still only go to the
+// employees actually assigned to that job (see notifyAssigned in admin.js) --
+// this broader visibility is just for the calendar view itself.
 router.get("/me", requireAuth, async (req, res) => {
   try {
     let { start, end } = req.query;
@@ -24,9 +28,9 @@ router.get("/me", requireAuth, async (req, res) => {
               c.name AS customer_name, c.phone AS customer_phone,
               c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip
        FROM jobs j
-       JOIN job_assignments ja ON ja.job_id = j.id
+       JOIN employees e ON e.company_id = j.company_id
        LEFT JOIN customers c ON c.id = j.customer_id
-       WHERE ja.employee_id = $1 AND j.end_date >= $2 AND j.start_date <= $3
+       WHERE e.id = $1 AND j.end_date >= $2 AND j.start_date <= $3
        ORDER BY j.start_date, j.title`,
       [req.employee.employee_id, start, end]
     );
