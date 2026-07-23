@@ -8,6 +8,8 @@ const { generateResetToken, hashResetToken } = require("../utils/resetToken");
 const { sendAdminPasswordResetEmail } = require("../utils/mailer");
 const requireAdmin = require("../middleware/requireAdmin");
 const { getPayPeriod, PAY_FREQUENCIES } = require("../utils/payPeriod");
+const { JOB_COLORS } = require("../utils/jobColors");
+const { sendPushToEmployee } = require("../utils/webPush");
 
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
@@ -408,6 +410,278 @@ router.post("/employees/:id/request-ping", async (req, res) => {
     [id]
   );
   res.json({ requested: true });
+});
+
+// ---------- Crews ----------
+// A crew is a reusable, named group of employees an admin can assign to a
+// job in one click instead of picking employees individually every time.
+
+// GET /api/admin/crews
+// Returns every crew for this company along with its current members.
+router.get("/crews", async (req, res) => {
+  const result = await db.query(
+    `SELECT c.id, c.name, c.created_at,
+            COALESCE(
+              json_agg(
+                json_build_object('id', e.id, 'name', e.name)
+                ORDER BY e.name
+              ) FILTER (WHERE e.id IS NOT NULL), '[]'
+            ) AS members
+     FROM crews c
+     LEFT JOIN crew_members cm ON cm.crew_id = c.id
+     LEFT JOIN employees e ON e.id = cm.employee_id
+     WHERE c.company_id = $1
+     GROUP BY c.id
+     ORDER BY c.name`,
+    [req.companyId]
+  );
+  res.json(result.rows);
+});
+
+// POST /api/admin/crews
+// Body: { name, employee_ids: [] }
+router.post("/crews", async (req, res) => {
+  const { name, employee_ids } = req.body;
+  if (!name) return res.status(400).json({ error: "name is required" });
+
+  const crewResult = await db.query(
+    `INSERT INTO crews (company_id, name) VALUES ($1, $2) RETURNING id, name, created_at`,
+    [req.companyId, name]
+  );
+  const crew = crewResult.rows[0];
+
+  const ids = Array.isArray(employee_ids) ? employee_ids : [];
+  if (ids.length > 0) {
+    await db.query(
+      `INSERT INTO crew_members (crew_id, employee_id)
+       SELECT $1, e.id FROM employees e WHERE e.id = ANY($2::uuid[]) AND e.company_id = $3
+       ON CONFLICT DO NOTHING`,
+      [crew.id, ids, req.companyId]
+    );
+  }
+  res.status(201).json({ ...crew, members: [] });
+});
+
+// PATCH /api/admin/crews/:id
+// Body: { name?, employee_ids? } -- employee_ids, if provided, fully
+// replaces the crew's membership list.
+router.patch("/crews/:id", async (req, res) => {
+  const { id } = req.params;
+  const { name, employee_ids } = req.body;
+
+  const owns = await db.query(`SELECT id FROM crews WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+  if (owns.rowCount === 0) return res.status(404).json({ error: "Crew not found" });
+
+  if (name !== undefined) {
+    await db.query(`UPDATE crews SET name = $1 WHERE id = $2`, [name, id]);
+  }
+  if (Array.isArray(employee_ids)) {
+    await db.query(`DELETE FROM crew_members WHERE crew_id = $1`, [id]);
+    if (employee_ids.length > 0) {
+      await db.query(
+        `INSERT INTO crew_members (crew_id, employee_id)
+         SELECT $1, e.id FROM employees e WHERE e.id = ANY($2::uuid[]) AND e.company_id = $3
+         ON CONFLICT DO NOTHING`,
+        [id, employee_ids, req.companyId]
+      );
+    }
+  }
+  res.json({ ok: true });
+});
+
+// DELETE /api/admin/crews/:id
+router.delete("/crews/:id", async (req, res) => {
+  const { id } = req.params;
+  const result = await db.query(`DELETE FROM crews WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+  if (result.rowCount === 0) return res.status(404).json({ error: "Crew not found" });
+  res.json({ ok: true });
+});
+
+// ---------- Jobs ----------
+// A job is a color-coded task scheduled for one or more days, assigned to
+// individual employees and/or whole crews. Assigning sends each newly
+// assigned employee a push notification (if they've enabled them).
+
+async function expandAssignments({ employee_ids, crew_ids, companyId }) {
+  // Map of employeeId -> assigned_via_crew_id (or null for a direct add).
+  // Crew members are added first so a direct add can "win" and be recorded
+  // as a direct assignment even if the same person is also in a crew.
+  const map = new Map();
+
+  const crewIds = Array.isArray(crew_ids) ? crew_ids : [];
+  if (crewIds.length > 0) {
+    const members = await db.query(
+      `SELECT cm.crew_id, cm.employee_id
+       FROM crew_members cm
+       JOIN crews c ON c.id = cm.crew_id
+       WHERE cm.crew_id = ANY($1::uuid[]) AND c.company_id = $2`,
+      [crewIds, companyId]
+    );
+    for (const row of members.rows) map.set(row.employee_id, row.crew_id);
+  }
+
+  const directIds = Array.isArray(employee_ids) ? employee_ids : [];
+  if (directIds.length > 0) {
+    const valid = await db.query(
+      `SELECT id FROM employees WHERE id = ANY($1::uuid[]) AND company_id = $2`,
+      [directIds, companyId]
+    );
+    for (const row of valid.rows) map.set(row.id, null);
+  }
+
+  return map;
+}
+
+async function notifyAssigned(employeeIds, job) {
+  const dateRange =
+    job.start_date === job.end_date
+      ? job.start_date
+      : `${job.start_date} to ${job.end_date}`;
+  await Promise.all(
+    employeeIds.map((employeeId) =>
+      sendPushToEmployee(employeeId, {
+        title: "New job scheduled",
+        body: `${job.title} — ${dateRange}`,
+        url: "/schedule",
+      }).catch((err) => console.error("Failed to send job notification:", err.message))
+    )
+  );
+}
+
+// GET /api/admin/jobs?start=YYYY-MM-DD&end=YYYY-MM-DD
+// Returns jobs overlapping the given range (both optional -- omit both to
+// get every job) along with their assigned employees.
+router.get("/jobs", async (req, res) => {
+  const { start, end } = req.query;
+  const conditions = [`j.company_id = $1`];
+  const params = [req.companyId];
+
+  if (start) { params.push(start); conditions.push(`j.end_date >= $${params.length}`); }
+  if (end) { params.push(end); conditions.push(`j.start_date <= $${params.length}`); }
+
+  const result = await db.query(
+    `SELECT j.id, j.title, j.notes, j.start_date, j.end_date, j.color, j.created_at,
+            COALESCE(
+              json_agg(
+                json_build_object('id', e.id, 'name', e.name, 'crew_id', ja.assigned_via_crew_id)
+                ORDER BY e.name
+              ) FILTER (WHERE e.id IS NOT NULL), '[]'
+            ) AS assigned_employees
+     FROM jobs j
+     LEFT JOIN job_assignments ja ON ja.job_id = j.id
+     LEFT JOIN employees e ON e.id = ja.employee_id
+     WHERE ${conditions.join(" AND ")}
+     GROUP BY j.id
+     ORDER BY j.start_date, j.title`,
+    params
+  );
+  res.json(result.rows);
+});
+
+// POST /api/admin/jobs
+// Body: { title, notes?, start_date, end_date, color, employee_ids?, crew_ids? }
+router.post("/jobs", async (req, res) => {
+  const { title, notes, start_date, end_date, color, employee_ids, crew_ids } = req.body;
+  if (!title || !start_date || !end_date) {
+    return res.status(400).json({ error: "title, start_date, and end_date are required" });
+  }
+  const jobColor = color || "rust";
+  if (!JOB_COLORS[jobColor]) {
+    return res.status(400).json({ error: `color must be one of: ${Object.keys(JOB_COLORS).join(", ")}` });
+  }
+
+  const jobResult = await db.query(
+    `INSERT INTO jobs (company_id, title, notes, start_date, end_date, color)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     RETURNING id, title, notes, start_date, end_date, color, created_at`,
+    [req.companyId, title, notes || null, start_date, end_date, jobColor]
+  );
+  const job = jobResult.rows[0];
+
+  const assignments = await expandAssignments({ employee_ids, crew_ids, companyId: req.companyId });
+  if (assignments.size > 0) {
+    await Promise.all(
+      Array.from(assignments.entries()).map(([employeeId, crewId]) =>
+        db.query(
+          `INSERT INTO job_assignments (job_id, employee_id, assigned_via_crew_id)
+           VALUES ($1, $2, $3)`,
+          [job.id, employeeId, crewId]
+        )
+      )
+    );
+    notifyAssigned(Array.from(assignments.keys()), job);
+  }
+
+  res.status(201).json(job);
+});
+
+// PATCH /api/admin/jobs/:id
+// Body: { title?, notes?, start_date?, end_date?, color?, employee_ids?, crew_ids? }
+// employee_ids/crew_ids, if either is provided, fully replace the job's
+// assignment list -- only employees newly added (who weren't already
+// assigned) get a push notification, so editing a job doesn't re-notify
+// everyone already on it.
+router.patch("/jobs/:id", async (req, res) => {
+  const { id } = req.params;
+  const { title, notes, start_date, end_date, color, employee_ids, crew_ids } = req.body;
+
+  const owns = await db.query(`SELECT * FROM jobs WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+  if (owns.rowCount === 0) return res.status(404).json({ error: "Job not found" });
+
+  const fields = [];
+  const values = [];
+  if (title !== undefined) { values.push(title); fields.push(`title = $${values.length}`); }
+  if (notes !== undefined) { values.push(notes); fields.push(`notes = $${values.length}`); }
+  if (start_date !== undefined) { values.push(start_date); fields.push(`start_date = $${values.length}`); }
+  if (end_date !== undefined) { values.push(end_date); fields.push(`end_date = $${values.length}`); }
+  if (color !== undefined) {
+    if (!JOB_COLORS[color]) {
+      return res.status(400).json({ error: `color must be one of: ${Object.keys(JOB_COLORS).join(", ")}` });
+    }
+    values.push(color); fields.push(`color = $${values.length}`);
+  }
+
+  let job = owns.rows[0];
+  if (fields.length > 0) {
+    values.push(id);
+    const result = await db.query(
+      `UPDATE jobs SET ${fields.join(", ")} WHERE id = $${values.length}
+       RETURNING id, title, notes, start_date, end_date, color, created_at`,
+      values
+    );
+    job = result.rows[0];
+  }
+
+  if (employee_ids !== undefined || crew_ids !== undefined) {
+    const before = await db.query(`SELECT employee_id FROM job_assignments WHERE job_id = $1`, [id]);
+    const beforeIds = new Set(before.rows.map((r) => r.employee_id));
+
+    const assignments = await expandAssignments({ employee_ids, crew_ids, companyId: req.companyId });
+    await db.query(`DELETE FROM job_assignments WHERE job_id = $1`, [id]);
+    if (assignments.size > 0) {
+      await Promise.all(
+        Array.from(assignments.entries()).map(([employeeId, crewId]) =>
+          db.query(
+            `INSERT INTO job_assignments (job_id, employee_id, assigned_via_crew_id)
+             VALUES ($1, $2, $3)`,
+            [id, employeeId, crewId]
+          )
+        )
+      );
+    }
+    const newlyAdded = Array.from(assignments.keys()).filter((eid) => !beforeIds.has(eid));
+    if (newlyAdded.length > 0) notifyAssigned(newlyAdded, job);
+  }
+
+  res.json(job);
+});
+
+// DELETE /api/admin/jobs/:id
+router.delete("/jobs/:id", async (req, res) => {
+  const { id } = req.params;
+  const result = await db.query(`DELETE FROM jobs WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+  if (result.rowCount === 0) return res.status(404).json({ error: "Job not found" });
+  res.json({ ok: true });
 });
 
 module.exports = router;
