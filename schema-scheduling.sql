@@ -17,6 +17,20 @@ CREATE TABLE IF NOT EXISTS crew_members (
   UNIQUE (crew_id, employee_id)
 );
 
+CREATE TABLE IF NOT EXISTS customers (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  phone TEXT,
+  email TEXT,
+  street TEXT,
+  city TEXT,
+  state TEXT,
+  zip TEXT,
+  notes TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS jobs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -26,6 +40,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   end_date DATE NOT NULL,
   color TEXT NOT NULL DEFAULT 'rust',
   event_type TEXT NOT NULL DEFAULT 'job' CHECK (event_type IN ('job', 'personal', 'other')),
+  customer_id UUID REFERENCES customers(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -50,3 +65,5 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
 CREATE INDEX IF NOT EXISTS idx_jobs_company_dates ON jobs (company_id, start_date, end_date);
 CREATE INDEX IF NOT EXISTS idx_job_assignments_employee ON job_assignments (employee_id);
 CREATE INDEX IF NOT EXISTS idx_push_subscriptions_employee ON push_subscriptions (employee_id);
+CREATE INDEX IF NOT EXISTS idx_customers_company ON customers (company_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_customer ON jobs (customer_id);

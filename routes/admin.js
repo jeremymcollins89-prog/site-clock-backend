@@ -418,6 +418,119 @@ router.post("/employees/:id/request-ping", async (req, res) => {
 // A crew is a reusable, named group of employees an admin can assign to a
 // job in one click instead of picking employees individually every time.
 
+// GET /api/admin/customers
+// Returns every customer for this company, most recently added first.
+router.get("/customers", async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, name, phone, email, street, city, state, zip, notes, created_at
+       FROM customers
+       WHERE company_id = $1
+       ORDER BY name`,
+      [req.companyId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/customers failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load customers." });
+  }
+});
+
+// GET /api/admin/customers/:id/events
+// Returns every event (job) linked to this customer, most recent first.
+router.get("/customers/:id/events", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const owns = await db.query(`SELECT id FROM customers WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Customer not found" });
+
+    const result = await db.query(
+      `SELECT id, title, notes, start_date, end_date, color, event_type
+       FROM jobs
+       WHERE customer_id = $1 AND company_id = $2
+       ORDER BY start_date DESC`,
+      [id, req.companyId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/customers/:id/events failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load customer events." });
+  }
+});
+
+// POST /api/admin/customers
+// Body: { name, phone?, email?, street?, city?, state?, zip?, notes? }
+router.post("/customers", async (req, res) => {
+  try {
+    const { name, phone, email, street, city, state, zip, notes } = req.body;
+    if (!name) return res.status(400).json({ error: "name is required" });
+
+    const result = await db.query(
+      `INSERT INTO customers (company_id, name, phone, email, street, city, state, zip, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id, name, phone, email, street, city, state, zip, notes, created_at`,
+      [req.companyId, name, phone || null, email || null, street || null, city || null, state || null, zip || null, notes || null]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("POST /admin/customers failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't create customer." });
+  }
+});
+
+// PATCH /api/admin/customers/:id
+// Body: { name?, phone?, email?, street?, city?, state?, zip?, notes? }
+router.patch("/customers/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, phone, email, street, city, state, zip, notes } = req.body;
+
+    const owns = await db.query(`SELECT id FROM customers WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Customer not found" });
+
+    const fields = [];
+    const values = [];
+    if (name !== undefined) { values.push(name); fields.push(`name = $${values.length}`); }
+    if (phone !== undefined) { values.push(phone); fields.push(`phone = $${values.length}`); }
+    if (email !== undefined) { values.push(email); fields.push(`email = $${values.length}`); }
+    if (street !== undefined) { values.push(street); fields.push(`street = $${values.length}`); }
+    if (city !== undefined) { values.push(city); fields.push(`city = $${values.length}`); }
+    if (state !== undefined) { values.push(state); fields.push(`state = $${values.length}`); }
+    if (zip !== undefined) { values.push(zip); fields.push(`zip = $${values.length}`); }
+    if (notes !== undefined) { values.push(notes); fields.push(`notes = $${values.length}`); }
+
+    let customer = owns.rows[0];
+    if (fields.length > 0) {
+      values.push(id);
+      const result = await db.query(
+        `UPDATE customers SET ${fields.join(", ")} WHERE id = $${values.length}
+         RETURNING id, name, phone, email, street, city, state, zip, notes, created_at`,
+        values
+      );
+      customer = result.rows[0];
+    }
+    res.json(customer);
+  } catch (err) {
+    console.error("PATCH /admin/customers/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't update customer." });
+  }
+});
+
+// DELETE /api/admin/customers/:id
+// Events linked to this customer are kept -- customer_id is just cleared
+// (see schema's ON DELETE SET NULL), so past job history isn't lost.
+router.delete("/customers/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(`DELETE FROM customers WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (result.rowCount === 0) return res.status(404).json({ error: "Customer not found" });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /admin/customers/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't delete customer." });
+  }
+});
+
 // GET /api/admin/crews
 // Returns every crew for this company along with its current members.
 router.get("/crews", async (req, res) => {
@@ -585,6 +698,8 @@ router.get("/jobs", async (req, res) => {
 
     const result = await db.query(
       `SELECT j.id, j.title, j.notes, j.start_date, j.end_date, j.color, j.event_type, j.created_at,
+              j.customer_id, c.name AS customer_name, c.phone AS customer_phone,
+              c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip,
               COALESCE(
                 json_agg(
                   json_build_object('id', e.id, 'name', e.name, 'crew_id', ja.assigned_via_crew_id)
@@ -594,8 +709,9 @@ router.get("/jobs", async (req, res) => {
        FROM jobs j
        LEFT JOIN job_assignments ja ON ja.job_id = j.id
        LEFT JOIN employees e ON e.id = ja.employee_id
+       LEFT JOIN customers c ON c.id = j.customer_id
        WHERE ${conditions.join(" AND ")}
-       GROUP BY j.id
+       GROUP BY j.id, c.id
        ORDER BY j.start_date, j.title`,
       params
     );
@@ -610,7 +726,7 @@ router.get("/jobs", async (req, res) => {
 // Body: { title, notes?, start_date, end_date, color, employee_ids?, crew_ids? }
 router.post("/jobs", async (req, res) => {
   try {
-    const { title, notes, start_date, end_date, color, event_type, employee_ids, crew_ids } = req.body;
+    const { title, notes, start_date, end_date, color, event_type, customer_id, employee_ids, crew_ids } = req.body;
     if (!title || !start_date || !end_date) {
       return res.status(400).json({ error: "title, start_date, and end_date are required" });
     }
@@ -622,12 +738,18 @@ router.post("/jobs", async (req, res) => {
     if (!EVENT_TYPES.includes(eventType)) {
       return res.status(400).json({ error: `event_type must be one of: ${EVENT_TYPES.join(", ")}` });
     }
+    let customerId = null;
+    if (customer_id) {
+      const ownsCustomer = await db.query(`SELECT id FROM customers WHERE id = $1 AND company_id = $2`, [customer_id, req.companyId]);
+      if (ownsCustomer.rowCount === 0) return res.status(400).json({ error: "customer not found" });
+      customerId = customer_id;
+    }
 
     const jobResult = await db.query(
-      `INSERT INTO jobs (company_id, title, notes, start_date, end_date, color, event_type)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, title, notes, start_date, end_date, color, event_type, created_at`,
-      [req.companyId, title, notes || null, start_date, end_date, jobColor, eventType]
+      `INSERT INTO jobs (company_id, title, notes, start_date, end_date, color, event_type, customer_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, title, notes, start_date, end_date, color, event_type, customer_id, created_at`,
+      [req.companyId, title, notes || null, start_date, end_date, jobColor, eventType, customerId]
     );
     const job = jobResult.rows[0];
 
@@ -661,7 +783,7 @@ router.post("/jobs", async (req, res) => {
 router.patch("/jobs/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, notes, start_date, end_date, color, event_type, employee_ids, crew_ids } = req.body;
+    const { title, notes, start_date, end_date, color, event_type, customer_id, employee_ids, crew_ids } = req.body;
 
     const owns = await db.query(`SELECT * FROM jobs WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
     if (owns.rowCount === 0) return res.status(404).json({ error: "Event not found" });
@@ -684,13 +806,20 @@ router.patch("/jobs/:id", async (req, res) => {
       }
       values.push(event_type); fields.push(`event_type = $${values.length}`);
     }
+    if (customer_id !== undefined) {
+      if (customer_id) {
+        const ownsCustomer = await db.query(`SELECT id FROM customers WHERE id = $1 AND company_id = $2`, [customer_id, req.companyId]);
+        if (ownsCustomer.rowCount === 0) return res.status(400).json({ error: "customer not found" });
+      }
+      values.push(customer_id || null); fields.push(`customer_id = $${values.length}`);
+    }
 
     let job = owns.rows[0];
     if (fields.length > 0) {
       values.push(id);
       const result = await db.query(
         `UPDATE jobs SET ${fields.join(", ")} WHERE id = $${values.length}
-         RETURNING id, title, notes, start_date, end_date, color, event_type, created_at`,
+         RETURNING id, title, notes, start_date, end_date, color, event_type, customer_id, created_at`,
         values
       );
       job = result.rows[0];
