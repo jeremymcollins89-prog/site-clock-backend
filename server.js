@@ -72,11 +72,13 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Something went wrong. Please try again." });
 });
 
-// Runs once a day (15:00 UTC, roughly 8-9am in Colorado) to send automatic
-// reminder emails for unpaid invoices. See utils/invoiceReminders.js for the
-// schedule/cap logic -- this just triggers it and reports failures to
-// Sentry instead of letting the whole process crash.
-cron.schedule("0 15 * * *", () => {
+// Runs at the top of every hour to send automatic reminder emails for
+// unpaid invoices. It runs hourly (rather than once a day at a fixed UTC
+// time) so each company gets its reminders around 9am *its own* local
+// time -- see the TARGET_LOCAL_HOUR check in utils/invoiceReminders.js,
+// which is what actually decides whether it's the right moment for any
+// given company, using that company's saved timezone.
+cron.schedule("0 * * * *", () => {
   checkAndSendReminders()
     .then((sent) => console.log(`Invoice reminder job sent ${sent} reminder(s).`))
     .catch((err) => {

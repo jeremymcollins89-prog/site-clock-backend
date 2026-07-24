@@ -209,6 +209,35 @@ router.patch("/shop-location", async (req, res) => {
   res.json(result.rows[0]);
 });
 
+// GET /api/admin/timezone
+// The IANA timezone this company is located in (e.g. "America/Denver").
+// Used to decide what local hour it is for this company when deciding when
+// to send automated emails -- right now, invoice reminders.
+router.get("/timezone", async (req, res) => {
+  const result = await db.query(`SELECT timezone FROM companies WHERE id = $1`, [req.companyId]);
+  if (result.rowCount === 0) return res.status(404).json({ error: "Company not found" });
+  res.json(result.rows[0]);
+});
+
+// PATCH /api/admin/timezone
+// Body: { timezone } -- must be a real IANA zone name; validated by asking
+// Intl to actually format a date with it rather than checking against a
+// hardcoded list, so every zone the browser/Node itself supports is valid.
+router.patch("/timezone", async (req, res) => {
+  const { timezone } = req.body;
+  if (!timezone) return res.status(400).json({ error: "timezone is required" });
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone });
+  } catch (err) {
+    return res.status(400).json({ error: "That doesn't look like a valid timezone." });
+  }
+  const result = await db.query(
+    `UPDATE companies SET timezone = $1 WHERE id = $2 RETURNING timezone`,
+    [timezone, req.companyId]
+  );
+  res.json(result.rows[0]);
+});
+
 // GET /api/admin/pay-schedule
 // Returns this company's pay frequency and (if applicable) the anchor date
 // and custom period length used to calculate pay periods.
