@@ -38,7 +38,10 @@ const scheduleRoutes = require("./routes/schedule");
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+// Raised from the 100kb default so a base64-encoded company logo upload
+// (see PUT /api/admin/company-logo) doesn't get rejected before it even
+// reaches the route handler's own size validation.
+app.use(express.json({ limit: "6mb" }));
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 

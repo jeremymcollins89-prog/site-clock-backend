@@ -16,10 +16,12 @@ function fmtDate(d) {
   return new Date(d).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
 }
 
-// Renders a single-page invoice PDF and resolves with a Buffer. Kept
-// deliberately plain (no logo/branding assets) so it doesn't depend on
-// anything beyond the invoice data itself.
-function renderInvoicePdf({ companyName, invoice, customer, lineItems }) {
+// Renders a single-page invoice PDF and resolves with a Buffer. logoBuffer
+// is optional (a company's uploaded logo, read straight from the bytea
+// column) -- if present it's drawn top-left and the company name shifts
+// right to make room. If the image data is ever invalid, the logo is
+// silently skipped rather than blocking the invoice from sending.
+function renderInvoicePdf({ companyName, invoice, customer, lineItems, logoBuffer }) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: "letter", margin: 50 });
     const chunks = [];
@@ -27,11 +29,26 @@ function renderInvoicePdf({ companyName, invoice, customer, lineItems }) {
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
 
-    doc.fontSize(20).text(companyName || "Invoice", { continued: true });
-    doc.fontSize(20).text("", { align: "right" });
-    doc.moveDown(0.2);
-    doc.fontSize(10).fillColor("#666").text(`Invoice #${invoice.invoice_number}`);
-    doc.moveDown(1);
+    // Header: logo (optional) top-left, company name next to it, invoice
+    // number top-right. Every piece here uses explicit x/y so the two
+    // columns can never run into each other regardless of name length.
+    const headerTop = 50;
+    let nameX = 50;
+    if (logoBuffer) {
+      try {
+        doc.image(logoBuffer, 50, headerTop, { fit: [90, 50] });
+        nameX = 150;
+      } catch (imgErr) {
+        nameX = 50;
+      }
+    }
+    doc.fontSize(18).fillColor("#000").text(companyName || "Invoice", nameX, headerTop, { width: 250 });
+    doc.fontSize(10).fillColor("#666").text(`Invoice #${invoice.invoice_number}`, 350, headerTop + 4, { width: 200, align: "right" });
+
+    // Fixed reset below the header block -- not derived from doc.y, so the
+    // rest of the layout is unaffected by logo height or name wrapping.
+    doc.x = 50;
+    doc.y = headerTop + 75;
 
     const topY = doc.y;
     doc.fontSize(10).fillColor("#000").text("Bill to:", 50, topY);

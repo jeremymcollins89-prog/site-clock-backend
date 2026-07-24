@@ -934,7 +934,7 @@ async function sendInvoiceNow(invoiceId, companyId) {
     `SELECT description, quantity, unit_price FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
     [invoiceId]
   );
-  const companyResult = await db.query(`SELECT name, admin_email FROM companies WHERE id = $1`, [companyId]);
+  const companyResult = await db.query(`SELECT name, admin_email, logo_data FROM companies WHERE id = $1`, [companyId]);
   const company = companyResult.rows[0];
 
   const pdfBuffer = await renderInvoicePdf({
@@ -950,6 +950,7 @@ async function sendInvoiceNow(invoiceId, companyId) {
       zip: invoice.customer_zip,
     },
     lineItems: itemsResult.rows,
+    logoBuffer: company.logo_data || null,
   });
 
   await sendInvoiceEmail({
@@ -1380,6 +1381,65 @@ router.delete("/catalog-items/:id", async (req, res) => {
   } catch (err) {
     console.error("DELETE /admin/catalog-items/:id failed:", err);
     res.status(500).json({ error: err.message || "Couldn't delete catalog item." });
+  }
+});
+
+// ---------- Company logo ----------
+// An optional logo shown on generated invoice PDFs, stored directly in
+// Postgres as bytea rather than a separate file-storage service. Uploaded
+// as base64 over the normal JSON API (no multipart handling needed) --
+// server.js raises the JSON body limit to 6mb to make room for that.
+
+const LOGO_MAX_BYTES = 3 * 1024 * 1024; // 3MB, before base64 inflation
+const LOGO_MIME_TYPES = ["image/png", "image/jpeg", "image/webp"];
+
+// GET /api/admin/company-logo
+// Returns { logo: null } if none is set, otherwise { logo: "data:<mime>;base64,..." }
+// ready to drop straight into an <img src>.
+router.get("/company-logo", async (req, res) => {
+  try {
+    const result = await db.query(`SELECT logo_data, logo_mime_type FROM companies WHERE id = $1`, [req.companyId]);
+    const row = result.rows[0];
+    if (!row || !row.logo_data) return res.json({ logo: null });
+    res.json({ logo: `data:${row.logo_mime_type};base64,${row.logo_data.toString("base64")}` });
+  } catch (err) {
+    console.error("GET /admin/company-logo failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load logo." });
+  }
+});
+
+// PUT /api/admin/company-logo
+// Body: { logo_base64, mime_type } -- logo_base64 is the raw base64 payload
+// (no "data:...;base64," prefix).
+router.put("/company-logo", async (req, res) => {
+  try {
+    const { logo_base64, mime_type } = req.body;
+    if (!logo_base64 || !mime_type) {
+      return res.status(400).json({ error: "logo_base64 and mime_type are required" });
+    }
+    if (!LOGO_MIME_TYPES.includes(mime_type)) {
+      return res.status(400).json({ error: "Logo must be a PNG, JPEG, or WebP image." });
+    }
+    const buffer = Buffer.from(logo_base64, "base64");
+    if (buffer.length > LOGO_MAX_BYTES) {
+      return res.status(400).json({ error: "Logo must be 3MB or smaller." });
+    }
+    await db.query(`UPDATE companies SET logo_data = $1, logo_mime_type = $2 WHERE id = $3`, [buffer, mime_type, req.companyId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("PUT /admin/company-logo failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't save logo." });
+  }
+});
+
+// DELETE /api/admin/company-logo
+router.delete("/company-logo", async (req, res) => {
+  try {
+    await db.query(`UPDATE companies SET logo_data = NULL, logo_mime_type = NULL WHERE id = $1`, [req.companyId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /admin/company-logo failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't remove logo." });
   }
 });
 
