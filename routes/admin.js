@@ -5,13 +5,17 @@ const db = require("../db");
 const { loginAdmin } = require("../utils/adminAuth");
 const { hashPin } = require("../utils/auth");
 const { generateResetToken, hashResetToken } = require("../utils/resetToken");
-const { sendAdminPasswordResetEmail } = require("../utils/mailer");
+const { sendAdminPasswordResetEmail, sendInvoiceEmail } = require("../utils/mailer");
+const { renderInvoicePdf } = require("../utils/invoicePdf");
 const requireAdmin = require("../middleware/requireAdmin");
 const { getPayPeriod, PAY_FREQUENCIES } = require("../utils/payPeriod");
 const { JOB_COLORS } = require("../utils/jobColors");
 const { sendPushToEmployee } = require("../utils/webPush");
 
 const EVENT_TYPES = ["job", "personal", "other"];
+const PAYMENT_TERMS = ["due_on_receipt", "net_15", "net_30", "net_60", "net_90"];
+const PAYMENT_TERMS_DAYS = { due_on_receipt: 0, net_15: 15, net_30: 30, net_60: 60, net_90: 90 };
+const PAYMENT_METHODS = ["card", "check", "cash", "other"];
 
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
@@ -863,6 +867,383 @@ router.delete("/jobs/:id", async (req, res) => {
   } catch (err) {
     console.error("DELETE /admin/jobs/:id failed:", err);
     res.status(500).json({ error: err.message || "Couldn't delete event." });
+  }
+});
+
+// ---------- Invoices ----------
+// Invoices bill a customer for completed (or upcoming) work, with line
+// items, configurable payment terms (Net 15/30/60/90 or due on receipt),
+// and a PDF that gets emailed to the customer. Card/check payments aren't
+// processed in-app yet -- "mark as paid" just records how payment came in
+// (check, cash, a card run elsewhere, etc.) so the invoice's status stays
+// accurate without actually moving any money.
+
+function computeInvoiceTotals(lineItems, taxRate) {
+  const subtotal = lineItems.reduce((sum, item) => sum + Number(item.quantity) * Number(item.unit_price), 0);
+  const taxAmount = subtotal * (Number(taxRate) / 100);
+  const total = subtotal + taxAmount;
+  return {
+    subtotal: Math.round(subtotal * 100) / 100,
+    taxAmount: Math.round(taxAmount * 100) / 100,
+    total: Math.round(total * 100) / 100,
+  };
+}
+
+function computeDueDate(issueDate, paymentTerms) {
+  const days = PAYMENT_TERMS_DAYS[paymentTerms] ?? 0;
+  const d = new Date(`${issueDate}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+// GET /api/admin/invoices
+// Returns every invoice for this company, most recent first, with the
+// customer's name joined in and an `is_overdue` flag computed on the fly
+// (sent + past due date) rather than stored, so nothing needs a cron job
+// to keep it in sync.
+router.get("/invoices", async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT i.id, i.invoice_number, i.status, i.payment_terms, i.payment_method,
+              i.issue_date, i.due_date, i.subtotal, i.tax_rate, i.tax_amount, i.total,
+              i.sent_at, i.paid_at, i.created_at,
+              i.customer_id, c.name AS customer_name,
+              (i.status = 'sent' AND i.due_date < CURRENT_DATE) AS is_overdue
+       FROM invoices i
+       JOIN customers c ON c.id = i.customer_id
+       WHERE i.company_id = $1
+       ORDER BY i.invoice_number DESC`,
+      [req.companyId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/invoices failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load invoices." });
+  }
+});
+
+// GET /api/admin/invoices/:id
+// Full detail, including line items and the customer's contact info (used
+// both for the edit form and to render/send the PDF).
+router.get("/invoices/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(
+      `SELECT i.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+              c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip,
+              (i.status = 'sent' AND i.due_date < CURRENT_DATE) AS is_overdue
+       FROM invoices i
+       JOIN customers c ON c.id = i.customer_id
+       WHERE i.id = $1 AND i.company_id = $2`,
+      [id, req.companyId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
+
+    const items = await db.query(
+      `SELECT id, description, quantity, unit_price, (quantity * unit_price) AS amount
+       FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
+      [id]
+    );
+    res.json({ ...result.rows[0], line_items: items.rows });
+  } catch (err) {
+    console.error("GET /admin/invoices/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load invoice." });
+  }
+});
+
+// POST /api/admin/invoices
+// Body: { customer_id, job_id?, payment_terms, issue_date?, tax_rate?, notes?, line_items: [{description, quantity, unit_price}] }
+// Always created as a draft -- POST /invoices/:id/send is the only thing
+// that flips it to "sent".
+router.post("/invoices", async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const { customer_id, job_id, payment_terms, issue_date, tax_rate, notes, line_items } = req.body;
+    if (!customer_id) return res.status(400).json({ error: "customer_id is required" });
+    if (!Array.isArray(line_items) || line_items.length === 0) {
+      return res.status(400).json({ error: "At least one line item is required" });
+    }
+    const terms = payment_terms || "due_on_receipt";
+    if (!PAYMENT_TERMS.includes(terms)) {
+      return res.status(400).json({ error: `payment_terms must be one of: ${PAYMENT_TERMS.join(", ")}` });
+    }
+    for (const item of line_items) {
+      if (!item.description || item.quantity == null || item.unit_price == null) {
+        return res.status(400).json({ error: "Each line item needs description, quantity, and unit_price" });
+      }
+    }
+
+    const ownsCustomer = await client.query(`SELECT id FROM customers WHERE id = $1 AND company_id = $2`, [customer_id, req.companyId]);
+    if (ownsCustomer.rowCount === 0) return res.status(400).json({ error: "Customer not found" });
+
+    let jobId = null;
+    if (job_id) {
+      const ownsJob = await client.query(`SELECT id FROM jobs WHERE id = $1 AND company_id = $2`, [job_id, req.companyId]);
+      if (ownsJob.rowCount === 0) return res.status(400).json({ error: "Job not found" });
+      jobId = job_id;
+    }
+
+    const issueDate = issue_date || new Date().toISOString().slice(0, 10);
+    const dueDate = computeDueDate(issueDate, terms);
+    const { subtotal, taxAmount, total } = computeInvoiceTotals(line_items, tax_rate || 0);
+
+    await client.query("BEGIN");
+    // Per-company advisory lock so two invoices created at the same instant
+    // can't both land on the same invoice_number.
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [req.companyId]);
+    const numResult = await client.query(
+      `SELECT COALESCE(MAX(invoice_number), 0) + 1 AS next FROM invoices WHERE company_id = $1`,
+      [req.companyId]
+    );
+    const invoiceNumber = numResult.rows[0].next;
+
+    const invoiceResult = await client.query(
+      `INSERT INTO invoices (company_id, customer_id, job_id, invoice_number, payment_terms, issue_date, due_date, notes, subtotal, tax_rate, tax_amount, total)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       RETURNING *`,
+      [req.companyId, customer_id, jobId, invoiceNumber, terms, issueDate, dueDate, notes || null, subtotal, tax_rate || 0, taxAmount, total]
+    );
+    const invoice = invoiceResult.rows[0];
+
+    for (let i = 0; i < line_items.length; i++) {
+      const item = line_items[i];
+      await client.query(
+        `INSERT INTO invoice_line_items (invoice_id, description, quantity, unit_price, sort_order)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [invoice.id, item.description, item.quantity, item.unit_price, i]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.status(201).json({ ...invoice, line_items: line_items.map((it, i) => ({ ...it, sort_order: i })) });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("POST /admin/invoices failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't create invoice." });
+  } finally {
+    client.release();
+  }
+});
+
+// PATCH /api/admin/invoices/:id
+// Body: any of { customer_id, job_id, payment_terms, issue_date, tax_rate, notes, line_items }
+// Only allowed while the invoice is still a draft -- once it's been sent,
+// the numbers on the customer's copy shouldn't silently change out from
+// under them. Void it and create a new one instead.
+router.patch("/invoices/:id", async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const { id } = req.params;
+    const owns = await client.query(`SELECT * FROM invoices WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
+    if (owns.rows[0].status !== "draft") {
+      return res.status(400).json({ error: "Only draft invoices can be edited. Void it and create a new one instead." });
+    }
+    const existing = owns.rows[0];
+    const { customer_id, job_id, payment_terms, issue_date, tax_rate, notes, line_items } = req.body;
+
+    if (customer_id !== undefined) {
+      const ownsCustomer = await client.query(`SELECT id FROM customers WHERE id = $1 AND company_id = $2`, [customer_id, req.companyId]);
+      if (ownsCustomer.rowCount === 0) return res.status(400).json({ error: "Customer not found" });
+    }
+    if (job_id) {
+      const ownsJob = await client.query(`SELECT id FROM jobs WHERE id = $1 AND company_id = $2`, [job_id, req.companyId]);
+      if (ownsJob.rowCount === 0) return res.status(400).json({ error: "Job not found" });
+    }
+    const terms = payment_terms !== undefined ? payment_terms : existing.payment_terms;
+    if (!PAYMENT_TERMS.includes(terms)) {
+      return res.status(400).json({ error: `payment_terms must be one of: ${PAYMENT_TERMS.join(", ")}` });
+    }
+
+    let items = line_items;
+    if (items !== undefined) {
+      if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ error: "At least one line item is required" });
+      }
+      for (const item of items) {
+        if (!item.description || item.quantity == null || item.unit_price == null) {
+          return res.status(400).json({ error: "Each line item needs description, quantity, and unit_price" });
+        }
+      }
+    } else {
+      const currentItems = await client.query(
+        `SELECT description, quantity, unit_price FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
+        [id]
+      );
+      items = currentItems.rows;
+    }
+
+    const issueDate = issue_date !== undefined ? issue_date : existing.issue_date.toISOString().slice(0, 10);
+    const dueDate = computeDueDate(issueDate, terms);
+    const taxRate = tax_rate !== undefined ? tax_rate : existing.tax_rate;
+    const { subtotal, taxAmount, total } = computeInvoiceTotals(items, taxRate);
+
+    await client.query("BEGIN");
+    const result = await client.query(
+      `UPDATE invoices SET customer_id = $1, job_id = $2, payment_terms = $3, issue_date = $4, due_date = $5,
+              notes = $6, tax_rate = $7, subtotal = $8, tax_amount = $9, total = $10
+       WHERE id = $11
+       RETURNING *`,
+      [
+        customer_id !== undefined ? customer_id : existing.customer_id,
+        job_id !== undefined ? (job_id || null) : existing.job_id,
+        terms,
+        issueDate,
+        dueDate,
+        notes !== undefined ? notes : existing.notes,
+        taxRate,
+        subtotal,
+        taxAmount,
+        total,
+        id,
+      ]
+    );
+
+    if (line_items !== undefined) {
+      await client.query(`DELETE FROM invoice_line_items WHERE invoice_id = $1`, [id]);
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        await client.query(
+          `INSERT INTO invoice_line_items (invoice_id, description, quantity, unit_price, sort_order)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [id, item.description, item.quantity, item.unit_price, i]
+        );
+      }
+    }
+
+    await client.query("COMMIT");
+    res.json(result.rows[0]);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("PATCH /admin/invoices/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't update invoice." });
+  } finally {
+    client.release();
+  }
+});
+
+// DELETE /api/admin/invoices/:id
+// Only draft invoices can be deleted outright -- once sent, use void
+// instead so the invoice number and history stay intact.
+router.delete("/invoices/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const owns = await db.query(`SELECT status FROM invoices WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
+    if (owns.rows[0].status !== "draft") {
+      return res.status(400).json({ error: "Only draft invoices can be deleted. Void it instead." });
+    }
+    await db.query(`DELETE FROM invoices WHERE id = $1`, [id]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /admin/invoices/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't delete invoice." });
+  }
+});
+
+// POST /api/admin/invoices/:id/send
+// Renders the invoice as a PDF and emails it to the customer (cc'ing this
+// company's own admin email as a paper trail), then marks the invoice
+// "sent". A sent invoice can be re-sent later (e.g. as a reminder) without
+// changing its status again.
+router.post("/invoices/:id/send", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(
+      `SELECT i.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+              c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip
+       FROM invoices i JOIN customers c ON c.id = i.customer_id
+       WHERE i.id = $1 AND i.company_id = $2`,
+      [id, req.companyId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
+    const invoice = result.rows[0];
+    if (invoice.status === "void") return res.status(400).json({ error: "Can't send a voided invoice." });
+    if (!invoice.customer_email) return res.status(400).json({ error: "This customer doesn't have an email on file." });
+
+    const itemsResult = await db.query(
+      `SELECT description, quantity, unit_price FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
+      [id]
+    );
+    const companyResult = await db.query(`SELECT name, admin_email FROM companies WHERE id = $1`, [req.companyId]);
+    const company = companyResult.rows[0];
+
+    const pdfBuffer = await renderInvoicePdf({
+      companyName: company.name,
+      invoice,
+      customer: {
+        name: invoice.customer_name,
+        email: invoice.customer_email,
+        phone: invoice.customer_phone,
+        street: invoice.customer_street,
+        city: invoice.customer_city,
+        state: invoice.customer_state,
+        zip: invoice.customer_zip,
+      },
+      lineItems: itemsResult.rows,
+    });
+
+    await sendInvoiceEmail({
+      to: invoice.customer_email,
+      cc: company.admin_email,
+      companyName: company.name,
+      invoice,
+      pdfBuffer,
+    });
+
+    const updateResult = await db.query(
+      `UPDATE invoices SET status = 'sent', sent_at = now() WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    res.json(updateResult.rows[0]);
+  } catch (err) {
+    console.error("POST /admin/invoices/:id/send failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't send invoice." });
+  }
+});
+
+// PATCH /api/admin/invoices/:id/mark-paid
+// Body: { payment_method } -- one of card/check/cash/other. Doesn't process
+// any payment itself; this just records how payment came in (a check that
+// arrived in the mail, a card run through a separate terminal, cash, etc.)
+// so the invoice's status reflects reality.
+router.patch("/invoices/:id/mark-paid", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { payment_method } = req.body;
+    if (!PAYMENT_METHODS.includes(payment_method)) {
+      return res.status(400).json({ error: `payment_method must be one of: ${PAYMENT_METHODS.join(", ")}` });
+    }
+    const owns = await db.query(`SELECT status FROM invoices WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
+    if (owns.rows[0].status === "void") return res.status(400).json({ error: "Can't mark a voided invoice as paid." });
+
+    const result = await db.query(
+      `UPDATE invoices SET status = 'paid', payment_method = $1, paid_at = now() WHERE id = $2 RETURNING *`,
+      [payment_method, id]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("PATCH /admin/invoices/:id/mark-paid failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't mark invoice as paid." });
+  }
+});
+
+// PATCH /api/admin/invoices/:id/void
+// Voids an invoice (sent by mistake, job fell through, etc.) without
+// deleting it, so the invoice number and history stay intact.
+router.patch("/invoices/:id/void", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(
+      `UPDATE invoices SET status = 'void' WHERE id = $1 AND company_id = $2 RETURNING *`,
+      [id, req.companyId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("PATCH /admin/invoices/:id/void failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't void invoice." });
   }
 });
 

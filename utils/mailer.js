@@ -157,4 +157,64 @@ async function sendEmployeePinResetEmail({ to, name, token, companyName }) {
   }
 }
 
-module.exports = { sendTimesheetEmail, sendAdminPasswordResetEmail, sendEmployeePinResetEmail };
+const PAYMENT_TERMS_LABELS = {
+  due_on_receipt: "Due on receipt",
+  net_15: "Net 15",
+  net_30: "Net 30",
+  net_60: "Net 60",
+  net_90: "Net 90",
+};
+
+function fmtMoney(n) {
+  return `$${Number(n).toFixed(2)}`;
+}
+
+// Emails an invoice PDF to the customer, cc'ing the company's own admin
+// email so there's always a paper trail of what went out. pdfBuffer is a
+// Buffer (from utils/invoicePdf.js) attached as base64, the format Resend's
+// API expects for attachments.
+async function sendInvoiceEmail({ to, cc, companyName, invoice, pdfBuffer }) {
+  const html = `
+    <div style="font-family: -apple-system, sans-serif;">
+      <h2>Invoice #${invoice.invoice_number} from ${companyName}</h2>
+      <p>Amount due: <strong>${fmtMoney(invoice.total)}</strong></p>
+      <p>Due date: ${fmtDate(invoice.due_date)} (${PAYMENT_TERMS_LABELS[invoice.payment_terms] || invoice.payment_terms})</p>
+      <p>The full invoice is attached as a PDF.</p>
+    </div>
+  `;
+
+  const body = {
+    from: FROM_ADDRESS,
+    to: [to],
+    subject: `Invoice #${invoice.invoice_number} from ${companyName} — ${fmtMoney(invoice.total)} due ${fmtDate(invoice.due_date)}`,
+    html,
+    attachments: [
+      {
+        filename: `invoice-${invoice.invoice_number}.pdf`,
+        content: pdfBuffer.toString("base64"),
+      },
+    ],
+  };
+  if (cc) body.cc = [cc];
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`Resend API error (${res.status}): ${errBody}`);
+  }
+}
+
+module.exports = {
+  sendTimesheetEmail,
+  sendAdminPasswordResetEmail,
+  sendEmployeePinResetEmail,
+  sendInvoiceEmail,
+};
