@@ -1023,63 +1023,6 @@ router.get("/invoices", async (req, res) => {
   }
 });
 
-// GET /api/admin/history
-// A single combined, newest-first feed of every appointment (from the
-// schedule/jobs table) and every invoice for this company, so Jeremy can
-// see "everything that's happened" in one place instead of checking the
-// Schedule and Invoices tabs separately. Quotes aren't a feature yet, so
-// they're left out for now -- this can fold them in once that exists.
-router.get("/history", async (req, res) => {
-  try {
-    const appointments = await db.query(
-      `SELECT j.id, j.title, j.event_type, j.start_date, j.end_date,
-              j.customer_id, c.name AS customer_name
-       FROM jobs j
-       LEFT JOIN customers c ON c.id = j.customer_id
-       WHERE j.company_id = $1`,
-      [req.companyId]
-    );
-    const invoices = await db.query(
-      `SELECT i.id, i.invoice_number, i.status, i.total, i.issue_date, i.due_date,
-              i.customer_id, c.name AS customer_name,
-              (i.status = 'sent' AND i.due_date < CURRENT_DATE) AS is_overdue
-       FROM invoices i
-       JOIN customers c ON c.id = i.customer_id
-       WHERE i.company_id = $1`,
-      [req.companyId]
-    );
-
-    const items = [
-      ...appointments.rows.map((a) => ({
-        type: "appointment",
-        id: a.id,
-        date: a.start_date,
-        customer_id: a.customer_id,
-        customer_name: a.customer_name || "No customer",
-        title: a.title,
-        event_type: a.event_type,
-      })),
-      ...invoices.rows.map((i) => ({
-        type: "invoice",
-        id: i.id,
-        date: i.issue_date,
-        customer_id: i.customer_id,
-        customer_name: i.customer_name,
-        invoice_number: i.invoice_number,
-        status: i.status,
-        is_overdue: i.is_overdue,
-        total: i.total,
-        due_date: i.due_date,
-      })),
-    ];
-    items.sort((a, b) => new Date(b.date) - new Date(a.date));
-    res.json(items);
-  } catch (err) {
-    console.error("GET /admin/history failed:", err);
-    res.status(500).json({ error: err.message || "Couldn't load history." });
-  }
-});
-
 // GET /api/admin/invoices/:id
 // Full detail, including line items and the customer's contact info (used
 // both for the edit form and to render/send the PDF).
