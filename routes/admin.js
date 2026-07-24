@@ -896,6 +896,77 @@ function computeDueDate(issueDate, paymentTerms) {
   return d.toISOString().slice(0, 10);
 }
 
+// Renders the invoice as a PDF, emails it to the customer (cc'ing this
+// company's own admin email as a paper trail), and marks it "sent". Shared
+// by the explicit "Send" button and by auto-send-on-save, so both paths
+// stay identical. Throws on failure; err.status carries the HTTP status the
+// caller should use if it turns the error into a response, err.expected
+// marks failures that are a normal part of the flow (no email on file yet,
+// invoice voided) rather than a real bug.
+async function sendInvoiceNow(invoiceId, companyId) {
+  const result = await db.query(
+    `SELECT i.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+            c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip
+     FROM invoices i JOIN customers c ON c.id = i.customer_id
+     WHERE i.id = $1 AND i.company_id = $2`,
+    [invoiceId, companyId]
+  );
+  if (result.rowCount === 0) {
+    const err = new Error("Invoice not found");
+    err.status = 404;
+    throw err;
+  }
+  const invoice = result.rows[0];
+  if (invoice.status === "void") {
+    const err = new Error("Can't send a voided invoice.");
+    err.status = 400;
+    err.expected = true;
+    throw err;
+  }
+  if (!invoice.customer_email) {
+    const err = new Error("This customer doesn't have an email on file.");
+    err.status = 400;
+    err.expected = true;
+    throw err;
+  }
+
+  const itemsResult = await db.query(
+    `SELECT description, quantity, unit_price FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
+    [invoiceId]
+  );
+  const companyResult = await db.query(`SELECT name, admin_email FROM companies WHERE id = $1`, [companyId]);
+  const company = companyResult.rows[0];
+
+  const pdfBuffer = await renderInvoicePdf({
+    companyName: company.name,
+    invoice,
+    customer: {
+      name: invoice.customer_name,
+      email: invoice.customer_email,
+      phone: invoice.customer_phone,
+      street: invoice.customer_street,
+      city: invoice.customer_city,
+      state: invoice.customer_state,
+      zip: invoice.customer_zip,
+    },
+    lineItems: itemsResult.rows,
+  });
+
+  await sendInvoiceEmail({
+    to: invoice.customer_email,
+    cc: company.admin_email,
+    companyName: company.name,
+    invoice,
+    pdfBuffer,
+  });
+
+  const updateResult = await db.query(
+    `UPDATE invoices SET status = 'sent', sent_at = now() WHERE id = $1 RETURNING *`,
+    [invoiceId]
+  );
+  return updateResult.rows[0];
+}
+
 // GET /api/admin/invoices
 // Returns every invoice for this company, most recent first, with the
 // customer's name joined in and an `is_overdue` flag computed on the fly
@@ -953,8 +1024,11 @@ router.get("/invoices/:id", async (req, res) => {
 
 // POST /api/admin/invoices
 // Body: { customer_id, job_id?, payment_terms, issue_date?, tax_rate?, notes?, line_items: [{description, quantity, unit_price}] }
-// Always created as a draft -- POST /invoices/:id/send is the only thing
-// that flips it to "sent".
+// Saved as a draft, then immediately emailed to the customer -- the
+// response's status will be "sent" if that succeeded. If the customer has
+// no email on file (or sending otherwise fails), it's left as a draft and
+// the response includes a `send_warning` explaining why, so nothing is
+// silently lost -- the manual Send button can be used once that's fixed.
 router.post("/invoices", async (req, res) => {
   const client = await db.pool.connect();
   try {
@@ -1015,7 +1089,21 @@ router.post("/invoices", async (req, res) => {
     }
 
     await client.query("COMMIT");
-    res.status(201).json({ ...invoice, line_items: line_items.map((it, i) => ({ ...it, sort_order: i })) });
+
+    let finalInvoice = invoice;
+    let sendWarning = null;
+    try {
+      finalInvoice = await sendInvoiceNow(invoice.id, req.companyId);
+    } catch (sendErr) {
+      if (!sendErr.expected) console.error("Auto-send on invoice creation failed:", sendErr);
+      sendWarning = sendErr.message || "Couldn't send the invoice automatically.";
+    }
+
+    res.status(201).json({
+      ...finalInvoice,
+      line_items: line_items.map((it, i) => ({ ...it, sort_order: i })),
+      send_warning: sendWarning,
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("POST /admin/invoices failed:", err);
@@ -1029,7 +1117,9 @@ router.post("/invoices", async (req, res) => {
 // Body: any of { customer_id, job_id, payment_terms, issue_date, tax_rate, notes, line_items }
 // Only allowed while the invoice is still a draft -- once it's been sent,
 // the numbers on the customer's copy shouldn't silently change out from
-// under them. Void it and create a new one instead.
+// under them. Void it and create a new one instead. After saving, this
+// also attempts to auto-send -- useful for a draft that stayed a draft
+// because the customer had no email on file yet (add one, then re-save).
 router.patch("/invoices/:id", async (req, res) => {
   const client = await db.pool.connect();
   try {
@@ -1112,7 +1202,17 @@ router.patch("/invoices/:id", async (req, res) => {
     }
 
     await client.query("COMMIT");
-    res.json(result.rows[0]);
+
+    let finalInvoice = result.rows[0];
+    let sendWarning = null;
+    try {
+      finalInvoice = await sendInvoiceNow(id, req.companyId);
+    } catch (sendErr) {
+      if (!sendErr.expected) console.error("Auto-send on invoice update failed:", sendErr);
+      sendWarning = sendErr.message || "Couldn't send the invoice automatically.";
+    }
+
+    res.json({ ...finalInvoice, send_warning: sendWarning });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("PATCH /admin/invoices/:id failed:", err);
@@ -1142,63 +1242,17 @@ router.delete("/invoices/:id", async (req, res) => {
 });
 
 // POST /api/admin/invoices/:id/send
-// Renders the invoice as a PDF and emails it to the customer (cc'ing this
-// company's own admin email as a paper trail), then marks the invoice
-// "sent". A sent invoice can be re-sent later (e.g. as a reminder) without
-// changing its status again.
+// Manual send/resend -- the same logic new invoices trigger automatically
+// on save, exposed here for resending as a reminder, or for a draft that
+// didn't auto-send the first time (e.g. the customer had no email on file
+// yet).
 router.post("/invoices/:id/send", async (req, res) => {
   try {
-    const { id } = req.params;
-    const result = await db.query(
-      `SELECT i.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
-              c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip
-       FROM invoices i JOIN customers c ON c.id = i.customer_id
-       WHERE i.id = $1 AND i.company_id = $2`,
-      [id, req.companyId]
-    );
-    if (result.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
-    const invoice = result.rows[0];
-    if (invoice.status === "void") return res.status(400).json({ error: "Can't send a voided invoice." });
-    if (!invoice.customer_email) return res.status(400).json({ error: "This customer doesn't have an email on file." });
-
-    const itemsResult = await db.query(
-      `SELECT description, quantity, unit_price FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
-      [id]
-    );
-    const companyResult = await db.query(`SELECT name, admin_email FROM companies WHERE id = $1`, [req.companyId]);
-    const company = companyResult.rows[0];
-
-    const pdfBuffer = await renderInvoicePdf({
-      companyName: company.name,
-      invoice,
-      customer: {
-        name: invoice.customer_name,
-        email: invoice.customer_email,
-        phone: invoice.customer_phone,
-        street: invoice.customer_street,
-        city: invoice.customer_city,
-        state: invoice.customer_state,
-        zip: invoice.customer_zip,
-      },
-      lineItems: itemsResult.rows,
-    });
-
-    await sendInvoiceEmail({
-      to: invoice.customer_email,
-      cc: company.admin_email,
-      companyName: company.name,
-      invoice,
-      pdfBuffer,
-    });
-
-    const updateResult = await db.query(
-      `UPDATE invoices SET status = 'sent', sent_at = now() WHERE id = $1 RETURNING *`,
-      [id]
-    );
-    res.json(updateResult.rows[0]);
+    const invoice = await sendInvoiceNow(req.params.id, req.companyId);
+    res.json(invoice);
   } catch (err) {
-    console.error("POST /admin/invoices/:id/send failed:", err);
-    res.status(500).json({ error: err.message || "Couldn't send invoice." });
+    if (!err.expected) console.error("POST /admin/invoices/:id/send failed:", err);
+    res.status(err.status || 500).json({ error: err.message || "Couldn't send invoice." });
   }
 });
 
