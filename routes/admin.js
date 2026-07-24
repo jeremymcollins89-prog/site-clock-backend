@@ -978,7 +978,7 @@ router.get("/invoices", async (req, res) => {
     const result = await db.query(
       `SELECT i.id, i.invoice_number, i.status, i.payment_terms, i.payment_method,
               i.issue_date, i.due_date, i.subtotal, i.tax_rate, i.tax_amount, i.total,
-              i.sent_at, i.paid_at, i.created_at,
+              i.sent_at, i.paid_at, i.created_at, i.reminder_count, i.last_reminder_sent_at,
               i.customer_id, c.name AS customer_name,
               (i.status = 'sent' AND i.due_date < CURRENT_DATE) AS is_overdue
        FROM invoices i

@@ -27,6 +27,7 @@ process.on("uncaughtException", (err) => {
 
 const express = require("express");
 const cors = require("cors");
+const cron = require("node-cron");
 const companyRoutes = require("./routes/companies");
 const authRoutes = require("./routes/auth");
 const timeEntryRoutes = require("./routes/timeEntries");
@@ -34,6 +35,7 @@ const timesheetRoutes = require("./routes/timesheets");
 const adminRoutes = require("./routes/admin");
 const pushRoutes = require("./routes/push");
 const scheduleRoutes = require("./routes/schedule");
+const { checkAndSendReminders } = require("./utils/invoiceReminders");
 
 const app = express();
 
@@ -68,6 +70,19 @@ Sentry.setupExpressErrorHandler(app);
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
   res.status(500).json({ error: "Something went wrong. Please try again." });
+});
+
+// Runs once a day (15:00 UTC, roughly 8-9am in Colorado) to send automatic
+// reminder emails for unpaid invoices. See utils/invoiceReminders.js for the
+// schedule/cap logic -- this just triggers it and reports failures to
+// Sentry instead of letting the whole process crash.
+cron.schedule("0 15 * * *", () => {
+  checkAndSendReminders()
+    .then((sent) => console.log(`Invoice reminder job sent ${sent} reminder(s).`))
+    .catch((err) => {
+      console.error("Invoice reminder job failed:", err);
+      Sentry.captureException(err);
+    });
 });
 
 const PORT = process.env.PORT || 3000;

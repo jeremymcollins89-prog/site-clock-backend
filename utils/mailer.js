@@ -212,9 +212,58 @@ async function sendInvoiceEmail({ to, cc, companyName, invoice, pdfBuffer }) {
   }
 }
 
+// Automatic follow-up for an unpaid invoice -- same PDF re-attached, but the
+// subject/body make clear it's a reminder rather than the original send, and
+// say where it falls in the capped sequence (max 5, see
+// utils/invoiceReminders.js) so the customer isn't confused by "reminder 4".
+async function sendInvoiceReminderEmail({ to, cc, companyName, invoice, pdfBuffer, reminderNumber, maxReminders }) {
+  const isPastDue = new Date(invoice.due_date) < new Date();
+  const html = `
+    <div style="font-family: -apple-system, sans-serif;">
+      <h2>Reminder: Invoice #${invoice.invoice_number} from ${companyName}</h2>
+      <p>Amount due: <strong>${fmtMoney(invoice.total)}</strong></p>
+      <p>${isPastDue
+        ? `This invoice was due on ${fmtDate(invoice.due_date)} and hasn't been marked paid yet.`
+        : `This invoice is due on ${fmtDate(invoice.due_date)}.`
+      }</p>
+      <p>The full invoice is attached again as a PDF.</p>
+      <p style="color:#999; font-size:12px;">Reminder ${reminderNumber} of ${maxReminders}.</p>
+    </div>
+  `;
+
+  const body = {
+    from: FROM_ADDRESS,
+    to: [to],
+    subject: `Reminder: Invoice #${invoice.invoice_number} from ${companyName} — ${fmtMoney(invoice.total)} due ${fmtDate(invoice.due_date)}`,
+    html,
+    attachments: [
+      {
+        filename: `invoice-${invoice.invoice_number}.pdf`,
+        content: pdfBuffer.toString("base64"),
+      },
+    ],
+  };
+  if (cc) body.cc = [cc];
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`Resend API error (${res.status}): ${errBody}`);
+  }
+}
+
 module.exports = {
   sendTimesheetEmail,
   sendAdminPasswordResetEmail,
+  sendInvoiceReminderEmail,
   sendEmployeePinResetEmail,
   sendInvoiceEmail,
 };
