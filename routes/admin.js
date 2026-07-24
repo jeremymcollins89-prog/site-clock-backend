@@ -1383,6 +1383,57 @@ router.patch("/invoices/:id/void", async (req, res) => {
   }
 });
 
+// ---------- Reports ----------
+// GET /api/admin/reports/summary?start=YYYY-MM-DD&end=YYYY-MM-DD
+// Aggregates for the Reports tab's preset time ranges (1 week, 1 month,
+// etc.) and the this-year-vs-last-year comparison, which just calls this
+// twice with two different ranges. "Invoiced" is billed amount (non-draft,
+// non-void invoices by issue date); "Paid" is what was actually collected
+// (paid invoices by the date they were marked paid) -- these intentionally
+// aren't the same number, since something can be invoiced in one period and
+// paid in a later one.
+router.get("/reports/summary", async (req, res) => {
+  try {
+    const { start, end } = req.query;
+    if (!start || !end) return res.status(400).json({ error: "start and end are required" });
+
+    const laborResult = await db.query(
+      `SELECT COALESCE(SUM(d.worked_seconds), 0) AS total_seconds
+       FROM time_entry_durations d
+       JOIN employees e ON e.id = d.employee_id
+       WHERE e.company_id = $1 AND d.clock_in >= $2::date AND d.clock_in < ($3::date + INTERVAL '1 day')`,
+      [req.companyId, start, end]
+    );
+
+    const invoicedResult = await db.query(
+      `SELECT COALESCE(SUM(total), 0) AS sum_total, COUNT(*) AS cnt
+       FROM invoices
+       WHERE company_id = $1 AND status NOT IN ('draft', 'void')
+         AND issue_date >= $2::date AND issue_date <= $3::date`,
+      [req.companyId, start, end]
+    );
+
+    const paidResult = await db.query(
+      `SELECT COALESCE(SUM(total), 0) AS sum_total, COUNT(*) AS cnt
+       FROM invoices
+       WHERE company_id = $1 AND status = 'paid'
+         AND paid_at >= $2::date AND paid_at < ($3::date + INTERVAL '1 day')`,
+      [req.companyId, start, end]
+    );
+
+    res.json({
+      labor_hours: Number(laborResult.rows[0].total_seconds) / 3600,
+      invoice_total: Number(invoicedResult.rows[0].sum_total),
+      invoice_count: Number(invoicedResult.rows[0].cnt),
+      paid_invoice_total: Number(paidResult.rows[0].sum_total),
+      paid_invoice_count: Number(paidResult.rows[0].cnt),
+    });
+  } catch (err) {
+    console.error("GET /admin/reports/summary failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load report." });
+  }
+});
+
 // ---------- Catalog items ----------
 // A reusable, per-company list of recurring invoice line items (name +
 // default unit price) so common charges don't need to be re-typed on every
