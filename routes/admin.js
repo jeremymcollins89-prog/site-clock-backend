@@ -1247,4 +1247,86 @@ router.patch("/invoices/:id/void", async (req, res) => {
   }
 });
 
+// ---------- Catalog items ----------
+// A reusable, per-company list of recurring invoice line items (name +
+// default unit price) so common charges don't need to be re-typed on every
+// invoice. Picking one just pre-fills a normal line item on the invoice --
+// there's no ongoing link back to the catalog afterward.
+
+// GET /api/admin/catalog-items
+router.get("/catalog-items", async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, name, unit_price, created_at FROM catalog_items WHERE company_id = $1 ORDER BY name`,
+      [req.companyId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/catalog-items failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load catalog items." });
+  }
+});
+
+// POST /api/admin/catalog-items
+// Body: { name, unit_price }
+router.post("/catalog-items", async (req, res) => {
+  try {
+    const { name, unit_price } = req.body;
+    if (!name) return res.status(400).json({ error: "name is required" });
+    const result = await db.query(
+      `INSERT INTO catalog_items (company_id, name, unit_price) VALUES ($1, $2, $3)
+       RETURNING id, name, unit_price, created_at`,
+      [req.companyId, name, Number(unit_price) || 0]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("POST /admin/catalog-items failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't create catalog item." });
+  }
+});
+
+// PATCH /api/admin/catalog-items/:id
+// Body: { name?, unit_price? }
+router.patch("/catalog-items/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, unit_price } = req.body;
+    const owns = await db.query(`SELECT id FROM catalog_items WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Catalog item not found" });
+
+    const fields = [];
+    const values = [];
+    if (name !== undefined) { values.push(name); fields.push(`name = $${values.length}`); }
+    if (unit_price !== undefined) { values.push(Number(unit_price) || 0); fields.push(`unit_price = $${values.length}`); }
+
+    let item = owns.rows[0];
+    if (fields.length > 0) {
+      values.push(id);
+      const result = await db.query(
+        `UPDATE catalog_items SET ${fields.join(", ")} WHERE id = $${values.length}
+         RETURNING id, name, unit_price, created_at`,
+        values
+      );
+      item = result.rows[0];
+    }
+    res.json(item);
+  } catch (err) {
+    console.error("PATCH /admin/catalog-items/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't update catalog item." });
+  }
+});
+
+// DELETE /api/admin/catalog-items/:id
+router.delete("/catalog-items/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(`DELETE FROM catalog_items WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (result.rowCount === 0) return res.status(404).json({ error: "Catalog item not found" });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /admin/catalog-items/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't delete catalog item." });
+  }
+});
+
 module.exports = router;
