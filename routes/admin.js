@@ -1052,6 +1052,58 @@ router.get("/invoices/:id", async (req, res) => {
   }
 });
 
+// GET /api/admin/invoices/:id/pdf
+// Regenerates the invoice PDF on demand (from the same data used to email
+// it) and streams it back so Jeremy can see exactly what a customer
+// received, for any invoice status -- including a draft that hasn't been
+// sent yet, as a preview. Nothing is stored -- this is rendered fresh every
+// time it's requested.
+router.get("/invoices/:id/pdf", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(
+      `SELECT i.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+              c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip
+       FROM invoices i
+       JOIN customers c ON c.id = i.customer_id
+       WHERE i.id = $1 AND i.company_id = $2`,
+      [id, req.companyId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
+    const invoice = result.rows[0];
+
+    const itemsResult = await db.query(
+      `SELECT description, quantity, unit_price FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
+      [id]
+    );
+    const companyResult = await db.query(`SELECT name, logo_data FROM companies WHERE id = $1`, [req.companyId]);
+    const company = companyResult.rows[0];
+
+    const pdfBuffer = await renderInvoicePdf({
+      companyName: company.name,
+      invoice,
+      customer: {
+        name: invoice.customer_name,
+        email: invoice.customer_email,
+        phone: invoice.customer_phone,
+        street: invoice.customer_street,
+        city: invoice.customer_city,
+        state: invoice.customer_state,
+        zip: invoice.customer_zip,
+      },
+      lineItems: itemsResult.rows,
+      logoBuffer: company.logo_data || null,
+    });
+
+    res.set("Content-Type", "application/pdf");
+    res.set("Content-Disposition", `inline; filename="invoice-${invoice.invoice_number}.pdf"`);
+    res.send(pdfBuffer);
+  } catch (err) {
+    console.error("GET /admin/invoices/:id/pdf failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't generate invoice PDF." });
+  }
+});
+
 // POST /api/admin/invoices
 // Body: { customer_id, job_id?, payment_terms, issue_date?, tax_rate?, notes?, line_items: [{description, quantity, unit_price}] }
 // Saved as a draft, then immediately emailed to the customer -- the
