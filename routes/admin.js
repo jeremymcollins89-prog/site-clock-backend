@@ -939,8 +939,13 @@ router.patch("/jobs/:id", async (req, res) => {
     }
 
     if (employee_ids !== undefined || crew_ids !== undefined) {
-      const before = await db.query(`SELECT employee_id FROM job_assignments WHERE job_id = $1`, [id]);
+      const before = await db.query(`SELECT employee_id, seen_by_employee FROM job_assignments WHERE job_id = $1`, [id]);
       const beforeIds = new Set(before.rows.map((r) => r.employee_id));
+      // Employees who were already assigned keep whatever "seen" state they
+      // already had (editing the job's title/date shouldn't re-flag it as
+      // new for someone who already looked at it) -- only genuinely new
+      // assignees start out unseen.
+      const beforeSeenMap = new Map(before.rows.map((r) => [r.employee_id, r.seen_by_employee]));
 
       const assignments = await expandAssignments({ employee_ids, crew_ids, companyId: req.companyId });
       await db.query(`DELETE FROM job_assignments WHERE job_id = $1`, [id]);
@@ -948,9 +953,9 @@ router.patch("/jobs/:id", async (req, res) => {
         await Promise.all(
           Array.from(assignments.entries()).map(([employeeId, crewId]) =>
             db.query(
-              `INSERT INTO job_assignments (job_id, employee_id, assigned_via_crew_id)
-               VALUES ($1, $2, $3)`,
-              [id, employeeId, crewId]
+              `INSERT INTO job_assignments (job_id, employee_id, assigned_via_crew_id, seen_by_employee)
+               VALUES ($1, $2, $3, $4)`,
+              [id, employeeId, crewId, beforeSeenMap.has(employeeId) ? beforeSeenMap.get(employeeId) : false]
             )
           )
         );

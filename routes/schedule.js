@@ -34,10 +34,37 @@ router.get("/me", requireAuth, async (req, res) => {
        ORDER BY j.start_date, j.title`,
       [req.employee.employee_id, start, end]
     );
+
+    // Opening the Schedule tab is what clears the "new assignment" badge --
+    // mark every one of this employee's assignments as seen, independent of
+    // the date range above (which only bounds what's shown, not what's
+    // "theirs").
+    await db.query(
+      `UPDATE job_assignments SET seen_by_employee = true WHERE employee_id = $1 AND seen_by_employee = false`,
+      [req.employee.employee_id]
+    );
+
     res.json(result.rows);
   } catch (err) {
     console.error("GET /schedule/me failed:", err);
     res.status(500).json({ error: err.message || "Couldn't load schedule." });
+  }
+});
+
+// GET /api/schedule/unseen-count
+// Lightweight, safe to poll -- does NOT mark anything as seen. Used to show
+// a badge on the Schedule tab without silently clearing it in the
+// background before the employee actually looks at it.
+router.get("/unseen-count", requireAuth, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT COUNT(*)::int AS count FROM job_assignments WHERE employee_id = $1 AND seen_by_employee = false`,
+      [req.employee.employee_id]
+    );
+    res.json({ count: result.rows[0].count });
+  } catch (err) {
+    console.error("GET /schedule/unseen-count failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load unseen count." });
   }
 });
 
