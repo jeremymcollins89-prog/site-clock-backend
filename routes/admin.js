@@ -512,6 +512,66 @@ router.post("/customers", async (req, res) => {
   }
 });
 
+// POST /api/admin/customers/import
+// Body: { customers: [{ name, phone?, email?, street?, city?, state?, zip?, notes? }, ...] }
+// Bulk-imports customers from a CSV exported by other software (parsed
+// client-side, sent here as plain objects). Rows missing a name are
+// skipped, and rows whose name case-insensitively matches an existing
+// customer -- or an earlier row in the same file -- are skipped as
+// duplicates instead of creating a second record.
+router.post("/customers/import", async (req, res) => {
+  try {
+    const { customers } = req.body;
+    if (!Array.isArray(customers) || customers.length === 0) {
+      return res.status(400).json({ error: "No customers to import." });
+    }
+    if (customers.length > 2000) {
+      return res.status(400).json({ error: "That's more than 2000 rows at once -- please split the file up." });
+    }
+
+    const existing = await db.query(`SELECT name FROM customers WHERE company_id = $1`, [req.companyId]);
+    const seenNames = new Set(existing.rows.map((r) => r.name.trim().toLowerCase()));
+
+    let imported = 0;
+    const skipped = [];
+
+    for (let i = 0; i < customers.length; i++) {
+      const row = customers[i] || {};
+      const name = (row.name || "").trim();
+      if (!name) {
+        skipped.push({ row: i + 1, reason: "missing_name" });
+        continue;
+      }
+      const key = name.toLowerCase();
+      if (seenNames.has(key)) {
+        skipped.push({ row: i + 1, reason: "duplicate", name });
+        continue;
+      }
+      seenNames.add(key);
+      await db.query(
+        `INSERT INTO customers (company_id, name, phone, email, street, city, state, zip, notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          req.companyId, name,
+          (row.phone || "").trim() || null,
+          (row.email || "").trim() || null,
+          (row.street || "").trim() || null,
+          (row.city || "").trim() || null,
+          (row.state || "").trim() || null,
+          (row.zip || "").trim() || null,
+          (row.notes || "").trim() || null,
+        ]
+      );
+      imported++;
+    }
+
+    res.status(201).json({ imported, skipped });
+  } catch (err) {
+    console.error("POST /admin/customers/import failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't import customers." });
+  }
+});
+
 // PATCH /api/admin/customers/:id
 // Body: { name?, phone?, email?, street?, city?, state?, zip?, notes? }
 router.patch("/customers/:id", async (req, res) => {
