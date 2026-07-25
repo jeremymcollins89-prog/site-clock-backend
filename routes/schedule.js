@@ -24,7 +24,7 @@ router.get("/me", requireAuth, async (req, res) => {
     }
 
     const result = await db.query(
-      `SELECT j.id, j.title, j.notes, j.start_date, j.end_date, j.color, j.event_type,
+      `SELECT j.id, j.title, j.notes, j.start_date, j.end_date, j.start_time, j.color, j.event_type,
               c.name AS customer_name, c.phone AS customer_phone,
               c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip
        FROM jobs j

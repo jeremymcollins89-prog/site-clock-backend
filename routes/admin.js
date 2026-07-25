@@ -479,7 +479,7 @@ router.get("/customers/:id/events", async (req, res) => {
     if (owns.rowCount === 0) return res.status(404).json({ error: "Customer not found" });
 
     const result = await db.query(
-      `SELECT id, title, notes, start_date, end_date, color, event_type
+      `SELECT id, title, notes, start_date, end_date, start_time, color, event_type
        FROM jobs
        WHERE customer_id = $1 AND company_id = $2
        ORDER BY start_date DESC`,
@@ -702,16 +702,25 @@ async function expandAssignments({ employee_ids, crew_ids, companyId }) {
   return map;
 }
 
+function formatTimeForNotification(startTime) {
+  if (!startTime) return "";
+  const [h, m] = startTime.split(":").map(Number);
+  const period = h >= 12 ? "PM" : "AM";
+  const hour12 = h % 12 === 0 ? 12 : h % 12;
+  return ` at ${hour12}:${String(m).padStart(2, "0")} ${period}`;
+}
+
 async function notifyAssigned(employeeIds, job) {
   const dateRange =
     job.start_date === job.end_date
       ? job.start_date
       : `${job.start_date} to ${job.end_date}`;
+  const timeLabel = formatTimeForNotification(job.start_time);
   await Promise.all(
     employeeIds.map((employeeId) =>
       sendPushToEmployee(employeeId, {
         title: "New event scheduled",
-        body: `${job.title} — ${dateRange}`,
+        body: `${job.title} — ${dateRange}${timeLabel}`,
         url: "/schedule",
       }).catch((err) => console.error("Failed to send job notification:", err.message))
     )
@@ -731,7 +740,7 @@ router.get("/jobs", async (req, res) => {
     if (end) { params.push(end); conditions.push(`j.start_date <= $${params.length}`); }
 
     const result = await db.query(
-      `SELECT j.id, j.title, j.notes, j.start_date, j.end_date, j.color, j.event_type, j.created_at,
+      `SELECT j.id, j.title, j.notes, j.start_date, j.end_date, j.start_time, j.color, j.event_type, j.created_at,
               j.customer_id, c.name AS customer_name, c.phone AS customer_phone,
               c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip,
               COALESCE(
@@ -760,7 +769,7 @@ router.get("/jobs", async (req, res) => {
 // Body: { title, notes?, start_date, end_date, color, employee_ids?, crew_ids? }
 router.post("/jobs", async (req, res) => {
   try {
-    const { title, notes, start_date, end_date, color, event_type, customer_id, employee_ids, crew_ids } = req.body;
+    const { title, notes, start_date, end_date, start_time, color, event_type, customer_id, employee_ids, crew_ids } = req.body;
     if (!title || !start_date || !end_date) {
       return res.status(400).json({ error: "title, start_date, and end_date are required" });
     }
@@ -772,6 +781,9 @@ router.post("/jobs", async (req, res) => {
     if (!EVENT_TYPES.includes(eventType)) {
       return res.status(400).json({ error: `event_type must be one of: ${EVENT_TYPES.join(", ")}` });
     }
+    if (start_time && !/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(start_time)) {
+      return res.status(400).json({ error: "start_time must be in HH:MM format" });
+    }
     let customerId = null;
     if (customer_id) {
       const ownsCustomer = await db.query(`SELECT id FROM customers WHERE id = $1 AND company_id = $2`, [customer_id, req.companyId]);
@@ -780,10 +792,10 @@ router.post("/jobs", async (req, res) => {
     }
 
     const jobResult = await db.query(
-      `INSERT INTO jobs (company_id, title, notes, start_date, end_date, color, event_type, customer_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id, title, notes, start_date, end_date, color, event_type, customer_id, created_at`,
-      [req.companyId, title, notes || null, start_date, end_date, jobColor, eventType, customerId]
+      `INSERT INTO jobs (company_id, title, notes, start_date, end_date, start_time, color, event_type, customer_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id, title, notes, start_date, end_date, start_time, color, event_type, customer_id, created_at`,
+      [req.companyId, title, notes || null, start_date, end_date, start_time || null, jobColor, eventType, customerId]
     );
     const job = jobResult.rows[0];
 
@@ -817,7 +829,7 @@ router.post("/jobs", async (req, res) => {
 router.patch("/jobs/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, notes, start_date, end_date, color, event_type, customer_id, employee_ids, crew_ids } = req.body;
+    const { title, notes, start_date, end_date, start_time, color, event_type, customer_id, employee_ids, crew_ids } = req.body;
 
     const owns = await db.query(`SELECT * FROM jobs WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
     if (owns.rowCount === 0) return res.status(404).json({ error: "Event not found" });
@@ -828,6 +840,13 @@ router.patch("/jobs/:id", async (req, res) => {
     if (notes !== undefined) { values.push(notes); fields.push(`notes = $${values.length}`); }
     if (start_date !== undefined) { values.push(start_date); fields.push(`start_date = $${values.length}`); }
     if (end_date !== undefined) { values.push(end_date); fields.push(`end_date = $${values.length}`); }
+    if (start_time !== undefined) {
+      // null explicitly clears it, meaning "no specific time" -- not "leave unchanged".
+      if (start_time && !/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(start_time)) {
+        return res.status(400).json({ error: "start_time must be in HH:MM format" });
+      }
+      values.push(start_time || null); fields.push(`start_time = $${values.length}`);
+    }
     if (color !== undefined) {
       if (!JOB_COLORS[color]) {
         return res.status(400).json({ error: `color must be one of: ${Object.keys(JOB_COLORS).join(", ")}` });
@@ -853,7 +872,7 @@ router.patch("/jobs/:id", async (req, res) => {
       values.push(id);
       const result = await db.query(
         `UPDATE jobs SET ${fields.join(", ")} WHERE id = $${values.length}
-         RETURNING id, title, notes, start_date, end_date, color, event_type, customer_id, created_at`,
+         RETURNING id, title, notes, start_date, end_date, start_time, color, event_type, customer_id, created_at`,
         values
       );
       job = result.rows[0];
