@@ -5,14 +5,15 @@ const db = require("../db");
 const { loginAdmin } = require("../utils/adminAuth");
 const { hashPin } = require("../utils/auth");
 const { generateResetToken, hashResetToken } = require("../utils/resetToken");
-const { sendAdminPasswordResetEmail, sendInvoiceEmail } = require("../utils/mailer");
-const { renderInvoicePdf } = require("../utils/invoicePdf");
+const { sendAdminPasswordResetEmail, sendInvoiceEmail, sendQuoteEmail } = require("../utils/mailer");
+const { renderInvoicePdf, renderQuotePdf } = require("../utils/invoicePdf");
 const requireAdmin = require("../middleware/requireAdmin");
 const { getPayPeriod, PAY_FREQUENCIES } = require("../utils/payPeriod");
 const { JOB_COLORS } = require("../utils/jobColors");
 const { sendPushToEmployee } = require("../utils/webPush");
 
 const EVENT_TYPES = ["job", "personal", "other"];
+const QUOTE_STATUSES = ["draft", "sent", "accepted", "declined"];
 const PAYMENT_TERMS = ["due_on_receipt", "net_15", "net_30", "net_60", "net_90"];
 const PAYMENT_TERMS_DAYS = { due_on_receipt: 0, net_15: 15, net_30: 30, net_60: 60, net_90: 90 };
 const PAYMENT_METHODS = ["card", "check", "cash", "other"];
@@ -1474,6 +1475,511 @@ router.patch("/invoices/:id/void", async (req, res) => {
   } catch (err) {
     console.error("PATCH /admin/invoices/:id/void failed:", err);
     res.status(500).json({ error: err.message || "Couldn't void invoice." });
+  }
+});
+
+// ---------- Quotes ----------
+// A quote (estimate) is priced up for a customer before any work is booked.
+// It shares its line-item/tax/total math with invoices (computeInvoiceTotals
+// works on either), but has its own sequential numbering, its own simpler
+// draft -> sent -> accepted/declined status, and no payment concept at all
+// -- it doesn't owe anything until it's converted into a job and/or an
+// invoice. Unlike invoices, a new quote is NOT auto-sent on save -- quotes
+// are commonly drafted, reviewed internally, and only sent once ready, so
+// sending here is always an explicit action.
+
+// GET /api/admin/quotes
+router.get("/quotes", async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT q.id, q.quote_number, q.status, q.issue_date, q.expiration_date,
+              q.subtotal, q.tax_rate, q.tax_amount, q.total, q.sent_at, q.created_at,
+              q.converted_job_id, q.converted_invoice_id,
+              q.customer_id, c.name AS customer_name,
+              (q.status = 'sent' AND q.expiration_date IS NOT NULL AND q.expiration_date < CURRENT_DATE) AS is_expired
+       FROM quotes q
+       JOIN customers c ON c.id = q.customer_id
+       WHERE q.company_id = $1
+       ORDER BY q.quote_number DESC`,
+      [req.companyId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/quotes failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load quotes." });
+  }
+});
+
+// GET /api/admin/quotes/:id
+router.get("/quotes/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(
+      `SELECT q.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+              c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip,
+              (q.status = 'sent' AND q.expiration_date IS NOT NULL AND q.expiration_date < CURRENT_DATE) AS is_expired
+       FROM quotes q
+       JOIN customers c ON c.id = q.customer_id
+       WHERE q.id = $1 AND q.company_id = $2`,
+      [id, req.companyId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Quote not found" });
+
+    const items = await db.query(
+      `SELECT id, description, quantity, unit_price, (quantity * unit_price) AS amount
+       FROM quote_line_items WHERE quote_id = $1 ORDER BY sort_order`,
+      [id]
+    );
+    res.json({ ...result.rows[0], line_items: items.rows });
+  } catch (err) {
+    console.error("GET /admin/quotes/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load quote." });
+  }
+});
+
+// GET /api/admin/quotes/:id/pdf
+// Regenerated fresh on every request, same as the invoice PDF -- works for
+// any status, including a draft, as a preview.
+router.get("/quotes/:id/pdf", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(
+      `SELECT q.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+              c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip
+       FROM quotes q
+       JOIN customers c ON c.id = q.customer_id
+       WHERE q.id = $1 AND q.company_id = $2`,
+      [id, req.companyId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Quote not found" });
+    const quote = result.rows[0];
+
+    const itemsResult = await db.query(
+      `SELECT description, quantity, unit_price FROM quote_line_items WHERE quote_id = $1 ORDER BY sort_order`,
+      [id]
+    );
+    const companyResult = await db.query(`SELECT name, logo_data FROM companies WHERE id = $1`, [req.companyId]);
+    const company = companyResult.rows[0];
+
+    const pdfBuffer = await renderQuotePdf({
+      companyName: company.name,
+      quote,
+      customer: {
+        name: quote.customer_name,
+        email: quote.customer_email,
+        phone: quote.customer_phone,
+        street: quote.customer_street,
+        city: quote.customer_city,
+        state: quote.customer_state,
+        zip: quote.customer_zip,
+      },
+      lineItems: itemsResult.rows,
+      logoBuffer: company.logo_data || null,
+    });
+
+    res.set("Content-Type", "application/pdf");
+    res.set("Content-Disposition", `inline; filename="quote-${quote.quote_number}.pdf"`);
+    res.send(pdfBuffer);
+  } catch (err) {
+    console.error("GET /admin/quotes/:id/pdf failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't generate quote PDF." });
+  }
+});
+
+// POST /api/admin/quotes
+// Body: { customer_id, issue_date?, expiration_date?, tax_rate?, notes?, line_items: [{description, quantity, unit_price}] }
+router.post("/quotes", async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const { customer_id, issue_date, expiration_date, tax_rate, notes, line_items } = req.body;
+    if (!customer_id) return res.status(400).json({ error: "customer_id is required" });
+    if (!Array.isArray(line_items) || line_items.length === 0) {
+      return res.status(400).json({ error: "At least one line item is required" });
+    }
+    for (const item of line_items) {
+      if (!item.description || item.quantity == null || item.unit_price == null) {
+        return res.status(400).json({ error: "Each line item needs description, quantity, and unit_price" });
+      }
+    }
+
+    const ownsCustomer = await client.query(`SELECT id FROM customers WHERE id = $1 AND company_id = $2`, [customer_id, req.companyId]);
+    if (ownsCustomer.rowCount === 0) return res.status(400).json({ error: "Customer not found" });
+
+    const issueDate = issue_date || new Date().toISOString().slice(0, 10);
+    const { subtotal, taxAmount, total } = computeInvoiceTotals(line_items, tax_rate || 0);
+
+    await client.query("BEGIN");
+    // Per-company advisory lock -- same trick invoice_number uses -- so two
+    // quotes created at the same instant can't collide on the same number.
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [req.companyId]);
+    const numResult = await client.query(
+      `SELECT COALESCE(MAX(quote_number), 0) + 1 AS next FROM quotes WHERE company_id = $1`,
+      [req.companyId]
+    );
+    const quoteNumber = numResult.rows[0].next;
+
+    const quoteResult = await client.query(
+      `INSERT INTO quotes (company_id, customer_id, quote_number, issue_date, expiration_date, notes, subtotal, tax_rate, tax_amount, total)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       RETURNING *`,
+      [req.companyId, customer_id, quoteNumber, issueDate, expiration_date || null, notes || null, subtotal, tax_rate || 0, taxAmount, total]
+    );
+    const quote = quoteResult.rows[0];
+
+    for (let i = 0; i < line_items.length; i++) {
+      const item = line_items[i];
+      await client.query(
+        `INSERT INTO quote_line_items (quote_id, description, quantity, unit_price, sort_order)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [quote.id, item.description, item.quantity, item.unit_price, i]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.status(201).json({ ...quote, line_items: line_items.map((it, i) => ({ ...it, sort_order: i })) });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("POST /admin/quotes failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't create quote." });
+  } finally {
+    client.release();
+  }
+});
+
+// PATCH /api/admin/quotes/:id
+// Body: any of { customer_id, issue_date, expiration_date, tax_rate, notes, line_items }
+// Editable while draft or sent (a quote commonly gets revised after going
+// out, unlike a sent invoice) -- locked once accepted/declined so the record
+// of what was actually agreed to (or turned down) doesn't shift underfoot.
+router.patch("/quotes/:id", async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const { id } = req.params;
+    const owns = await client.query(`SELECT * FROM quotes WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Quote not found" });
+    if (!["draft", "sent"].includes(owns.rows[0].status)) {
+      return res.status(400).json({ error: "Only draft or sent quotes can be edited." });
+    }
+    const existing = owns.rows[0];
+    const { customer_id, issue_date, expiration_date, tax_rate, notes, line_items } = req.body;
+
+    if (customer_id !== undefined) {
+      const ownsCustomer = await client.query(`SELECT id FROM customers WHERE id = $1 AND company_id = $2`, [customer_id, req.companyId]);
+      if (ownsCustomer.rowCount === 0) return res.status(400).json({ error: "Customer not found" });
+    }
+
+    let items = line_items;
+    if (items !== undefined) {
+      if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ error: "At least one line item is required" });
+      }
+      for (const item of items) {
+        if (!item.description || item.quantity == null || item.unit_price == null) {
+          return res.status(400).json({ error: "Each line item needs description, quantity, and unit_price" });
+        }
+      }
+    } else {
+      const currentItems = await client.query(
+        `SELECT description, quantity, unit_price FROM quote_line_items WHERE quote_id = $1 ORDER BY sort_order`,
+        [id]
+      );
+      items = currentItems.rows;
+    }
+
+    const taxRate = tax_rate !== undefined ? tax_rate : existing.tax_rate;
+    const { subtotal, taxAmount, total } = computeInvoiceTotals(items, taxRate);
+
+    await client.query("BEGIN");
+    const result = await client.query(
+      `UPDATE quotes SET customer_id = $1, issue_date = $2, expiration_date = $3,
+              notes = $4, tax_rate = $5, subtotal = $6, tax_amount = $7, total = $8
+       WHERE id = $9
+       RETURNING *`,
+      [
+        customer_id !== undefined ? customer_id : existing.customer_id,
+        issue_date !== undefined ? issue_date : existing.issue_date.toISOString().slice(0, 10),
+        expiration_date !== undefined ? (expiration_date || null) : existing.expiration_date,
+        notes !== undefined ? notes : existing.notes,
+        taxRate,
+        subtotal,
+        taxAmount,
+        total,
+        id,
+      ]
+    );
+
+    if (line_items !== undefined) {
+      await client.query(`DELETE FROM quote_line_items WHERE quote_id = $1`, [id]);
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        await client.query(
+          `INSERT INTO quote_line_items (quote_id, description, quantity, unit_price, sort_order)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [id, item.description, item.quantity, item.unit_price, i]
+        );
+      }
+    }
+
+    await client.query("COMMIT");
+    res.json(result.rows[0]);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("PATCH /admin/quotes/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't update quote." });
+  } finally {
+    client.release();
+  }
+});
+
+// DELETE /api/admin/quotes/:id
+// Only drafts can be deleted outright, matching invoices.
+router.delete("/quotes/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const owns = await db.query(`SELECT status FROM quotes WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Quote not found" });
+    if (owns.rows[0].status !== "draft") {
+      return res.status(400).json({ error: "Only draft quotes can be deleted." });
+    }
+    await db.query(`DELETE FROM quotes WHERE id = $1`, [id]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /admin/quotes/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't delete quote." });
+  }
+});
+
+// POST /api/admin/quotes/:id/send
+// Emails the quote PDF to the customer and marks it "sent". Unlike invoices
+// this is never automatic -- always an explicit click.
+router.post("/quotes/:id/send", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(
+      `SELECT q.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+              c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip
+       FROM quotes q JOIN customers c ON c.id = q.customer_id
+       WHERE q.id = $1 AND q.company_id = $2`,
+      [id, req.companyId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Quote not found" });
+    const quote = result.rows[0];
+    if (!["draft", "sent"].includes(quote.status)) {
+      return res.status(400).json({ error: "Only draft or sent quotes can be sent." });
+    }
+    if (!quote.customer_email) {
+      return res.status(400).json({ error: "This customer doesn't have an email on file." });
+    }
+
+    const itemsResult = await db.query(
+      `SELECT description, quantity, unit_price FROM quote_line_items WHERE quote_id = $1 ORDER BY sort_order`,
+      [id]
+    );
+    const companyResult = await db.query(`SELECT name, admin_email, logo_data FROM companies WHERE id = $1`, [req.companyId]);
+    const company = companyResult.rows[0];
+
+    const pdfBuffer = await renderQuotePdf({
+      companyName: company.name,
+      quote,
+      customer: {
+        name: quote.customer_name,
+        email: quote.customer_email,
+        phone: quote.customer_phone,
+        street: quote.customer_street,
+        city: quote.customer_city,
+        state: quote.customer_state,
+        zip: quote.customer_zip,
+      },
+      lineItems: itemsResult.rows,
+      logoBuffer: company.logo_data || null,
+    });
+
+    await sendQuoteEmail({
+      to: quote.customer_email,
+      cc: company.admin_email,
+      companyName: company.name,
+      quote,
+      pdfBuffer,
+    });
+
+    const updateResult = await db.query(
+      `UPDATE quotes SET status = 'sent', sent_at = now() WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    res.json(updateResult.rows[0]);
+  } catch (err) {
+    console.error("POST /admin/quotes/:id/send failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't send quote." });
+  }
+});
+
+// PATCH /api/admin/quotes/:id/mark-accepted
+// PATCH /api/admin/quotes/:id/mark-declined
+// Records the customer's decision. Doesn't do anything else on its own --
+// converting to a job/invoice is a separate explicit action (a customer
+// might accept but the work doesn't get scheduled for weeks).
+router.patch("/quotes/:id/mark-accepted", async (req, res) => {
+  try {
+    const result = await db.query(
+      `UPDATE quotes SET status = 'accepted' WHERE id = $1 AND company_id = $2 RETURNING *`,
+      [req.params.id, req.companyId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Quote not found" });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("PATCH /admin/quotes/:id/mark-accepted failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't mark quote as accepted." });
+  }
+});
+
+router.patch("/quotes/:id/mark-declined", async (req, res) => {
+  try {
+    const result = await db.query(
+      `UPDATE quotes SET status = 'declined' WHERE id = $1 AND company_id = $2 RETURNING *`,
+      [req.params.id, req.companyId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Quote not found" });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("PATCH /admin/quotes/:id/mark-declined failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't mark quote as declined." });
+  }
+});
+
+// POST /api/admin/quotes/:id/convert-to-job
+// Body: { title?, notes?, start_date, end_date, start_time?, color?, event_type?, employee_ids?, crew_ids? }
+// Schedules the quoted work as a job, carrying over the quote's customer.
+// Reuses the same color/event_type validation and crew/employee assignment
+// expansion as the regular jobs route. Records the link both ways (quote ->
+// converted_job_id) and bumps the quote to "accepted" if it wasn't already,
+// since scheduling the work implies the customer said yes.
+router.post("/quotes/:id/convert-to-job", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const quoteResult = await db.query(`SELECT * FROM quotes WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (quoteResult.rowCount === 0) return res.status(404).json({ error: "Quote not found" });
+    const quote = quoteResult.rows[0];
+
+    const { title, notes, start_date, end_date, start_time, color, event_type, employee_ids, crew_ids } = req.body;
+    if (!start_date || !end_date) {
+      return res.status(400).json({ error: "start_date and end_date are required" });
+    }
+    const jobColor = color || "rust";
+    if (!JOB_COLORS[jobColor]) {
+      return res.status(400).json({ error: `color must be one of: ${Object.keys(JOB_COLORS).join(", ")}` });
+    }
+    const eventType = event_type || "job";
+    if (!EVENT_TYPES.includes(eventType)) {
+      return res.status(400).json({ error: `event_type must be one of: ${EVENT_TYPES.join(", ")}` });
+    }
+    if (start_time && !/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(start_time)) {
+      return res.status(400).json({ error: "start_time must be in HH:MM format" });
+    }
+
+    const jobTitle = title || `Quote #${quote.quote_number}`;
+    const jobResult = await db.query(
+      `INSERT INTO jobs (company_id, title, notes, start_date, end_date, start_time, color, event_type, customer_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id, title, notes, start_date, end_date, start_time, color, event_type, customer_id, created_at`,
+      [req.companyId, jobTitle, notes !== undefined ? notes : quote.notes, start_date, end_date, start_time || null, jobColor, eventType, quote.customer_id]
+    );
+    const job = jobResult.rows[0];
+
+    const assignments = await expandAssignments({ employee_ids, crew_ids, companyId: req.companyId });
+    if (assignments.size > 0) {
+      await Promise.all(
+        Array.from(assignments.entries()).map(([employeeId, crewId]) =>
+          db.query(
+            `INSERT INTO job_assignments (job_id, employee_id, assigned_via_crew_id)
+             VALUES ($1, $2, $3)`,
+            [job.id, employeeId, crewId]
+          )
+        )
+      );
+      notifyAssigned(Array.from(assignments.keys()), job);
+    }
+
+    const updatedQuote = await db.query(
+      `UPDATE quotes SET converted_job_id = $1, status = CASE WHEN status IN ('draft', 'sent') THEN 'accepted' ELSE status END
+       WHERE id = $2 RETURNING *`,
+      [job.id, id]
+    );
+
+    res.status(201).json({ job, quote: updatedQuote.rows[0] });
+  } catch (err) {
+    console.error("POST /admin/quotes/:id/convert-to-job failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't convert quote to a scheduled job." });
+  }
+});
+
+// POST /api/admin/quotes/:id/convert-to-invoice
+// Body: { payment_terms?, issue_date? } -- everything else (customer, line
+// items, tax rate) carries over from the quote. Created as a draft, same as
+// any other invoice -- NOT auto-sent, so the terms/due date can be reviewed
+// first. Links both ways (invoices.quote_id / quotes.converted_invoice_id)
+// and bumps the quote to "accepted" if it wasn't already.
+router.post("/quotes/:id/convert-to-invoice", async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const { id } = req.params;
+    const quoteResult = await client.query(`SELECT * FROM quotes WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (quoteResult.rowCount === 0) return res.status(404).json({ error: "Quote not found" });
+    const quote = quoteResult.rows[0];
+
+    const itemsResult = await client.query(
+      `SELECT description, quantity, unit_price FROM quote_line_items WHERE quote_id = $1 ORDER BY sort_order`,
+      [id]
+    );
+    if (itemsResult.rowCount === 0) return res.status(400).json({ error: "This quote has no line items to invoice." });
+
+    const { payment_terms, issue_date } = req.body;
+    const terms = payment_terms || "due_on_receipt";
+    if (!PAYMENT_TERMS.includes(terms)) {
+      return res.status(400).json({ error: `payment_terms must be one of: ${PAYMENT_TERMS.join(", ")}` });
+    }
+    const issueDate = issue_date || new Date().toISOString().slice(0, 10);
+    const dueDate = computeDueDate(issueDate, terms);
+    const { subtotal, taxAmount, total } = computeInvoiceTotals(itemsResult.rows, quote.tax_rate);
+
+    await client.query("BEGIN");
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [req.companyId]);
+    const numResult = await client.query(
+      `SELECT COALESCE(MAX(invoice_number), 0) + 1 AS next FROM invoices WHERE company_id = $1`,
+      [req.companyId]
+    );
+    const invoiceNumber = numResult.rows[0].next;
+
+    const invoiceResult = await client.query(
+      `INSERT INTO invoices (company_id, customer_id, quote_id, invoice_number, payment_terms, issue_date, due_date, notes, subtotal, tax_rate, tax_amount, total)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       RETURNING *`,
+      [req.companyId, quote.customer_id, quote.id, invoiceNumber, terms, issueDate, dueDate, quote.notes, subtotal, quote.tax_rate, taxAmount, total]
+    );
+    const invoice = invoiceResult.rows[0];
+
+    for (let i = 0; i < itemsResult.rows.length; i++) {
+      const item = itemsResult.rows[i];
+      await client.query(
+        `INSERT INTO invoice_line_items (invoice_id, description, quantity, unit_price, sort_order)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [invoice.id, item.description, item.quantity, item.unit_price, i]
+      );
+    }
+
+    const updatedQuote = await client.query(
+      `UPDATE quotes SET converted_invoice_id = $1, status = CASE WHEN status IN ('draft', 'sent') THEN 'accepted' ELSE status END
+       WHERE id = $2 RETURNING *`,
+      [invoice.id, id]
+    );
+
+    await client.query("COMMIT");
+    res.status(201).json({ invoice: { ...invoice, line_items: itemsResult.rows }, quote: updatedQuote.rows[0] });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("POST /admin/quotes/:id/convert-to-invoice failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't convert quote to an invoice." });
+  } finally {
+    client.release();
   }
 });
 

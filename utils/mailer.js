@@ -260,10 +260,56 @@ async function sendInvoiceReminderEmail({ to, cc, companyName, invoice, pdfBuffe
   }
 }
 
+// Emails a quote/estimate PDF to the customer, cc'ing the company's own
+// admin email -- same pattern as sendInvoiceEmail, just without payment
+// terms language since nothing is due yet.
+async function sendQuoteEmail({ to, cc, companyName, quote, pdfBuffer }) {
+  const expiryLine = quote.expiration_date
+    ? `<p>This estimate is valid until ${fmtDate(quote.expiration_date)}.</p>`
+    : "";
+  const html = `
+    <div style="font-family: -apple-system, sans-serif;">
+      <h2>Quote #${quote.quote_number} from ${companyName}</h2>
+      <p>Estimate total: <strong>${fmtMoney(quote.total)}</strong></p>
+      ${expiryLine}
+      <p>The full quote is attached as a PDF.</p>
+    </div>
+  `;
+
+  const body = {
+    from: FROM_ADDRESS,
+    to: [to],
+    subject: `Quote #${quote.quote_number} from ${companyName} — ${fmtMoney(quote.total)}`,
+    html,
+    attachments: [
+      {
+        filename: `quote-${quote.quote_number}.pdf`,
+        content: pdfBuffer.toString("base64"),
+      },
+    ],
+  };
+  if (cc) body.cc = [cc];
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`Resend API error (${res.status}): ${errBody}`);
+  }
+}
+
 module.exports = {
   sendTimesheetEmail,
   sendAdminPasswordResetEmail,
   sendInvoiceReminderEmail,
   sendEmployeePinResetEmail,
   sendInvoiceEmail,
+  sendQuoteEmail,
 };
