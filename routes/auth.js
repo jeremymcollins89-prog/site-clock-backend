@@ -52,7 +52,7 @@ router.post("/login", async (req, res) => {
       shop_lng: employee.shop_lng,
       shop_radius_m: employee.shop_radius_m,
       auto_clockout_time: employee.auto_clockout_time,
-      celebrate_clock_in: employee.celebrate_clock_in,
+      clock_in_animation: employee.clock_in_animation,
     },
   });
 });
@@ -129,7 +129,7 @@ router.post("/reset-pin", async (req, res) => {
 const requireAuth = require("../middleware/requireAuth");
 router.get("/me", requireAuth, async (req, res) => {
   const result = await db.query(
-    `SELECT e.id, e.name, e.email, e.celebrate_clock_in, c.shop_lat, c.shop_lng, c.shop_radius_m, c.auto_clockout_time
+    `SELECT e.id, e.name, e.email, e.clock_in_animation, c.shop_lat, c.shop_lng, c.shop_radius_m, c.auto_clockout_time
      FROM employees e
      LEFT JOIN companies c ON c.id = e.company_id
      WHERE e.id = $1`,
