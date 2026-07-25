@@ -50,4 +50,41 @@ async function sendPushToEmployee(employeeId, { title, body, url }) {
   );
 }
 
-module.exports = { sendPushToEmployee, VAPID_PUBLIC_KEY };
+// Same idea as sendPushToEmployee, but for the admin side of chat -- there's
+// one admin login per company, so subscriptions are keyed by company_id
+// instead of employee_id (see admin_push_subscriptions).
+async function sendPushToAdmin(companyId, { title, body, url }) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+    console.error("Push not sent: VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY are not configured");
+    return;
+  }
+
+  const result = await db.query(
+    `SELECT id, endpoint, p256dh, auth FROM admin_push_subscriptions WHERE company_id = $1`,
+    [companyId]
+  );
+
+  const payload = JSON.stringify({ title, body, url: url || "/" });
+
+  await Promise.all(
+    result.rows.map(async (sub) => {
+      try {
+        await webpush.sendNotification(
+          {
+            endpoint: sub.endpoint,
+            keys: { p256dh: sub.p256dh, auth: sub.auth },
+          },
+          payload
+        );
+      } catch (err) {
+        if (err.statusCode === 404 || err.statusCode === 410) {
+          await db.query(`DELETE FROM admin_push_subscriptions WHERE id = $1`, [sub.id]);
+        } else {
+          console.error(`Admin push failed for subscription ${sub.id}:`, err.message);
+        }
+      }
+    })
+  );
+}
+
+module.exports = { sendPushToEmployee, sendPushToAdmin, VAPID_PUBLIC_KEY };

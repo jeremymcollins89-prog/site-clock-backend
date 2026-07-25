@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const requireAuth = require("../middleware/requireAuth");
+const { sendPushToAdmin } = require("../utils/webPush");
 
 router.use(requireAuth);
 
@@ -58,15 +59,23 @@ router.post("/messages", async (req, res) => {
       return res.status(400).json({ error: "You need to be clocked in to send a message." });
     }
 
-    const employee = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
+    const employee = await db.query(`SELECT company_id, name FROM employees WHERE id = $1`, [req.employee.employee_id]);
     if (employee.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    const companyId = employee.rows[0].company_id;
 
     const result = await db.query(
       `INSERT INTO chat_messages (company_id, employee_id, sender, body, read_by_admin, read_by_employee)
        VALUES ($1, $2, 'employee', $3, false, true)
        RETURNING id, sender, body, created_at`,
-      [employee.rows[0].company_id, req.employee.employee_id, body.trim()]
+      [companyId, req.employee.employee_id, body.trim()]
     );
+
+    sendPushToAdmin(companyId, {
+      title: `Message from ${employee.rows[0].name}`,
+      body: body.trim().slice(0, 120),
+      url: "/admin.html?view=chat",
+    }).catch((err) => console.error("Failed to send admin chat push notification:", err.message));
+
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error("POST /chat/messages failed:", err);

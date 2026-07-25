@@ -1595,6 +1595,43 @@ router.delete("/company-logo", async (req, res) => {
   }
 });
 
+// ---------- Admin push subscriptions (for chat notifications) ----------
+// POST /api/admin/push/subscribe
+// Body: a PushSubscription object from the browser's Push API. Called once
+// per device from the mobile admin web page.
+router.post("/push/subscribe", async (req, res) => {
+  try {
+    const { endpoint, keys } = req.body;
+    if (!endpoint || !keys || !keys.p256dh || !keys.auth) {
+      return res.status(400).json({ error: "A valid push subscription is required" });
+    }
+    await db.query(
+      `INSERT INTO admin_push_subscriptions (company_id, endpoint, p256dh, auth)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (endpoint) DO UPDATE SET company_id = $1, p256dh = $3, auth = $4`,
+      [req.companyId, endpoint, keys.p256dh, keys.auth]
+    );
+    res.status(201).json({ ok: true });
+  } catch (err) {
+    console.error("POST /admin/push/subscribe failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't save subscription." });
+  }
+});
+
+// POST /api/admin/push/unsubscribe
+// Body: { endpoint }
+router.post("/push/unsubscribe", async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    if (!endpoint) return res.status(400).json({ error: "endpoint is required" });
+    await db.query(`DELETE FROM admin_push_subscriptions WHERE endpoint = $1 AND company_id = $2`, [endpoint, req.companyId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /admin/push/unsubscribe failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't remove subscription." });
+  }
+});
+
 // ---------- Chat ----------
 // One thread per employee (there's only one admin per company). Employees
 // only show up here if they're currently clocked in (so a brand-new
