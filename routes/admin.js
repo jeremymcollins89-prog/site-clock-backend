@@ -1595,4 +1595,97 @@ router.delete("/company-logo", async (req, res) => {
   }
 });
 
+// ---------- Chat ----------
+// One thread per employee (there's only one admin per company). Employees
+// only show up here if they're currently clocked in (so a brand-new
+// conversation can be started) or already have message history (so past
+// conversations stay visible after someone clocks out).
+router.get("/chat/threads", async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT e.id, e.name,
+              (open_te.id IS NOT NULL) AS on_clock,
+              lm.body AS last_message_body, lm.sender AS last_message_sender, lm.created_at AS last_message_at,
+              COALESCE(uc.unread_count, 0)::int AS unread_count
+       FROM employees e
+       LEFT JOIN time_entries open_te ON open_te.employee_id = e.id AND open_te.clock_out IS NULL
+       LEFT JOIN LATERAL (
+         SELECT body, sender, created_at FROM chat_messages WHERE employee_id = e.id ORDER BY created_at DESC LIMIT 1
+       ) lm ON true
+       LEFT JOIN (
+         SELECT employee_id, COUNT(*) AS unread_count FROM chat_messages
+         WHERE sender = 'employee' AND read_by_admin = false GROUP BY employee_id
+       ) uc ON uc.employee_id = e.id
+       WHERE e.company_id = $1 AND e.active = true AND (open_te.id IS NOT NULL OR lm.created_at IS NOT NULL)
+       ORDER BY (lm.created_at IS NULL), lm.created_at DESC, e.name`,
+      [req.companyId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/chat/threads failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load chats." });
+  }
+});
+
+// GET /api/admin/chat/:employeeId/messages
+// Marks the employee's messages in this thread as read.
+router.get("/chat/:employeeId/messages", async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    const owns = await db.query(`SELECT id FROM employees WHERE id = $1 AND company_id = $2`, [employeeId, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+
+    const result = await db.query(
+      `SELECT id, sender, body, created_at FROM chat_messages WHERE employee_id = $1 ORDER BY created_at`,
+      [employeeId]
+    );
+    await db.query(
+      `UPDATE chat_messages SET read_by_admin = true WHERE employee_id = $1 AND sender = 'employee' AND read_by_admin = false`,
+      [employeeId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/chat/:employeeId/messages failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load messages." });
+  }
+});
+
+// POST /api/admin/chat/:employeeId/messages
+// Body: { body }. Only allowed while the employee is currently clocked in.
+router.post("/chat/:employeeId/messages", async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    const { body } = req.body;
+    if (!body || !body.trim()) return res.status(400).json({ error: "Message can't be empty." });
+
+    const employee = await db.query(`SELECT id, name FROM employees WHERE id = $1 AND company_id = $2`, [employeeId, req.companyId]);
+    if (employee.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+
+    const openShift = await db.query(`SELECT id FROM time_entries WHERE employee_id = $1 AND clock_out IS NULL`, [employeeId]);
+    if (openShift.rowCount === 0) {
+      return res.status(400).json({ error: "This employee isn't clocked in right now, so they can't be messaged." });
+    }
+
+    const result = await db.query(
+      `INSERT INTO chat_messages (company_id, employee_id, sender, body, read_by_admin, read_by_employee)
+       VALUES ($1, $2, 'admin', $3, true, false)
+       RETURNING id, sender, body, created_at`,
+      [req.companyId, employeeId, body.trim()]
+    );
+
+    const company = await db.query(`SELECT name FROM companies WHERE id = $1`, [req.companyId]);
+    const companyName = company.rows[0]?.name || "Your employer";
+    sendPushToEmployee(employeeId, {
+      title: `Message from ${companyName}`,
+      body: body.trim().slice(0, 120),
+      url: "/chat",
+    }).catch((err) => console.error("Failed to send chat push notification:", err.message));
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("POST /admin/chat/:employeeId/messages failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't send message." });
+  }
+});
+
 module.exports = router;

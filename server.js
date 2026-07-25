@@ -35,6 +35,7 @@ const timesheetRoutes = require("./routes/timesheets");
 const adminRoutes = require("./routes/admin");
 const pushRoutes = require("./routes/push");
 const scheduleRoutes = require("./routes/schedule");
+const chatRoutes = require("./routes/chat");
 const { checkAndSendReminders } = require("./utils/invoiceReminders");
 
 const app = express();
@@ -61,6 +62,7 @@ app.use("/api/admin", adminRoutes);
 app.use("/api/companies", companyRoutes);
 app.use("/api/push", pushRoutes);
 app.use("/api/schedule", scheduleRoutes);
+app.use("/api/chat", chatRoutes);
 
 // Must come after all routes, before any other error-handling middleware.
 Sentry.setupExpressErrorHandler(app);
