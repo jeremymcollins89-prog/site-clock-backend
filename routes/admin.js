@@ -1484,9 +1484,11 @@ router.patch("/invoices/:id/void", async (req, res) => {
 // works on either), but has its own sequential numbering, its own simpler
 // draft -> sent -> accepted/declined status, and no payment concept at all
 // -- it doesn't owe anything until it's converted into a job and/or an
-// invoice. Unlike invoices, a new quote is NOT auto-sent on save -- quotes
-// are commonly drafted, reviewed internally, and only sent once ready, so
-// sending here is always an explicit action.
+// invoice. Like invoices, a new quote is auto-sent right after it's created
+// (see sendQuoteNow, used by both POST /quotes and POST /quotes/:id/send) --
+// if the customer has no email on file, or sending otherwise fails, the
+// quote is still saved as a draft and the failure comes back as
+// send_warning instead of blocking creation.
 
 // GET /api/admin/quotes
 router.get("/quotes", async (req, res) => {
@@ -1586,6 +1588,77 @@ router.get("/quotes/:id/pdf", async (req, res) => {
   }
 });
 
+// Shared by both the auto-send-on-create step (POST /quotes below) and the
+// explicit POST /quotes/:id/send route -- mirrors sendInvoiceNow. Bail-outs
+// that are a normal, expected part of quote life (wrong status to send from,
+// no customer email on file) are tagged err.expected so callers don't log
+// them as real bugs, just surface the message (as send_warning on creation,
+// or a plain error response on an explicit send).
+async function sendQuoteNow(quoteId, companyId) {
+  const result = await db.query(
+    `SELECT q.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+            c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip
+     FROM quotes q JOIN customers c ON c.id = q.customer_id
+     WHERE q.id = $1 AND q.company_id = $2`,
+    [quoteId, companyId]
+  );
+  if (result.rowCount === 0) {
+    const err = new Error("Quote not found");
+    err.status = 404;
+    throw err;
+  }
+  const quote = result.rows[0];
+  if (!["draft", "sent"].includes(quote.status)) {
+    const err = new Error("Only draft or sent quotes can be sent.");
+    err.status = 400;
+    err.expected = true;
+    throw err;
+  }
+  if (!quote.customer_email) {
+    const err = new Error("This customer doesn't have an email on file.");
+    err.status = 400;
+    err.expected = true;
+    throw err;
+  }
+
+  const itemsResult = await db.query(
+    `SELECT description, quantity, unit_price FROM quote_line_items WHERE quote_id = $1 ORDER BY sort_order`,
+    [quoteId]
+  );
+  const companyResult = await db.query(`SELECT name, admin_email, logo_data FROM companies WHERE id = $1`, [companyId]);
+  const company = companyResult.rows[0];
+
+  const pdfBuffer = await renderQuotePdf({
+    companyName: company.name,
+    quote,
+    customer: {
+      name: quote.customer_name,
+      email: quote.customer_email,
+      phone: quote.customer_phone,
+      street: quote.customer_street,
+      city: quote.customer_city,
+      state: quote.customer_state,
+      zip: quote.customer_zip,
+    },
+    lineItems: itemsResult.rows,
+    logoBuffer: company.logo_data || null,
+  });
+
+  await sendQuoteEmail({
+    to: quote.customer_email,
+    cc: company.admin_email,
+    companyName: company.name,
+    quote,
+    pdfBuffer,
+  });
+
+  const updateResult = await db.query(
+    `UPDATE quotes SET status = 'sent', sent_at = now() WHERE id = $1 RETURNING *`,
+    [quoteId]
+  );
+  return updateResult.rows[0];
+}
+
 // POST /api/admin/quotes
 // Body: { customer_id, issue_date?, expiration_date?, tax_rate?, notes?, line_items: [{description, quantity, unit_price}] }
 router.post("/quotes", async (req, res) => {
@@ -1636,7 +1709,21 @@ router.post("/quotes", async (req, res) => {
     }
 
     await client.query("COMMIT");
-    res.status(201).json({ ...quote, line_items: line_items.map((it, i) => ({ ...it, sort_order: i })) });
+
+    let finalQuote = quote;
+    let sendWarning = null;
+    try {
+      finalQuote = await sendQuoteNow(quote.id, req.companyId);
+    } catch (sendErr) {
+      if (!sendErr.expected) console.error("Auto-send on quote creation failed:", sendErr);
+      sendWarning = sendErr.message || "Couldn't send the quote automatically.";
+    }
+
+    res.status(201).json({
+      ...finalQuote,
+      line_items: line_items.map((it, i) => ({ ...it, sort_order: i })),
+      send_warning: sendWarning,
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("POST /admin/quotes failed:", err);
@@ -1750,66 +1837,18 @@ router.delete("/quotes/:id", async (req, res) => {
 });
 
 // POST /api/admin/quotes/:id/send
-// Emails the quote PDF to the customer and marks it "sent". Unlike invoices
-// this is never automatic -- always an explicit click.
+// Emails the quote PDF to the customer and marks it "sent". Also used
+// internally right after a quote is created (see sendQuoteNow above) --
+// this route stays around for re-sending an already-sent quote, or manually
+// sending one whose auto-send failed (e.g. customer had no email on file
+// yet at creation time, added since).
 router.post("/quotes/:id/send", async (req, res) => {
   try {
-    const { id } = req.params;
-    const result = await db.query(
-      `SELECT q.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
-              c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip
-       FROM quotes q JOIN customers c ON c.id = q.customer_id
-       WHERE q.id = $1 AND q.company_id = $2`,
-      [id, req.companyId]
-    );
-    if (result.rowCount === 0) return res.status(404).json({ error: "Quote not found" });
-    const quote = result.rows[0];
-    if (!["draft", "sent"].includes(quote.status)) {
-      return res.status(400).json({ error: "Only draft or sent quotes can be sent." });
-    }
-    if (!quote.customer_email) {
-      return res.status(400).json({ error: "This customer doesn't have an email on file." });
-    }
-
-    const itemsResult = await db.query(
-      `SELECT description, quantity, unit_price FROM quote_line_items WHERE quote_id = $1 ORDER BY sort_order`,
-      [id]
-    );
-    const companyResult = await db.query(`SELECT name, admin_email, logo_data FROM companies WHERE id = $1`, [req.companyId]);
-    const company = companyResult.rows[0];
-
-    const pdfBuffer = await renderQuotePdf({
-      companyName: company.name,
-      quote,
-      customer: {
-        name: quote.customer_name,
-        email: quote.customer_email,
-        phone: quote.customer_phone,
-        street: quote.customer_street,
-        city: quote.customer_city,
-        state: quote.customer_state,
-        zip: quote.customer_zip,
-      },
-      lineItems: itemsResult.rows,
-      logoBuffer: company.logo_data || null,
-    });
-
-    await sendQuoteEmail({
-      to: quote.customer_email,
-      cc: company.admin_email,
-      companyName: company.name,
-      quote,
-      pdfBuffer,
-    });
-
-    const updateResult = await db.query(
-      `UPDATE quotes SET status = 'sent', sent_at = now() WHERE id = $1 RETURNING *`,
-      [id]
-    );
-    res.json(updateResult.rows[0]);
+    const quote = await sendQuoteNow(req.params.id, req.companyId);
+    res.json(quote);
   } catch (err) {
-    console.error("POST /admin/quotes/:id/send failed:", err);
-    res.status(500).json({ error: err.message || "Couldn't send quote." });
+    if (!err.expected) console.error("POST /admin/quotes/:id/send failed:", err);
+    res.status(err.status || 500).json({ error: err.message || "Couldn't send quote." });
   }
 });
 
