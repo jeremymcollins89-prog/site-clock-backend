@@ -5,6 +5,19 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 // address on the verified collbusinesssolutions.com domain.
 const FROM_ADDRESS = process.env.RESEND_FROM || "Coll Timeclock <timesheets@collbusinesssolutions.com>";
 
+// The raw email address portion of FROM_ADDRESS (Resend only requires the
+// domain to be verified -- the display name in a "From" header can be
+// anything). Used to rebrand customer-facing emails (quotes, invoices) with
+// the sending company's own business name instead of "Coll Timeclock",
+// since those emails go to a company's customer, not to Coll Timeclock's own
+// users -- seeing "Coll Timeclock" as the sender there looks like the wrong
+// business emailed them.
+const FROM_EMAIL_ONLY = (FROM_ADDRESS.match(/<(.+)>/) || [null, FROM_ADDRESS])[1];
+
+function customerFacingFrom(companyName) {
+  return `${companyName} <${FROM_EMAIL_ONLY}>`;
+}
+
 // Where the employee PWA (and its static reset pages) are hosted. Used to
 // build clickable links in reset emails.
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://site-clock-frontend-production.up.railway.app";
@@ -184,7 +197,7 @@ async function sendInvoiceEmail({ to, cc, companyName, invoice, pdfBuffer }) {
   `;
 
   const body = {
-    from: FROM_ADDRESS,
+    from: customerFacingFrom(companyName),
     to: [to],
     subject: `Invoice #${invoice.invoice_number} from ${companyName} — ${fmtMoney(invoice.total)} due ${fmtDate(invoice.due_date)}`,
     html,
@@ -232,7 +245,7 @@ async function sendInvoiceReminderEmail({ to, cc, companyName, invoice, pdfBuffe
   `;
 
   const body = {
-    from: FROM_ADDRESS,
+    from: customerFacingFrom(companyName),
     to: [to],
     subject: `Reminder: Invoice #${invoice.invoice_number} from ${companyName} — ${fmtMoney(invoice.total)} due ${fmtDate(invoice.due_date)}`,
     html,
@@ -277,7 +290,7 @@ async function sendQuoteEmail({ to, cc, companyName, quote, pdfBuffer }) {
   `;
 
   const body = {
-    from: FROM_ADDRESS,
+    from: customerFacingFrom(companyName),
     to: [to],
     subject: `Quote #${quote.quote_number} from ${companyName} — ${fmtMoney(quote.total)}`,
     html,
