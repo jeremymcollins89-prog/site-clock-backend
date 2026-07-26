@@ -2124,6 +2124,45 @@ router.get("/reports/summary", async (req, res) => {
   }
 });
 
+// GET /api/admin/reports/labor-breakdown?start=YYYY-MM-DD&end=YYYY-MM-DD
+// Per-employee hours + cost for the same date range reports/summary uses --
+// powers the drill-down when someone clicks the Labor hours or Gross Profit
+// bubble. Only includes employees who actually worked in the range (an
+// employee with zero hours has nothing to show here even if they have a
+// rate set).
+router.get("/reports/labor-breakdown", async (req, res) => {
+  try {
+    const { start, end } = req.query;
+    if (!start || !end) return res.status(400).json({ error: "start and end are required" });
+
+    const result = await db.query(
+      `SELECT e.id AS employee_id, e.name AS employee_name, e.hourly_rate,
+              SUM(d.worked_seconds) AS total_seconds
+       FROM time_entry_durations d
+       JOIN employees e ON e.id = d.employee_id
+       WHERE e.company_id = $1 AND d.clock_in >= $2::date AND d.clock_in < ($3::date + INTERVAL '1 day')
+       GROUP BY e.id, e.name, e.hourly_rate
+       ORDER BY e.name`,
+      [req.companyId, start, end]
+    );
+
+    res.json(result.rows.map(function(r) {
+      const hours = Number(r.total_seconds) / 3600;
+      const rate = r.hourly_rate === null ? null : Number(r.hourly_rate);
+      return {
+        employee_id: r.employee_id,
+        employee_name: r.employee_name,
+        hours: hours,
+        hourly_rate: rate,
+        cost: rate === null ? 0 : hours * rate,
+      };
+    }));
+  } catch (err) {
+    console.error("GET /admin/reports/labor-breakdown failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load labor breakdown." });
+  }
+});
+
 // ---------- Expenses ----------
 // Simple manually-logged business costs (materials, insurance, rent, etc.)
 // that feed into Net Profit on the Reports tab. Deliberately minimal --
