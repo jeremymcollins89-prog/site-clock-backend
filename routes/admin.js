@@ -2134,8 +2134,10 @@ router.get("/reports/summary", async (req, res) => {
 router.get("/expenses", async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT id, expense_date, amount, description, created_at
-       FROM expenses WHERE company_id = $1 ORDER BY expense_date DESC, created_at DESC`,
+      `SELECT e.id, e.expense_date, e.amount, e.description, e.created_at, e.job_id, j.title AS job_title
+       FROM expenses e
+       LEFT JOIN jobs j ON j.id = e.job_id
+       WHERE e.company_id = $1 ORDER BY e.expense_date DESC, e.created_at DESC`,
       [req.companyId]
     );
     res.json(result.rows);
@@ -2146,18 +2148,22 @@ router.get("/expenses", async (req, res) => {
 });
 
 // POST /api/admin/expenses
-// Body: { expense_date, amount, description? }
+// Body: { expense_date, amount, description?, job_id? }
 router.post("/expenses", async (req, res) => {
   try {
-    const { expense_date, amount, description } = req.body;
+    const { expense_date, amount, description, job_id } = req.body;
     if (!expense_date) return res.status(400).json({ error: "expense_date is required" });
     if (amount === undefined || amount === null || isNaN(Number(amount))) {
       return res.status(400).json({ error: "amount is required" });
     }
+    if (job_id) {
+      const ownsJob = await db.query(`SELECT id FROM jobs WHERE id = $1 AND company_id = $2`, [job_id, req.companyId]);
+      if (ownsJob.rowCount === 0) return res.status(400).json({ error: "job not found" });
+    }
     const result = await db.query(
-      `INSERT INTO expenses (company_id, expense_date, amount, description) VALUES ($1, $2, $3, $4)
-       RETURNING id, expense_date, amount, description, created_at`,
-      [req.companyId, expense_date, Number(amount), description || null]
+      `INSERT INTO expenses (company_id, expense_date, amount, description, job_id) VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, expense_date, amount, description, created_at, job_id`,
+      [req.companyId, expense_date, Number(amount), description || null, job_id || null]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -2167,16 +2173,20 @@ router.post("/expenses", async (req, res) => {
 });
 
 // PATCH /api/admin/expenses/:id
-// Body: { expense_date?, amount?, description? }
+// Body: { expense_date?, amount?, description?, job_id? } -- job_id: null unassigns
 router.patch("/expenses/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { expense_date, amount, description } = req.body;
+    const { expense_date, amount, description, job_id } = req.body;
     const owns = await db.query(`SELECT id FROM expenses WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
     if (owns.rowCount === 0) return res.status(404).json({ error: "Expense not found" });
 
     if (amount !== undefined && isNaN(Number(amount))) {
       return res.status(400).json({ error: "amount must be a number" });
+    }
+    if (job_id) {
+      const ownsJob = await db.query(`SELECT id FROM jobs WHERE id = $1 AND company_id = $2`, [job_id, req.companyId]);
+      if (ownsJob.rowCount === 0) return res.status(400).json({ error: "job not found" });
     }
 
     const fields = [];
@@ -2184,12 +2194,13 @@ router.patch("/expenses/:id", async (req, res) => {
     if (expense_date !== undefined) { values.push(expense_date); fields.push(`expense_date = $${values.length}`); }
     if (amount !== undefined) { values.push(Number(amount)); fields.push(`amount = $${values.length}`); }
     if (description !== undefined) { values.push(description || null); fields.push(`description = $${values.length}`); }
+    if (job_id !== undefined) { values.push(job_id || null); fields.push(`job_id = $${values.length}`); }
     if (fields.length === 0) return res.status(400).json({ error: "Nothing to update" });
 
     values.push(id, req.companyId);
     const result = await db.query(
       `UPDATE expenses SET ${fields.join(", ")} WHERE id = $${values.length - 1} AND company_id = $${values.length}
-       RETURNING id, expense_date, amount, description, created_at`,
+       RETURNING id, expense_date, amount, description, created_at, job_id`,
       values
     );
     res.json(result.rows[0]);
