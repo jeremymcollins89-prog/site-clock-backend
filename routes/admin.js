@@ -162,6 +162,29 @@ router.patch("/payroll-email", async (req, res) => {
   res.json(result.rows[0]);
 });
 
+// GET /api/admin/company-name
+// The business name shown on invoice/quote PDFs, in the "From" display name
+// of customer-facing emails (see utils/mailer.js's customerFacingFrom), and
+// in push notification titles -- basically anywhere the app is representing
+// this specific company rather than Coll Timeclock itself.
+router.get("/company-name", async (req, res) => {
+  const result = await db.query(`SELECT name FROM companies WHERE id = $1`, [req.companyId]);
+  if (result.rowCount === 0) return res.status(404).json({ error: "Company not found" });
+  res.json(result.rows[0]);
+});
+
+// PATCH /api/admin/company-name
+// Body: { name }
+router.patch("/company-name", async (req, res) => {
+  const { name } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: "A company name is required" });
+  const result = await db.query(
+    `UPDATE companies SET name = $1 WHERE id = $2 RETURNING name`,
+    [name.trim(), req.companyId]
+  );
+  res.json(result.rows[0]);
+});
+
 // GET /api/admin/shop-location
 // Returns this company's shop coordinates and auto clock-out cutoff time,
 // used by the employee app for geo-based auto clock-in/out. shop_lat/shop_lng
