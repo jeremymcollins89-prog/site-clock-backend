@@ -17,30 +17,40 @@ router.get("/vapid-public-key", (req, res) => {
 // Body: a PushSubscription object from the browser's Push API
 // (endpoint, keys.p256dh, keys.auth). Called once per device.
 router.post("/subscribe", requireAuth, async (req, res) => {
-  const { endpoint, keys } = req.body;
-  if (!endpoint || !keys || !keys.p256dh || !keys.auth) {
-    return res.status(400).json({ error: "A valid push subscription is required" });
-  }
+  try {
+    const { endpoint, keys } = req.body;
+    if (!endpoint || !keys || !keys.p256dh || !keys.auth) {
+      return res.status(400).json({ error: "A valid push subscription is required" });
+    }
 
-  await db.query(
-    `INSERT INTO push_subscriptions (employee_id, endpoint, p256dh, auth)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (endpoint) DO UPDATE SET employee_id = $1, p256dh = $3, auth = $4`,
-    [req.employee.employee_id, endpoint, keys.p256dh, keys.auth]
-  );
-  res.status(201).json({ ok: true });
+    await db.query(
+      `INSERT INTO push_subscriptions (employee_id, endpoint, p256dh, auth)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (endpoint) DO UPDATE SET employee_id = $1, p256dh = $3, auth = $4`,
+      [req.employee.employee_id, endpoint, keys.p256dh, keys.auth]
+    );
+    res.status(201).json({ ok: true });
+  } catch (err) {
+    console.error("POST /push/subscribe failed:", err);
+    res.status(500).json({ error: "Couldn't save push subscription." });
+  }
 });
 
 // POST /api/push/unsubscribe
 // Body: { endpoint }
 router.post("/unsubscribe", requireAuth, async (req, res) => {
-  const { endpoint } = req.body;
-  if (!endpoint) return res.status(400).json({ error: "endpoint is required" });
-  await db.query(`DELETE FROM push_subscriptions WHERE endpoint = $1 AND employee_id = $2`, [
-    endpoint,
-    req.employee.employee_id,
-  ]);
-  res.json({ ok: true });
+  try {
+    const { endpoint } = req.body;
+    if (!endpoint) return res.status(400).json({ error: "endpoint is required" });
+    await db.query(`DELETE FROM push_subscriptions WHERE endpoint = $1 AND employee_id = $2`, [
+      endpoint,
+      req.employee.employee_id,
+    ]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /push/unsubscribe failed:", err);
+    res.status(500).json({ error: "Couldn't remove push subscription." });
+  }
 });
 
 module.exports = router;

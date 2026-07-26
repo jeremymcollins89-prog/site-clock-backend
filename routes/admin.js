@@ -16,7 +16,10 @@ const EVENT_TYPES = ["job", "personal", "other"];
 const QUOTE_STATUSES = ["draft", "sent", "accepted", "declined"];
 const PAYMENT_TERMS = ["due_on_receipt", "net_15", "net_30", "net_60", "net_90"];
 const PAYMENT_TERMS_DAYS = { due_on_receipt: 0, net_15: 15, net_30: 30, net_60: 60, net_90: 90 };
+// "online" isn't in this list on purpose -- it's only ever set by the Stripe
+// webhook (see routes/payments.js), never a manual "Mark as paid" option.
 const PAYMENT_METHODS = ["card", "check", "cash", "other"];
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://site-clock-frontend-production.up.railway.app";
 
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
@@ -1108,6 +1111,7 @@ async function sendInvoiceNow(invoiceId, companyId) {
     },
     lineItems: itemsResult.rows,
     logoBuffer: company.logo_data || null,
+    payUrl: `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`,
   });
 
   await sendInvoiceEmail({
@@ -1221,6 +1225,7 @@ router.get("/invoices/:id/pdf", async (req, res) => {
       },
       lineItems: itemsResult.rows,
       logoBuffer: company.logo_data || null,
+      payUrl: `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`,
     });
 
     res.set("Content-Type", "application/pdf");

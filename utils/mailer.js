@@ -187,12 +187,17 @@ function fmtMoney(n) {
 // Buffer (from utils/invoicePdf.js) attached as base64, the format Resend's
 // API expects for attachments.
 async function sendInvoiceEmail({ to, cc, companyName, invoice, pdfBuffer }) {
+  const payUrl = `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`;
   const html = `
     <div style="font-family: -apple-system, sans-serif;">
       <h2>Invoice #${invoice.invoice_number} from ${companyName}</h2>
       <p>Amount due: <strong>${fmtMoney(invoice.total)}</strong></p>
       <p>Due date: ${fmtDate(invoice.due_date)} (${PAYMENT_TERMS_LABELS[invoice.payment_terms] || invoice.payment_terms})</p>
       <p>The full invoice is attached as a PDF.</p>
+      <p style="margin-top:20px;">
+        <a href="${payUrl}" style="background:#1F2421; color:#F4F2ED; padding:12px 24px; border-radius:6px; text-decoration:none; font-weight:600; display:inline-block;">Pay now</a>
+      </p>
+      <p style="color:#8A8578; font-size:12px;">Pay securely by card or bank transfer (ACH).</p>
     </div>
   `;
 
@@ -231,6 +236,7 @@ async function sendInvoiceEmail({ to, cc, companyName, invoice, pdfBuffer }) {
 // utils/invoiceReminders.js) so the customer isn't confused by "reminder 4".
 async function sendInvoiceReminderEmail({ to, cc, companyName, invoice, pdfBuffer, reminderNumber, maxReminders }) {
   const isPastDue = new Date(invoice.due_date) < new Date();
+  const payUrl = `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`;
   const html = `
     <div style="font-family: -apple-system, sans-serif;">
       <h2>Reminder: Invoice #${invoice.invoice_number} from ${companyName}</h2>
@@ -240,6 +246,10 @@ async function sendInvoiceReminderEmail({ to, cc, companyName, invoice, pdfBuffe
         : `This invoice is due on ${fmtDate(invoice.due_date)}.`
       }</p>
       <p>The full invoice is attached again as a PDF.</p>
+      <p style="margin-top:20px;">
+        <a href="${payUrl}" style="background:#1F2421; color:#F4F2ED; padding:12px 24px; border-radius:6px; text-decoration:none; font-weight:600; display:inline-block;">Pay now</a>
+      </p>
+      <p style="color:#8A8578; font-size:12px;">Pay securely by card or bank transfer (ACH).</p>
       <p style="color:#999; font-size:12px;">Reminder ${reminderNumber} of ${maxReminders}.</p>
     </div>
   `;

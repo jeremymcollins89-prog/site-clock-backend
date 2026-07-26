@@ -2,6 +2,8 @@ const db = require("../db");
 const { renderInvoicePdf } = require("./invoicePdf");
 const { sendInvoiceReminderEmail } = require("./mailer");
 
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://site-clock-frontend-production.up.railway.app";
+
 // Automatic reminder emails for unpaid ("sent") invoices. First reminder
 // fires on or after the due date; each one after that waits at least this
 // many days from the last reminder, capped at MAX_REMINDERS total. Timing
@@ -92,6 +94,7 @@ async function checkAndSendReminders() {
         },
         lineItems: itemsResult.rows,
         logoBuffer: invoice.company_logo_data || null,
+        payUrl: `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`,
       });
 
       const reminderNumber = invoice.reminder_count + 1;

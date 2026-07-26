@@ -37,11 +37,20 @@ const pushRoutes = require("./routes/push");
 const scheduleRoutes = require("./routes/schedule");
 const chatRoutes = require("./routes/chat");
 const teamChatRoutes = require("./routes/teamChat");
+const { router: paymentsRoutes, handleStripeWebhook } = require("./routes/payments");
 const { checkAndSendReminders } = require("./utils/invoiceReminders");
 
 const app = express();
 
 app.use(cors());
+
+// Stripe webhook signature verification needs the raw, untouched request
+// body -- so this route is registered with its own express.raw() middleware
+// *before* the global express.json() below ever gets a chance to parse it.
+// Express matches routes in registration order, so a POST to this exact
+// path never reaches express.json() at all.
+app.post("/api/payments/webhook", express.raw({ type: "application/json" }), handleStripeWebhook);
+
 // Raised from the 100kb default so a base64-encoded company logo upload
 // (see PUT /api/admin/company-logo) doesn't get rejected before it even
 // reaches the route handler's own size validation.
@@ -65,6 +74,7 @@ app.use("/api/push", pushRoutes);
 app.use("/api/schedule", scheduleRoutes);
 app.use("/api/chat", chatRoutes);
 app.use("/api/team-chat", teamChatRoutes);
+app.use("/api/payments", paymentsRoutes);
 
 // Must come after all routes, before any other error-handling middleware.
 Sentry.setupExpressErrorHandler(app);

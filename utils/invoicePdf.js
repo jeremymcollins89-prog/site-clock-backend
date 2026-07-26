@@ -21,7 +21,7 @@ function fmtDate(d) {
 // column) -- if present it's drawn top-left and the company name shifts
 // right to make room. If the image data is ever invalid, the logo is
 // silently skipped rather than blocking the invoice from sending.
-function renderInvoicePdf({ companyName, invoice, customer, lineItems, logoBuffer }) {
+function renderInvoicePdf({ companyName, invoice, customer, lineItems, logoBuffer, payUrl }) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: "letter", margin: 50 });
     const chunks = [];
@@ -100,9 +100,18 @@ function renderInvoicePdf({ companyName, invoice, customer, lineItems, logoBuffe
     doc.text("Total due", 380, totalsY, { width: 80, align: "right" });
     doc.text(fmtMoney(invoice.total), 470, totalsY, { width: 80, align: "right" });
 
+    let afterTotalsY = totalsY + 20;
+    if (payUrl && invoice.status !== "paid" && invoice.status !== "void") {
+      doc.font("Helvetica-Bold").fontSize(10).fillColor("#C1502E")
+        .text("Pay this invoice online (card or bank transfer):", 50, afterTotalsY, { width: 500 });
+      doc.font("Helvetica").fillColor("#1F2421")
+        .text(payUrl, 50, afterTotalsY + 14, { width: 500, link: payUrl, underline: true });
+      afterTotalsY += 40;
+    }
+
     if (invoice.notes) {
       doc.font("Helvetica").fontSize(9).fillColor("#666");
-      doc.text(invoice.notes, 50, totalsY + 40, { width: 500 });
+      doc.text(invoice.notes, 50, afterTotalsY, { width: 500 });
     }
 
     doc.end();
