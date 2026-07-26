@@ -186,18 +186,27 @@ function fmtMoney(n) {
 // email so there's always a paper trail of what went out. pdfBuffer is a
 // Buffer (from utils/invoicePdf.js) attached as base64, the format Resend's
 // API expects for attachments.
-async function sendInvoiceEmail({ to, cc, companyName, invoice, pdfBuffer }) {
-  const payUrl = `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`;
+// payUrl is nullable -- the caller (routes/admin.js) only passes one in if
+// this company has actually connected its own Stripe account (see
+// canAcceptOnlinePayments there). A company that hasn't connected yet has
+// no way to actually receive an online payment, so the button is left out
+// entirely rather than showing a "Pay now" link that would just error out.
+async function sendInvoiceEmail({ to, cc, companyName, invoice, pdfBuffer, payUrl }) {
+  const payButtonHtml = payUrl
+    ? `
+      <p style="margin-top:20px;">
+        <a href="${payUrl}" style="background:#1F2421; color:#F4F2ED; padding:12px 24px; border-radius:6px; text-decoration:none; font-weight:600; display:inline-block;">Pay now</a>
+      </p>
+      <p style="color:#8A8578; font-size:12px;">Pay securely by card or bank transfer (ACH).</p>
+    `
+    : "";
   const html = `
     <div style="font-family: -apple-system, sans-serif;">
       <h2>Invoice #${invoice.invoice_number} from ${companyName}</h2>
       <p>Amount due: <strong>${fmtMoney(invoice.total)}</strong></p>
       <p>Due date: ${fmtDate(invoice.due_date)} (${PAYMENT_TERMS_LABELS[invoice.payment_terms] || invoice.payment_terms})</p>
       <p>The full invoice is attached as a PDF.</p>
-      <p style="margin-top:20px;">
-        <a href="${payUrl}" style="background:#1F2421; color:#F4F2ED; padding:12px 24px; border-radius:6px; text-decoration:none; font-weight:600; display:inline-block;">Pay now</a>
-      </p>
-      <p style="color:#8A8578; font-size:12px;">Pay securely by card or bank transfer (ACH).</p>
+      ${payButtonHtml}
     </div>
   `;
 
@@ -234,9 +243,18 @@ async function sendInvoiceEmail({ to, cc, companyName, invoice, pdfBuffer }) {
 // subject/body make clear it's a reminder rather than the original send, and
 // say where it falls in the capped sequence (max 5, see
 // utils/invoiceReminders.js) so the customer isn't confused by "reminder 4".
-async function sendInvoiceReminderEmail({ to, cc, companyName, invoice, pdfBuffer, reminderNumber, maxReminders }) {
+// Same payUrl-from-caller pattern as sendInvoiceEmail above -- null unless
+// this company has connected its own Stripe account.
+async function sendInvoiceReminderEmail({ to, cc, companyName, invoice, pdfBuffer, reminderNumber, maxReminders, payUrl }) {
   const isPastDue = new Date(invoice.due_date) < new Date();
-  const payUrl = `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`;
+  const payButtonHtml = payUrl
+    ? `
+      <p style="margin-top:20px;">
+        <a href="${payUrl}" style="background:#1F2421; color:#F4F2ED; padding:12px 24px; border-radius:6px; text-decoration:none; font-weight:600; display:inline-block;">Pay now</a>
+      </p>
+      <p style="color:#8A8578; font-size:12px;">Pay securely by card or bank transfer (ACH).</p>
+    `
+    : "";
   const html = `
     <div style="font-family: -apple-system, sans-serif;">
       <h2>Reminder: Invoice #${invoice.invoice_number} from ${companyName}</h2>
@@ -246,10 +264,7 @@ async function sendInvoiceReminderEmail({ to, cc, companyName, invoice, pdfBuffe
         : `This invoice is due on ${fmtDate(invoice.due_date)}.`
       }</p>
       <p>The full invoice is attached again as a PDF.</p>
-      <p style="margin-top:20px;">
-        <a href="${payUrl}" style="background:#1F2421; color:#F4F2ED; padding:12px 24px; border-radius:6px; text-decoration:none; font-weight:600; display:inline-block;">Pay now</a>
-      </p>
-      <p style="color:#8A8578; font-size:12px;">Pay securely by card or bank transfer (ACH).</p>
+      ${payButtonHtml}
       <p style="color:#999; font-size:12px;">Reminder ${reminderNumber} of ${maxReminders}.</p>
     </div>
   `;

@@ -1108,6 +1108,12 @@ async function sendInvoiceNow(invoiceId, companyId) {
     [companyId]
   );
   const company = companyResult.rows[0];
+  // Computed once and reused for both the PDF and the email below, so
+  // there's exactly one place deciding whether this company can accept
+  // online payments -- not two copies that could drift out of sync.
+  const payUrl = canAcceptOnlinePayments(company.stripe_connect_status)
+    ? `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`
+    : null;
 
   const pdfBuffer = await renderInvoicePdf({
     companyName: company.name,
@@ -1123,9 +1129,7 @@ async function sendInvoiceNow(invoiceId, companyId) {
     },
     lineItems: itemsResult.rows,
     logoBuffer: company.logo_data || null,
-    payUrl: canAcceptOnlinePayments(company.stripe_connect_status)
-      ? `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`
-      : null,
+    payUrl,
   });
 
   await sendInvoiceEmail({
@@ -1134,6 +1138,7 @@ async function sendInvoiceNow(invoiceId, companyId) {
     companyName: company.name,
     invoice,
     pdfBuffer,
+    payUrl,
   });
 
   const updateResult = await db.query(

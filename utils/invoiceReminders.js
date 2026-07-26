@@ -87,6 +87,11 @@ async function checkAndSendReminders() {
         [invoice.id]
       );
 
+      // Computed once and reused for both the PDF and the email below.
+      const payUrl = canAcceptOnlinePayments(invoice.company_stripe_connect_status)
+        ? `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`
+        : null;
+
       const pdfBuffer = await renderInvoicePdf({
         companyName: invoice.company_name,
         invoice,
@@ -101,9 +106,7 @@ async function checkAndSendReminders() {
         },
         lineItems: itemsResult.rows,
         logoBuffer: invoice.company_logo_data || null,
-        payUrl: canAcceptOnlinePayments(invoice.company_stripe_connect_status)
-          ? `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`
-          : null,
+        payUrl,
       });
 
       const reminderNumber = invoice.reminder_count + 1;
@@ -115,6 +118,7 @@ async function checkAndSendReminders() {
         pdfBuffer,
         reminderNumber,
         maxReminders: MAX_REMINDERS,
+        payUrl,
       });
 
       await db.query(
