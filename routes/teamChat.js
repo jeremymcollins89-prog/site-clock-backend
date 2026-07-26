@@ -2,12 +2,15 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const requireAuth = require("../middleware/requireAuth");
-const { sendPushToEmployee } = require("../utils/webPush");
+const { sendPushToEmployee, sendPushToAdmin } = require("../utils/webPush");
 
 router.use(requireAuth);
 
 // GET /api/team-chat/coworkers
 // Other active employees at the same company, for starting a new DM or group.
+// Deliberately does NOT include the admin -- messaging the admin still goes
+// through the existing dedicated /api/chat channel, not a team-chat thread
+// an employee creates themselves.
 router.get("/coworkers", async (req, res) => {
   try {
     const me = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
@@ -24,14 +27,18 @@ router.get("/coworkers", async (req, res) => {
 });
 
 // GET /api/team-chat/unread-count
-// Lightweight, safe to poll -- does NOT mark anything as read.
+// Lightweight, safe to poll -- does NOT mark anything as read. Uses IS
+// DISTINCT FROM (not !=) so that admin-sent messages, whose
+// sender_employee_id is NULL, still count as "not mine" instead of being
+// silently excluded by a plain NULL comparison.
 router.get("/unread-count", async (req, res) => {
   try {
     const result = await db.query(
       `SELECT COUNT(*)::int AS count
        FROM employee_chat_messages m
        JOIN employee_chat_participants p ON p.thread_id = m.thread_id AND p.employee_id = $1
-       WHERE m.sender_employee_id != $1 AND (p.last_read_at IS NULL OR m.created_at > p.last_read_at)`,
+       WHERE m.sender_employee_id IS DISTINCT FROM $1
+         AND (p.last_read_at IS NULL OR m.created_at > p.last_read_at)`,
       [req.employee.employee_id]
     );
     res.json({ count: result.rows[0].count });
@@ -43,7 +50,8 @@ router.get("/unread-count", async (req, res) => {
 
 // GET /api/team-chat/threads
 // Every thread (DM or group) this employee belongs to, with the other
-// participant(s), a preview of the last message, and a per-thread unread count.
+// participant(s) -- including a labeled "Admin" entry if the admin is in the
+// thread -- a preview of the last message, and a per-thread unread count.
 router.get("/threads", async (req, res) => {
   try {
     const me = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
@@ -52,14 +60,20 @@ router.get("/threads", async (req, res) => {
 
     const result = await db.query(
       `SELECT t.id, t.is_group, t.name,
-         (SELECT json_agg(json_build_object('id', e.id, 'name', e.name) ORDER BY e.name)
-            FROM employee_chat_participants p2
-            JOIN employees e ON e.id = p2.employee_id
-            WHERE p2.thread_id = t.id AND p2.employee_id != $1) AS other_participants,
-         (SELECT json_build_object('body', m.body, 'created_at', m.created_at, 'sender_employee_id', m.sender_employee_id)
+         (SELECT json_agg(x ORDER BY x.name) FROM (
+            SELECT e.id::text AS id, e.name AS name
+              FROM employee_chat_participants p2
+              JOIN employees e ON e.id = p2.employee_id
+             WHERE p2.thread_id = t.id AND p2.employee_id IS NOT NULL AND p2.employee_id != $1
+            UNION ALL
+            SELECT 'admin' AS id, 'Admin' AS name
+              FROM employee_chat_participants p3
+             WHERE p3.thread_id = t.id AND p3.is_admin = true
+          ) x) AS other_participants,
+         (SELECT json_build_object('body', m.body, 'created_at', m.created_at, 'sender_employee_id', m.sender_employee_id, 'sender_is_admin', m.sender_is_admin)
             FROM employee_chat_messages m WHERE m.thread_id = t.id ORDER BY m.created_at DESC LIMIT 1) AS last_message,
          (SELECT COUNT(*)::int FROM employee_chat_messages m
-            WHERE m.thread_id = t.id AND m.sender_employee_id != $1
+            WHERE m.thread_id = t.id AND m.sender_employee_id IS DISTINCT FROM $1
               AND (p.last_read_at IS NULL OR m.created_at > p.last_read_at)) AS unread_count
        FROM employee_chat_threads t
        JOIN employee_chat_participants p ON p.thread_id = t.id AND p.employee_id = $1
@@ -77,7 +91,8 @@ router.get("/threads", async (req, res) => {
 // POST /api/team-chat/threads
 // Body: { employee_ids: [uuid, ...], name? }. One id = a 1:1 DM (reuses an
 // existing thread between the same two people if one exists); 2+ ids = a
-// new group chat, optionally named.
+// new group chat, optionally named. Only ever includes other employees --
+// not the admin (see /coworkers comment above).
 router.post("/threads", async (req, res) => {
   try {
     const { employee_ids, name } = req.body;
@@ -117,7 +132,8 @@ router.post("/threads", async (req, res) => {
     }
 
     const threadResult = await db.query(
-      `INSERT INTO employee_chat_threads (company_id, is_group, name, created_by) VALUES ($1, $2, $3, $4) RETURNING id`,
+      `INSERT INTO employee_chat_threads (company_id, is_group, name, created_by_employee_id)
+       VALUES ($1, $2, $3, $4) RETURNING id`,
       [companyId, isGroup, isGroup ? (name || null) : null, req.employee.employee_id]
     );
     const threadId = threadResult.rows[0].id;
@@ -152,9 +168,11 @@ router.get("/threads/:id/messages", async (req, res) => {
     if (participant.rowCount === 0) return res.status(404).json({ error: "Chat not found" });
 
     const result = await db.query(
-      `SELECT m.id, m.sender_employee_id, e.name AS sender_name, m.body, m.created_at
+      `SELECT m.id, m.sender_employee_id, m.sender_is_admin,
+              CASE WHEN m.sender_is_admin THEN 'Admin' ELSE e.name END AS sender_name,
+              m.body, m.created_at
        FROM employee_chat_messages m
-       JOIN employees e ON e.id = m.sender_employee_id
+       LEFT JOIN employees e ON e.id = m.sender_employee_id
        WHERE m.thread_id = $1 ORDER BY m.created_at`,
       [id]
     );
@@ -171,7 +189,9 @@ router.get("/threads/:id/messages", async (req, res) => {
 
 // POST /api/team-chat/threads/:id/messages
 // Body: { body }. Only allowed while the sender is clocked in -- mirrors the
-// same gate used for the admin<->employee chat.
+// same gate used for the admin<->employee chat. (The admin side of team
+// chat, in routes/admin.js, has no such gate -- that rule is specifically
+// about employees messaging each other while off the clock.)
 router.post("/threads/:id/messages", async (req, res) => {
   try {
     const { id } = req.params;
@@ -192,12 +212,13 @@ router.post("/threads/:id/messages", async (req, res) => {
       return res.status(400).json({ error: "You need to be clocked in to message your team." });
     }
 
-    const me = await db.query(`SELECT name FROM employees WHERE id = $1`, [req.employee.employee_id]);
+    const me = await db.query(`SELECT name, company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
     const senderName = me.rows[0]?.name || "A coworker";
+    const companyId = me.rows[0]?.company_id;
 
     const result = await db.query(
       `INSERT INTO employee_chat_messages (thread_id, sender_employee_id, body) VALUES ($1, $2, $3)
-       RETURNING id, sender_employee_id, body, created_at`,
+       RETURNING id, sender_employee_id, sender_is_admin, body, created_at`,
       [id, req.employee.employee_id, body.trim()]
     );
 
@@ -207,21 +228,34 @@ router.post("/threads/:id/messages", async (req, res) => {
       [id, req.employee.employee_id]
     );
 
-    const others = await db.query(
-      `SELECT employee_id FROM employee_chat_participants WHERE thread_id = $1 AND employee_id != $2`,
+    const otherEmployees = await db.query(
+      `SELECT employee_id FROM employee_chat_participants
+       WHERE thread_id = $1 AND employee_id IS NOT NULL AND employee_id != $2`,
       [id, req.employee.employee_id]
+    );
+    const adminParticipant = await db.query(
+      `SELECT 1 FROM employee_chat_participants WHERE thread_id = $1 AND is_admin = true`,
+      [id]
     );
     const thread = await db.query(`SELECT is_group, name FROM employee_chat_threads WHERE id = $1`, [id]);
     const title = thread.rows[0]?.is_group
       ? `${senderName} in ${thread.rows[0].name || "group chat"}`
       : `Message from ${senderName}`;
-    others.rows.forEach((row) => {
+
+    otherEmployees.rows.forEach((row) => {
       sendPushToEmployee(row.employee_id, {
         title,
         body: body.trim().slice(0, 120),
         url: "/team",
       }).catch((err) => console.error("Failed to send team chat push notification:", err.message));
     });
+    if (adminParticipant.rowCount > 0 && companyId) {
+      sendPushToAdmin(companyId, {
+        title,
+        body: body.trim().slice(0, 120),
+        url: "/admin.html?view=team-chat",
+      }).catch((err) => console.error("Failed to send team chat admin push notification:", err.message));
+    }
 
     res.status(201).json({ ...result.rows[0], sender_name: senderName });
   } catch (err) {

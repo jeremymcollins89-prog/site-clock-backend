@@ -2533,4 +2533,196 @@ router.post("/chat/:employeeId/messages", async (req, res) => {
   }
 });
 
+// ---------- Team Chat (admin as a participant) ----------
+// The admin can start/join direct and group chats with employees, using the
+// same employee_chat_* tables employees use to message each other -- the
+// admin is just a participant row with is_admin = true / employee_id NULL
+// instead of a real employee row. Unlike an employee sender, the admin has
+// no clock-in gate on sending -- that rule only applies to employees
+// messaging each other while off the clock.
+router.get("/team-chat/threads", async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT t.id, t.is_group, t.name,
+         (SELECT json_agg(json_build_object('id', e.id, 'name', e.name) ORDER BY e.name)
+            FROM employee_chat_participants p2
+            JOIN employees e ON e.id = p2.employee_id
+            WHERE p2.thread_id = t.id AND p2.employee_id IS NOT NULL) AS other_participants,
+         (SELECT json_build_object('body', m.body, 'created_at', m.created_at, 'sender_employee_id', m.sender_employee_id, 'sender_is_admin', m.sender_is_admin)
+            FROM employee_chat_messages m WHERE m.thread_id = t.id ORDER BY m.created_at DESC LIMIT 1) AS last_message,
+         (SELECT COUNT(*)::int FROM employee_chat_messages m
+            WHERE m.thread_id = t.id AND m.sender_is_admin = false
+              AND (p.last_read_at IS NULL OR m.created_at > p.last_read_at)) AS unread_count
+       FROM employee_chat_threads t
+       JOIN employee_chat_participants p ON p.thread_id = t.id AND p.is_admin = true
+       WHERE t.company_id = $1
+       ORDER BY COALESCE((SELECT MAX(created_at) FROM employee_chat_messages m2 WHERE m2.thread_id = t.id), t.created_at) DESC`,
+      [req.companyId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/team-chat/threads failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load chats." });
+  }
+});
+
+// GET /api/admin/team-chat/unread-count
+router.get("/team-chat/unread-count", async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT COUNT(*)::int AS count
+       FROM employee_chat_messages m
+       JOIN employee_chat_participants p ON p.thread_id = m.thread_id AND p.is_admin = true
+       JOIN employee_chat_threads t ON t.id = m.thread_id
+       WHERE t.company_id = $1 AND m.sender_is_admin = false
+         AND (p.last_read_at IS NULL OR m.created_at > p.last_read_at)`,
+      [req.companyId]
+    );
+    res.json({ count: result.rows[0].count });
+  } catch (err) {
+    console.error("GET /admin/team-chat/unread-count failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load unread count." });
+  }
+});
+
+// POST /api/admin/team-chat/threads
+// Body: { employee_ids: [uuid, ...], name? }. One id = a 1:1 DM with that
+// employee (reuses an existing admin<->employee team thread if one already
+// exists); 2+ ids = a new group chat including the admin and those
+// employees, optionally named.
+router.post("/team-chat/threads", async (req, res) => {
+  try {
+    const { employee_ids, name } = req.body;
+    if (!Array.isArray(employee_ids) || employee_ids.length === 0) {
+      return res.status(400).json({ error: "Select at least one employee." });
+    }
+    const uniqueIds = [...new Set(employee_ids)];
+    const validCheck = await db.query(
+      `SELECT id FROM employees WHERE company_id = $1 AND id = ANY($2::uuid[])`,
+      [req.companyId, uniqueIds]
+    );
+    if (validCheck.rowCount !== uniqueIds.length) {
+      return res.status(400).json({ error: "One or more selected employees weren't found." });
+    }
+
+    const isGroup = uniqueIds.length > 1;
+
+    if (!isGroup) {
+      const existing = await db.query(
+        `SELECT t.id FROM employee_chat_threads t
+         WHERE t.company_id = $1 AND t.is_group = false
+           AND (SELECT COUNT(*) FROM employee_chat_participants p WHERE p.thread_id = t.id) = 2
+           AND EXISTS (SELECT 1 FROM employee_chat_participants p WHERE p.thread_id = t.id AND p.is_admin = true)
+           AND EXISTS (SELECT 1 FROM employee_chat_participants p WHERE p.thread_id = t.id AND p.employee_id = $2)`,
+        [req.companyId, uniqueIds[0]]
+      );
+      if (existing.rowCount > 0) {
+        return res.status(200).json({ id: existing.rows[0].id, existing: true });
+      }
+    }
+
+    const threadResult = await db.query(
+      `INSERT INTO employee_chat_threads (company_id, is_group, name, created_by_is_admin)
+       VALUES ($1, $2, $3, true) RETURNING id`,
+      [req.companyId, isGroup, isGroup ? (name || null) : null]
+    );
+    const threadId = threadResult.rows[0].id;
+
+    const values = [threadId];
+    const empPlaceholders = uniqueIds
+      .map((empId) => {
+        values.push(empId);
+        return `($1, $${values.length})`;
+      })
+      .join(", ");
+    await db.query(`INSERT INTO employee_chat_participants (thread_id, employee_id) VALUES ${empPlaceholders}`, values);
+    await db.query(`INSERT INTO employee_chat_participants (thread_id, is_admin) VALUES ($1, true)`, [threadId]);
+
+    res.status(201).json({ id: threadId, existing: false });
+  } catch (err) {
+    console.error("POST /admin/team-chat/threads failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't start chat." });
+  }
+});
+
+// GET /api/admin/team-chat/threads/:id/messages
+// Marks the thread read for the admin.
+router.get("/team-chat/threads/:id/messages", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const participant = await db.query(
+      `SELECT p.id FROM employee_chat_participants p
+       JOIN employee_chat_threads t ON t.id = p.thread_id
+       WHERE p.thread_id = $1 AND p.is_admin = true AND t.company_id = $2`,
+      [id, req.companyId]
+    );
+    if (participant.rowCount === 0) return res.status(404).json({ error: "Chat not found" });
+
+    const result = await db.query(
+      `SELECT m.id, m.sender_employee_id, m.sender_is_admin,
+              CASE WHEN m.sender_is_admin THEN 'Admin' ELSE e.name END AS sender_name,
+              m.body, m.created_at
+       FROM employee_chat_messages m
+       LEFT JOIN employees e ON e.id = m.sender_employee_id
+       WHERE m.thread_id = $1 ORDER BY m.created_at`,
+      [id]
+    );
+    await db.query(`UPDATE employee_chat_participants SET last_read_at = now() WHERE thread_id = $1 AND is_admin = true`, [id]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/team-chat/threads/:id/messages failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load messages." });
+  }
+});
+
+// POST /api/admin/team-chat/threads/:id/messages
+// Body: { body }. No clock-in gate -- see comment at the top of this section.
+router.post("/team-chat/threads/:id/messages", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { body } = req.body;
+    if (!body || !body.trim()) return res.status(400).json({ error: "Message can't be empty." });
+
+    const participant = await db.query(
+      `SELECT p.id FROM employee_chat_participants p
+       JOIN employee_chat_threads t ON t.id = p.thread_id
+       WHERE p.thread_id = $1 AND p.is_admin = true AND t.company_id = $2`,
+      [id, req.companyId]
+    );
+    if (participant.rowCount === 0) return res.status(404).json({ error: "Chat not found" });
+
+    const result = await db.query(
+      `INSERT INTO employee_chat_messages (thread_id, sender_is_admin, body) VALUES ($1, true, $2)
+       RETURNING id, sender_employee_id, sender_is_admin, body, created_at`,
+      [id, body.trim()]
+    );
+
+    await db.query(`UPDATE employee_chat_participants SET last_read_at = now() WHERE thread_id = $1 AND is_admin = true`, [id]);
+
+    const company = await db.query(`SELECT name FROM companies WHERE id = $1`, [req.companyId]);
+    const companyName = company.rows[0]?.name || "Your employer";
+
+    const employees = await db.query(
+      `SELECT employee_id FROM employee_chat_participants WHERE thread_id = $1 AND employee_id IS NOT NULL`,
+      [id]
+    );
+    const thread = await db.query(`SELECT is_group, name FROM employee_chat_threads WHERE id = $1`, [id]);
+    const title = thread.rows[0]?.is_group
+      ? `${companyName} in ${thread.rows[0].name || "group chat"}`
+      : `Message from ${companyName}`;
+    employees.rows.forEach((row) => {
+      sendPushToEmployee(row.employee_id, {
+        title,
+        body: body.trim().slice(0, 120),
+        url: "/team",
+      }).catch((err) => console.error("Failed to send team chat push notification:", err.message));
+    });
+
+    res.status(201).json({ ...result.rows[0], sender_name: "Admin" });
+  } catch (err) {
+    console.error("POST /admin/team-chat/threads/:id/messages failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't send message." });
+  }
+});
+
 module.exports = router;
