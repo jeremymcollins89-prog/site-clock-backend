@@ -411,8 +411,17 @@ router.get("/time-entries", async (req, res) => {
   const conditions = [`e.company_id = $1`];
   const params = [req.companyId];
 
-  if (start) { params.push(start); conditions.push(`d.clock_in >= $${params.length}`); }
-  if (end) { params.push(end); conditions.push(`d.clock_in <= $${params.length}`); }
+  // end is a plain "YYYY-MM-DD" date with no time component. Comparing
+  // clock_in (a timestamptz) against it with <= casts the date to midnight,
+  // so any entry on the end day itself with a clock_in after 00:00 -- i.e.
+  // basically all of them -- got silently excluded. That's exactly what made
+  // editing a time entry to land on "today" (the default end of the range in
+  // the Edit Hours view) look like the save didn't take: it saved fine, it
+  // just immediately fell outside this query's range and vanished from the
+  // list. Using "< end + 1 day" instead makes the end day fully inclusive,
+  // matching the fix already applied to the Reports queries below.
+  if (start) { params.push(start); conditions.push(`d.clock_in >= $${params.length}::date`); }
+  if (end) { params.push(end); conditions.push(`d.clock_in < ($${params.length}::date + INTERVAL '1 day')`); }
   if (employee_id) { params.push(employee_id); conditions.push(`d.employee_id = $${params.length}`); }
 
   const result = await db.query(

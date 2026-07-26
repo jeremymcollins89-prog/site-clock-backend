@@ -116,13 +116,17 @@ router.get("/", async (req, res) => {
     const conditions = [`employee_id = $1`];
     const params = [employee_id];
 
+    // Same fix as routes/admin.js's GET /time-entries: end is a plain
+    // "YYYY-MM-DD" date, and clock_in <= that casts to midnight, silently
+    // excluding anything on the end day itself with a clock_in after 00:00.
+    // "< end + 1 day" makes the end day fully inclusive.
     if (start) {
       params.push(start);
-      conditions.push(`clock_in >= $${params.length}`);
+      conditions.push(`clock_in >= $${params.length}::date`);
     }
     if (end) {
       params.push(end);
-      conditions.push(`clock_in <= $${params.length}`);
+      conditions.push(`clock_in < ($${params.length}::date + INTERVAL '1 day')`);
     }
 
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
