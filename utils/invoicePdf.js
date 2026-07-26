@@ -9,7 +9,7 @@ const PAYMENT_TERMS_LABELS = {
 };
 
 function fmtMoney(n) {
-  return `$${Number(n).toFixed(2)}`;
+  return `$${Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 function fmtDate(d) {

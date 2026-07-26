@@ -179,7 +179,7 @@ const PAYMENT_TERMS_LABELS = {
 };
 
 function fmtMoney(n) {
-  return `$${Number(n).toFixed(2)}`;
+  return `$${Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 // Emails an invoice PDF to the customer, cc'ing the company's own admin
