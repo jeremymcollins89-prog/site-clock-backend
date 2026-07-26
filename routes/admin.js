@@ -319,14 +319,14 @@ const CLOCK_IN_ANIMATIONS = ["none", "fireworks", "birthday"];
 
 router.get("/employees", async (req, res) => {
   const result = await db.query(
-    `SELECT id, name, email, active, created_at, clock_in_animation FROM employees WHERE company_id = $1 ORDER BY name`,
+    `SELECT id, name, email, active, created_at, clock_in_animation, hourly_rate FROM employees WHERE company_id = $1 ORDER BY name`,
     [req.companyId]
   );
   res.json(result.rows);
 });
 
 router.post("/employees", async (req, res) => {
-  const { name, email, pin, clock_in_animation } = req.body;
+  const { name, email, pin, clock_in_animation, hourly_rate } = req.body;
   if (!name || !email || !pin) {
     return res.status(400).json({ error: "name, email, and pin are required" });
   }
@@ -336,9 +336,9 @@ router.post("/employees", async (req, res) => {
   const pin_hash = await hashPin(pin);
   try {
     const result = await db.query(
-      `INSERT INTO employees (name, email, pin_hash, company_id, clock_in_animation) VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, name, email, active, created_at, clock_in_animation`,
-      [name, email, pin_hash, req.companyId, clock_in_animation || "none"]
+      `INSERT INTO employees (name, email, pin_hash, company_id, clock_in_animation, hourly_rate) VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, name, email, active, created_at, clock_in_animation, hourly_rate`,
+      [name, email, pin_hash, req.companyId, clock_in_animation || "none", hourly_rate || null]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -351,10 +351,13 @@ router.post("/employees", async (req, res) => {
 
 router.patch("/employees/:id", async (req, res) => {
   const { id } = req.params;
-  const { name, email, active, pin, clock_in_animation } = req.body;
+  const { name, email, active, pin, clock_in_animation, hourly_rate } = req.body;
 
   if (clock_in_animation !== undefined && !CLOCK_IN_ANIMATIONS.includes(clock_in_animation)) {
     return res.status(400).json({ error: "Invalid clock_in_animation" });
+  }
+  if (hourly_rate !== undefined && hourly_rate !== null && (isNaN(Number(hourly_rate)) || Number(hourly_rate) < 0)) {
+    return res.status(400).json({ error: "hourly_rate must be a non-negative number" });
   }
 
   const fields = [];
@@ -364,6 +367,7 @@ router.patch("/employees/:id", async (req, res) => {
   if (active !== undefined) { values.push(active); fields.push(`active = $${values.length}`); }
   if (pin) { values.push(await hashPin(pin)); fields.push(`pin_hash = $${values.length}`); }
   if (clock_in_animation !== undefined) { values.push(clock_in_animation); fields.push(`clock_in_animation = $${values.length}`); }
+  if (hourly_rate !== undefined) { values.push(hourly_rate === null || hourly_rate === "" ? null : Number(hourly_rate)); fields.push(`hourly_rate = $${values.length}`); }
 
   if (fields.length === 0) return res.status(400).json({ error: "Nothing to update" });
 
@@ -371,7 +375,7 @@ router.patch("/employees/:id", async (req, res) => {
   try {
     const result = await db.query(
       `UPDATE employees SET ${fields.join(", ")} WHERE id = $${values.length - 1} AND company_id = $${values.length}
-       RETURNING id, name, email, active, created_at, clock_in_animation`,
+       RETURNING id, name, email, active, created_at, clock_in_animation, hourly_rate`,
       values
     );
     if (result.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
@@ -2083,16 +2087,128 @@ router.get("/reports/summary", async (req, res) => {
       [req.companyId, start, end]
     );
 
+    // Labor cost mirrors the labor_hours query above (same clock_in-based
+    // range) but multiplies each employee's worked hours by their own
+    // hourly_rate before summing, so employees with different pay rates
+    // are costed correctly. Employees with no rate set (NULL) contribute $0
+    // -- this undercounts true cost until a rate is filled in for everyone,
+    // which is called out to Jeremy in the UI rather than silently guessed.
+    const laborCostResult = await db.query(
+      `SELECT COALESCE(SUM((d.worked_seconds / 3600.0) * COALESCE(e.hourly_rate, 0)), 0) AS total_cost
+       FROM time_entry_durations d
+       JOIN employees e ON e.id = d.employee_id
+       WHERE e.company_id = $1 AND d.clock_in >= $2::date AND d.clock_in < ($3::date + INTERVAL '1 day')`,
+      [req.companyId, start, end]
+    );
+
+    const expenseResult = await db.query(
+      `SELECT COALESCE(SUM(amount), 0) AS sum_total, COUNT(*) AS cnt
+       FROM expenses
+       WHERE company_id = $1 AND expense_date >= $2::date AND expense_date <= $3::date`,
+      [req.companyId, start, end]
+    );
+
     res.json({
       labor_hours: Number(laborResult.rows[0].total_seconds) / 3600,
       invoice_total: Number(invoicedResult.rows[0].sum_total),
       invoice_count: Number(invoicedResult.rows[0].cnt),
       paid_invoice_total: Number(paidResult.rows[0].sum_total),
       paid_invoice_count: Number(paidResult.rows[0].cnt),
+      labor_cost: Number(laborCostResult.rows[0].total_cost),
+      expense_total: Number(expenseResult.rows[0].sum_total),
+      expense_count: Number(expenseResult.rows[0].cnt),
     });
   } catch (err) {
     console.error("GET /admin/reports/summary failed:", err);
     res.status(500).json({ error: err.message || "Couldn't load report." });
+  }
+});
+
+// ---------- Expenses ----------
+// Simple manually-logged business costs (materials, insurance, rent, etc.)
+// that feed into Net Profit on the Reports tab. Deliberately minimal --
+// date, amount, optional description -- for quick logging rather than full
+// bookkeeping.
+
+// GET /api/admin/expenses
+router.get("/expenses", async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, expense_date, amount, description, created_at
+       FROM expenses WHERE company_id = $1 ORDER BY expense_date DESC, created_at DESC`,
+      [req.companyId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/expenses failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load expenses." });
+  }
+});
+
+// POST /api/admin/expenses
+// Body: { expense_date, amount, description? }
+router.post("/expenses", async (req, res) => {
+  try {
+    const { expense_date, amount, description } = req.body;
+    if (!expense_date) return res.status(400).json({ error: "expense_date is required" });
+    if (amount === undefined || amount === null || isNaN(Number(amount))) {
+      return res.status(400).json({ error: "amount is required" });
+    }
+    const result = await db.query(
+      `INSERT INTO expenses (company_id, expense_date, amount, description) VALUES ($1, $2, $3, $4)
+       RETURNING id, expense_date, amount, description, created_at`,
+      [req.companyId, expense_date, Number(amount), description || null]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("POST /admin/expenses failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't create expense." });
+  }
+});
+
+// PATCH /api/admin/expenses/:id
+// Body: { expense_date?, amount?, description? }
+router.patch("/expenses/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { expense_date, amount, description } = req.body;
+    const owns = await db.query(`SELECT id FROM expenses WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Expense not found" });
+
+    if (amount !== undefined && isNaN(Number(amount))) {
+      return res.status(400).json({ error: "amount must be a number" });
+    }
+
+    const fields = [];
+    const values = [];
+    if (expense_date !== undefined) { values.push(expense_date); fields.push(`expense_date = $${values.length}`); }
+    if (amount !== undefined) { values.push(Number(amount)); fields.push(`amount = $${values.length}`); }
+    if (description !== undefined) { values.push(description || null); fields.push(`description = $${values.length}`); }
+    if (fields.length === 0) return res.status(400).json({ error: "Nothing to update" });
+
+    values.push(id, req.companyId);
+    const result = await db.query(
+      `UPDATE expenses SET ${fields.join(", ")} WHERE id = $${values.length - 1} AND company_id = $${values.length}
+       RETURNING id, expense_date, amount, description, created_at`,
+      values
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("PATCH /admin/expenses/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't update expense." });
+  }
+});
+
+// DELETE /api/admin/expenses/:id
+router.delete("/expenses/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(`DELETE FROM expenses WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (result.rowCount === 0) return res.status(404).json({ error: "Expense not found" });
+    res.status(204).end();
+  } catch (err) {
+    console.error("DELETE /admin/expenses/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't delete expense." });
   }
 });
 
