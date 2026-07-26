@@ -315,7 +315,7 @@ router.patch("/pay-schedule", async (req, res) => {
   res.json(result.rows[0]);
 });
 
-const CLOCK_IN_ANIMATIONS = ["none", "fireworks", "birthday"];
+const CLOCK_IN_ANIMATIONS = ["none", "fireworks", "birthday", "rocket"];
 
 router.get("/employees", async (req, res) => {
   const result = await db.query(
