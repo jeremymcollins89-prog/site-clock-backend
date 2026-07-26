@@ -102,11 +102,11 @@ function renderInvoicePdf({ companyName, invoice, customer, lineItems, logoBuffe
 
     let afterTotalsY = totalsY + 20;
     if (payUrl && invoice.status !== "paid" && invoice.status !== "void") {
-      doc.font("Helvetica-Bold").fontSize(10).fillColor("#C1502E")
-        .text("Pay this invoice online (card or bank transfer):", 50, afterTotalsY, { width: 500 });
-      doc.font("Helvetica").fillColor("#1F2421")
-        .text(payUrl, 50, afterTotalsY + 14, { width: 500, link: payUrl, underline: true });
-      afterTotalsY += 40;
+      // Clickable link text only -- no raw URL shown -- but the link
+      // destination (payUrl) is unchanged underneath.
+      doc.font("Helvetica-Bold").fontSize(11).fillColor("#C1502E")
+        .text("Click here to pay now", 50, afterTotalsY, { width: 500, link: payUrl, underline: true });
+      afterTotalsY += 26;
     }
 
     if (invoice.notes) {
