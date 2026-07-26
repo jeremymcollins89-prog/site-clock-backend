@@ -328,6 +328,48 @@ async function sendQuoteEmail({ to, cc, companyName, quote, pdfBuffer }) {
   }
 }
 
+// Sent automatically the instant a Stripe payment for an invoice is
+// confirmed (see routes/payments.js's webhook handler) -- a lightweight
+// payment confirmation, separate from the full invoice PDF (already emailed
+// when the invoice was originally sent). Branded with the paying company's
+// name via customerFacingFrom, same as every other customer-facing email,
+// so it doesn't look like it came from "Coll Timeclock" instead of the
+// business the customer actually paid.
+async function sendPaymentReceiptEmail({ to, companyName, invoice }) {
+  const paidDate = fmtDate(invoice.paid_at);
+  const html = `
+    <div style="font-family: -apple-system, sans-serif;">
+      <h2>Payment received &mdash; thank you!</h2>
+      <p>${companyName} received your payment for Invoice #${invoice.invoice_number}.</p>
+      <table style="border-collapse: collapse; margin: 16px 0;">
+        <tr><td style="padding:4px 12px 4px 0; color:#8A8578;">Amount paid</td><td style="padding:4px 0; font-weight:600;">${fmtMoney(invoice.total)}</td></tr>
+        <tr><td style="padding:4px 12px 4px 0; color:#8A8578;">Date</td><td style="padding:4px 0;">${paidDate}</td></tr>
+        <tr><td style="padding:4px 12px 4px 0; color:#8A8578;">Invoice</td><td style="padding:4px 0;">#${invoice.invoice_number}</td></tr>
+      </table>
+      <p style="color:#8A8578; font-size:12px;">This is a payment confirmation, not a new invoice -- keep it for your records.</p>
+    </div>
+  `;
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: customerFacingFrom(companyName),
+      to: [to],
+      subject: `Payment received -- Invoice #${invoice.invoice_number} (${fmtMoney(invoice.total)})`,
+      html,
+    }),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`Resend API error (${res.status}): ${errBody}`);
+  }
+}
+
 module.exports = {
   sendTimesheetEmail,
   sendAdminPasswordResetEmail,
@@ -335,4 +377,5 @@ module.exports = {
   sendEmployeePinResetEmail,
   sendInvoiceEmail,
   sendQuoteEmail,
+  sendPaymentReceiptEmail,
 };

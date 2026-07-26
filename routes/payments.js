@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const stripe = require("../utils/stripeClient");
+const { sendPaymentReceiptEmail } = require("../utils/mailer");
 
 // Where the customer lands after paying (or backing out of) a Checkout
 // page -- static pages in the frontend site, not behind any login.
@@ -125,12 +126,39 @@ async function handleStripeWebhook(req, res) {
 async function markInvoicePaidFromStripe(session) {
   const invoiceId = session.metadata && session.metadata.invoice_id;
   if (!invoiceId) return;
-  await db.query(
+
+  const result = await db.query(
     `UPDATE invoices
      SET status = 'paid', payment_method = 'online', paid_at = now(), stripe_payment_intent_id = $1
-     WHERE id = $2 AND status != 'paid'`,
+     WHERE id = $2 AND status != 'paid'
+     RETURNING *`,
     [session.payment_intent || null, invoiceId]
   );
+  // rowCount is 0 if this invoice was already marked paid -- e.g. Stripe
+  // re-delivering the same webhook event, which it does retry on occasion.
+  // Nothing new happened, so there's nothing new to send a receipt for.
+  if (result.rowCount === 0) return;
+  const invoice = result.rows[0];
+
+  try {
+    const detail = await db.query(
+      `SELECT c.name AS customer_name, c.email AS customer_email, co.name AS company_name
+       FROM invoices i
+       JOIN customers c ON c.id = i.customer_id
+       JOIN companies co ON co.id = i.company_id
+       WHERE i.id = $1`,
+      [invoiceId]
+    );
+    const row = detail.rows[0];
+    if (row && row.customer_email) {
+      await sendPaymentReceiptEmail({ to: row.customer_email, companyName: row.company_name, invoice });
+    }
+  } catch (err) {
+    // A failed receipt email shouldn't undo the payment already being
+    // recorded above -- just log it (Sentry picks it up via the global
+    // handler) rather than losing the failure silently.
+    console.error("Failed to send payment receipt email:", err.message);
+  }
 }
 
 module.exports = { router, handleStripeWebhook };
