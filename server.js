@@ -37,7 +37,8 @@ const pushRoutes = require("./routes/push");
 const scheduleRoutes = require("./routes/schedule");
 const chatRoutes = require("./routes/chat");
 const teamChatRoutes = require("./routes/teamChat");
-const { router: paymentsRoutes, handleStripeWebhook } = require("./routes/payments");
+const { router: paymentsRoutes, handleStripeWebhook, handleStripeConnectWebhook } = require("./routes/payments");
+const connectRoutes = require("./routes/connect");
 const { checkAndSendReminders } = require("./utils/invoiceReminders");
 
 const app = express();
@@ -50,6 +51,13 @@ app.use(cors());
 // Express matches routes in registration order, so a POST to this exact
 // path never reaches express.json() at all.
 app.post("/api/payments/webhook", express.raw({ type: "application/json" }), handleStripeWebhook);
+
+// Second webhook destination, for events Stripe fires on *connected*
+// accounts (see routes/connect.js) -- Stripe requires this to be a
+// separate "Connected accounts" destination in the dashboard, signed with
+// its own secret, even though it can point at a different path on the same
+// server.
+app.post("/api/payments/connect-webhook", express.raw({ type: "application/json" }), handleStripeConnectWebhook);
 
 // Raised from the 100kb default so a base64-encoded company logo upload
 // (see PUT /api/admin/company-logo) doesn't get rejected before it even
@@ -75,6 +83,7 @@ app.use("/api/schedule", scheduleRoutes);
 app.use("/api/chat", chatRoutes);
 app.use("/api/team-chat", teamChatRoutes);
 app.use("/api/payments", paymentsRoutes);
+app.use("/api/connect", connectRoutes);
 
 // Must come after all routes, before any other error-handling middleware.
 Sentry.setupExpressErrorHandler(app);

@@ -4,6 +4,13 @@ const { sendInvoiceReminderEmail } = require("./mailer");
 
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://site-clock-frontend-production.up.railway.app";
 
+// See routes/admin.js for the fuller explanation -- every company must
+// connect its own Stripe account before its invoices get a Pay Now link,
+// no exceptions.
+function canAcceptOnlinePayments(stripeConnectStatus) {
+  return stripeConnectStatus === "connected";
+}
+
 // Automatic reminder emails for unpaid ("sent") invoices. First reminder
 // fires on or after the due date; each one after that waits at least this
 // many days from the last reminder, capped at MAX_REMINDERS total. Timing
@@ -60,7 +67,7 @@ async function checkAndSendReminders() {
     `SELECT i.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
             c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip,
             comp.name AS company_name, comp.admin_email AS company_admin_email, comp.logo_data AS company_logo_data,
-            comp.timezone AS company_timezone
+            comp.timezone AS company_timezone, comp.stripe_connect_status AS company_stripe_connect_status
      FROM invoices i
      JOIN customers c ON c.id = i.customer_id
      JOIN companies comp ON comp.id = i.company_id
@@ -94,7 +101,9 @@ async function checkAndSendReminders() {
         },
         lineItems: itemsResult.rows,
         logoBuffer: invoice.company_logo_data || null,
-        payUrl: `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`,
+        payUrl: canAcceptOnlinePayments(invoice.company_stripe_connect_status)
+          ? `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`
+          : null,
       });
 
       const reminderNumber = invoice.reminder_count + 1;

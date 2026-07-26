@@ -21,6 +21,15 @@ const PAYMENT_TERMS_DAYS = { due_on_receipt: 0, net_15: 15, net_30: 30, net_60: 
 const PAYMENT_METHODS = ["card", "check", "cash", "other"];
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://site-clock-frontend-production.up.railway.app";
 
+// Every company -- including Jeremy's own -- must connect its own Stripe
+// account (see routes/connect.js) before its invoices get a Pay Now link.
+// There's no platform-account fallback for anyone: see routes/payments.js
+// for why that would be a self-referential mess (an application fee on a
+// charge to your own account).
+function canAcceptOnlinePayments(stripeConnectStatus) {
+  return stripeConnectStatus === "connected";
+}
+
 router.post("/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
@@ -1094,7 +1103,10 @@ async function sendInvoiceNow(invoiceId, companyId) {
     `SELECT description, quantity, unit_price FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
     [invoiceId]
   );
-  const companyResult = await db.query(`SELECT name, admin_email, logo_data FROM companies WHERE id = $1`, [companyId]);
+  const companyResult = await db.query(
+    `SELECT name, admin_email, logo_data, stripe_connect_status FROM companies WHERE id = $1`,
+    [companyId]
+  );
   const company = companyResult.rows[0];
 
   const pdfBuffer = await renderInvoicePdf({
@@ -1111,7 +1123,9 @@ async function sendInvoiceNow(invoiceId, companyId) {
     },
     lineItems: itemsResult.rows,
     logoBuffer: company.logo_data || null,
-    payUrl: `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`,
+    payUrl: canAcceptOnlinePayments(company.stripe_connect_status)
+      ? `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`
+      : null,
   });
 
   await sendInvoiceEmail({
@@ -1208,7 +1222,10 @@ router.get("/invoices/:id/pdf", async (req, res) => {
       `SELECT description, quantity, unit_price FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
       [id]
     );
-    const companyResult = await db.query(`SELECT name, logo_data FROM companies WHERE id = $1`, [req.companyId]);
+    const companyResult = await db.query(
+      `SELECT name, logo_data, stripe_connect_status FROM companies WHERE id = $1`,
+      [req.companyId]
+    );
     const company = companyResult.rows[0];
 
     const pdfBuffer = await renderInvoicePdf({
@@ -1225,7 +1242,9 @@ router.get("/invoices/:id/pdf", async (req, res) => {
       },
       lineItems: itemsResult.rows,
       logoBuffer: company.logo_data || null,
-      payUrl: `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`,
+      payUrl: canAcceptOnlinePayments(company.stripe_connect_status)
+        ? `${FRONTEND_URL}/pay-invoice.html?id=${invoice.id}`
+        : null,
     });
 
     res.set("Content-Type", "application/pdf");
