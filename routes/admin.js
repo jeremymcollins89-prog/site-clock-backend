@@ -319,7 +319,8 @@ const CLOCK_IN_ANIMATIONS = ["none", "fireworks", "birthday", "rocket"];
 
 router.get("/employees", async (req, res) => {
   const result = await db.query(
-    `SELECT id, name, email, active, created_at, clock_in_animation, hourly_rate FROM employees WHERE company_id = $1 ORDER BY name`,
+    `SELECT id, name, email, active, created_at, clock_in_animation, hourly_rate, phone, street, city, state, zip
+     FROM employees WHERE company_id = $1 ORDER BY name`,
     [req.companyId]
   );
   res.json(result.rows);
@@ -351,7 +352,7 @@ router.post("/employees", async (req, res) => {
 
 router.patch("/employees/:id", async (req, res) => {
   const { id } = req.params;
-  const { name, email, active, pin, clock_in_animation, hourly_rate } = req.body;
+  const { name, email, active, pin, clock_in_animation, hourly_rate, phone, street, city, state, zip } = req.body;
 
   if (clock_in_animation !== undefined && !CLOCK_IN_ANIMATIONS.includes(clock_in_animation)) {
     return res.status(400).json({ error: "Invalid clock_in_animation" });
@@ -368,6 +369,11 @@ router.patch("/employees/:id", async (req, res) => {
   if (pin) { values.push(await hashPin(pin)); fields.push(`pin_hash = $${values.length}`); }
   if (clock_in_animation !== undefined) { values.push(clock_in_animation); fields.push(`clock_in_animation = $${values.length}`); }
   if (hourly_rate !== undefined) { values.push(hourly_rate === null || hourly_rate === "" ? null : Number(hourly_rate)); fields.push(`hourly_rate = $${values.length}`); }
+  if (phone !== undefined) { values.push(phone || null); fields.push(`phone = $${values.length}`); }
+  if (street !== undefined) { values.push(street || null); fields.push(`street = $${values.length}`); }
+  if (city !== undefined) { values.push(city || null); fields.push(`city = $${values.length}`); }
+  if (state !== undefined) { values.push(state || null); fields.push(`state = $${values.length}`); }
+  if (zip !== undefined) { values.push(zip || null); fields.push(`zip = $${values.length}`); }
 
   if (fields.length === 0) return res.status(400).json({ error: "Nothing to update" });
 
@@ -375,7 +381,7 @@ router.patch("/employees/:id", async (req, res) => {
   try {
     const result = await db.query(
       `UPDATE employees SET ${fields.join(", ")} WHERE id = $${values.length - 1} AND company_id = $${values.length}
-       RETURNING id, name, email, active, created_at, clock_in_animation, hourly_rate`,
+       RETURNING id, name, email, active, created_at, clock_in_animation, hourly_rate, phone, street, city, state, zip`,
       values
     );
     if (result.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
