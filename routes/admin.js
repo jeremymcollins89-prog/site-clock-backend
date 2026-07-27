@@ -8,6 +8,7 @@ const { generateResetToken, hashResetToken } = require("../utils/resetToken");
 const { sendAdminPasswordResetEmail, sendInvoiceEmail, sendQuoteEmail, sendPaymentReceiptEmail } = require("../utils/mailer");
 const { renderInvoicePdf, renderQuotePdf } = require("../utils/invoicePdf");
 const requireAdmin = require("../middleware/requireAdmin");
+const loginRateLimit = require("../middleware/loginRateLimit");
 const { getPayPeriod, PAY_FREQUENCIES } = require("../utils/payPeriod");
 const { JOB_COLORS } = require("../utils/jobColors");
 const { sendPushToEmployee } = require("../utils/webPush");
@@ -30,7 +31,7 @@ function canAcceptOnlinePayments(stripeConnectStatus) {
   return stripeConnectStatus === "connected";
 }
 
-router.post("/login", async (req, res) => {
+router.post("/login", loginRateLimit, async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: "email and password are required" });
@@ -48,7 +49,7 @@ router.post("/login", async (req, res) => {
 // Public — no auth required, since the whole point is recovering access.
 // Always responds the same way whether or not the email exists, so this
 // endpoint can't be used to find out which emails have accounts.
-router.post("/forgot-password", async (req, res) => {
+router.post("/forgot-password", loginRateLimit, async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: "email is required" });
 
@@ -72,7 +73,7 @@ router.post("/forgot-password", async (req, res) => {
 // Body: { token, new_password }
 // Public — the token itself (emailed via forgot-password) is the proof of
 // identity here.
-router.post("/reset-password", async (req, res) => {
+router.post("/reset-password", loginRateLimit, async (req, res) => {
   const { token, new_password } = req.body;
   if (!token || !new_password) {
     return res.status(400).json({ error: "token and new_password are required" });

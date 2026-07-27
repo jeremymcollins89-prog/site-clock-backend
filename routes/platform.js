@@ -3,13 +3,14 @@ const router = express.Router();
 const db = require("../db");
 const { checkPlatformCredentials, signPlatformToken } = require("../utils/platformAuth");
 const requirePlatformAuth = require("../middleware/requirePlatformAuth");
+const loginRateLimit = require("../middleware/loginRateLimit");
 
 // POST /api/platform/login
 // Body: { email, password }
 // Not company-scoped at all -- this is Jeremy's own cross-company login,
 // checked against PLATFORM_ADMIN_EMAIL / PLATFORM_ADMIN_PASSWORD in Railway
 // rather than any row in the database (there's only ever one of these).
-router.post("/login", async (req, res) => {
+router.post("/login", loginRateLimit, async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: "email and password are required" });

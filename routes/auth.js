@@ -4,13 +4,14 @@ const db = require("../db");
 const { signToken, hashPin, comparePin } = require("../utils/auth");
 const { generateResetToken, hashResetToken } = require("../utils/resetToken");
 const { sendEmployeePinResetEmail } = require("../utils/mailer");
+const loginRateLimit = require("../middleware/loginRateLimit");
 
 // POST /api/auth/login
 // Body: { name, pin }
 // Called once per device, the first time an employee opens the app.
 // Returns a long-lived token the app stores locally so they never have
 // to re-enter their PIN on that device again.
-router.post("/login", async (req, res) => {
+router.post("/login", loginRateLimit, async (req, res) => {
   try {
     const { email, pin } = req.body;
     if (!email || !pin) {
@@ -69,7 +70,7 @@ router.post("/login", async (req, res) => {
 // Public — no auth required, since the whole point is recovering access.
 // Always responds the same way whether or not the email exists, so this
 // endpoint can't be used to find out which emails have accounts.
-router.post("/forgot-pin", async (req, res) => {
+router.post("/forgot-pin", loginRateLimit, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: "email is required" });
@@ -113,7 +114,7 @@ router.post("/forgot-pin", async (req, res) => {
 // POST /api/auth/reset-pin
 // Body: { token, new_pin }
 // Public — the token itself (emailed via forgot-pin) is the proof of identity.
-router.post("/reset-pin", async (req, res) => {
+router.post("/reset-pin", loginRateLimit, async (req, res) => {
   try {
     const { token, new_pin } = req.body;
     if (!token || !new_pin) {

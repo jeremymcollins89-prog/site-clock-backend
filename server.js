@@ -27,6 +27,7 @@ process.on("uncaughtException", (err) => {
 
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
 const cron = require("node-cron");
 const companyRoutes = require("./routes/companies");
 const authRoutes = require("./routes/auth");
@@ -44,6 +45,24 @@ const { checkAndSendReminders } = require("./utils/invoiceReminders");
 const { checkAndSendLongShiftAlerts } = require("./utils/longShiftAlerts");
 
 const app = express();
+
+// Railway sits in front of this server as a reverse proxy, so without this,
+// every request looks like it comes from Railway's own IP -- which would
+// make the login rate limiter below (keyed by IP) treat every visitor as
+// the same "user" and block everyone together after one person's failed
+// attempts. This tells Express to trust the first hop's X-Forwarded-For
+// header so req.ip is the real caller.
+app.set("trust proxy", 1);
+
+// Sets a handful of standard security response headers (no more X-Powered-By
+// giving away the framework, no framing by other sites, etc). CSP is turned
+// off because this server only ever returns JSON -- the actual web pages are
+// served separately by the frontend -- and CORP is relaxed to cross-origin
+// since the frontend calls this API from a different Railway domain.
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+}));
 
 app.use(cors());
 
