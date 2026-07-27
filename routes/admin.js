@@ -5,7 +5,7 @@ const db = require("../db");
 const { loginAdmin } = require("../utils/adminAuth");
 const { hashPin } = require("../utils/auth");
 const { generateResetToken, hashResetToken } = require("../utils/resetToken");
-const { sendAdminPasswordResetEmail, sendInvoiceEmail, sendQuoteEmail } = require("../utils/mailer");
+const { sendAdminPasswordResetEmail, sendInvoiceEmail, sendQuoteEmail, sendPaymentReceiptEmail } = require("../utils/mailer");
 const { renderInvoicePdf, renderQuotePdf } = require("../utils/invoicePdf");
 const requireAdmin = require("../middleware/requireAdmin");
 const { getPayPeriod, PAY_FREQUENCIES } = require("../utils/payPeriod");
@@ -1568,6 +1568,47 @@ router.patch("/invoices/:id/mark-paid", async (req, res) => {
   } catch (err) {
     console.error("PATCH /admin/invoices/:id/mark-paid failed:", err);
     res.status(500).json({ error: err.message || "Couldn't mark invoice as paid." });
+  }
+});
+
+// POST /api/admin/invoices/:id/resend-receipt
+// Body: { email } -- optional. Manually re-sends the same payment-received
+// email normally sent automatically the instant an online payment clears
+// (see markInvoicePaidFromStripe in routes/payments.js). This is the only
+// way an in-person/phone payment (cash, check, card run elsewhere) ever gets
+// a receipt at all, since those are marked paid by hand and never trigger
+// that automatic email. If no email is given, falls back to the customer's
+// email on file; lets the admin send to a different address instead
+// (a coworker who handles the customer's books, etc.) without having to
+// change the customer's own contact info to do it.
+router.post("/invoices/:id/resend-receipt", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const emailOverride = (req.body.email || "").trim();
+
+    const result = await db.query(
+      `SELECT i.*, c.email AS customer_email
+       FROM invoices i JOIN customers c ON c.id = i.customer_id
+       WHERE i.id = $1 AND i.company_id = $2`,
+      [id, req.companyId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
+    const invoice = result.rows[0];
+
+    if (invoice.status !== "paid") {
+      return res.status(400).json({ error: "This invoice hasn't been paid yet." });
+    }
+    const to = emailOverride || invoice.customer_email;
+    if (!to) {
+      return res.status(400).json({ error: "No email on file for this customer -- enter one to send the receipt to." });
+    }
+
+    const companyResult = await db.query(`SELECT name FROM companies WHERE id = $1`, [req.companyId]);
+    await sendPaymentReceiptEmail({ to, companyName: companyResult.rows[0].name, invoice });
+    res.json({ message: `Receipt sent to ${to}.` });
+  } catch (err) {
+    console.error("POST /admin/invoices/:id/resend-receipt failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't send receipt. Please try again." });
   }
 });
 
