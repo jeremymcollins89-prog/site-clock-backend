@@ -39,6 +39,7 @@ const chatRoutes = require("./routes/chat");
 const teamChatRoutes = require("./routes/teamChat");
 const { router: paymentsRoutes, handleStripeWebhook, handleStripeConnectWebhook } = require("./routes/payments");
 const connectRoutes = require("./routes/connect");
+const platformRoutes = require("./routes/platform");
 const { checkAndSendReminders } = require("./utils/invoiceReminders");
 const { checkAndSendLongShiftAlerts } = require("./utils/longShiftAlerts");
 
@@ -85,6 +86,7 @@ app.use("/api/chat", chatRoutes);
 app.use("/api/team-chat", teamChatRoutes);
 app.use("/api/payments", paymentsRoutes);
 app.use("/api/connect", connectRoutes);
+app.use("/api/platform", platformRoutes);
 
 // Must come after all routes, before any other error-handling middleware.
 Sentry.setupExpressErrorHandler(app);
