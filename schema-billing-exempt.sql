@@ -1,0 +1,12 @@
+-- Marks a company as exempt from any future subscription/paywall check,
+-- regardless of Stripe subscription status. Whenever billing is built, every
+-- "does this company have to pay" check must look at this flag FIRST and let
+-- exempt companies through unconditionally -- this is what guarantees
+-- Modular Cleanrooms (and any other company flagged this way later) never
+-- gets locked out or charged, no matter how billing itself is implemented.
+--
+-- Set manually via SQL (see below) rather than through an admin screen --
+-- there's no cross-company "platform owner" UI in this app, and comping a
+-- company is rare enough that a one-line UPDATE is the right amount of
+-- tooling for it.
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS billing_exempt BOOLEAN NOT NULL DEFAULT false;
