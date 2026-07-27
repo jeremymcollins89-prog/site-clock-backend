@@ -40,6 +40,7 @@ const teamChatRoutes = require("./routes/teamChat");
 const { router: paymentsRoutes, handleStripeWebhook, handleStripeConnectWebhook } = require("./routes/payments");
 const connectRoutes = require("./routes/connect");
 const { checkAndSendReminders } = require("./utils/invoiceReminders");
+const { checkAndSendLongShiftAlerts } = require("./utils/longShiftAlerts");
 
 const app = express();
 
@@ -106,6 +107,19 @@ cron.schedule("0 * * * *", () => {
     .then((sent) => console.log(`Invoice reminder job sent ${sent} reminder(s).`))
     .catch((err) => {
       console.error("Invoice reminder job failed:", err);
+      Sentry.captureException(err);
+    });
+});
+
+// Runs every 10 minutes so a company's long_shift_alert_hours setting (see
+// GET/PATCH /api/admin/long-shift-alert, 1-24, or off) fires reasonably
+// close to the threshold rather than only once an hour -- someone who sets
+// a 1-hour alert would otherwise wait up to an extra 59 minutes for it.
+cron.schedule("*/10 * * * *", () => {
+  checkAndSendLongShiftAlerts()
+    .then((sent) => console.log(`Long shift alert job sent ${sent} alert(s).`))
+    .catch((err) => {
+      console.error("Long shift alert job failed:", err);
       Sentry.captureException(err);
     });
 });

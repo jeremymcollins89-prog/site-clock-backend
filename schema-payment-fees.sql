@@ -1,0 +1,22 @@
+-- Actual cost of accepting an online payment, captured at the moment Stripe
+-- confirms it (see markInvoicePaidFromStripe in routes/payments.js). Both are
+-- NULL for invoices paid any other way (cash/check/etc.), since there's no
+-- processing cost for those.
+--
+-- stripe_processing_fee: Stripe's own cut for processing the charge (varies
+-- by payment method -- card vs. ACH bank transfer -- so this can't just be
+-- calculated from a fixed rate; it's pulled from the real balance transaction
+-- Stripe recorded for that charge).
+--
+-- platform_fee: Coll Timeclock's own 0.5% cut (see PLATFORM_FEE_RATE in
+-- routes/payments.js). This is fully deterministic from the invoice total,
+-- but it's stored here too rather than recalculated later, so a rate change
+-- down the road doesn't silently rewrite the historical number for past
+-- invoices.
+--
+-- Together, these are money that came in as part of the invoice total but
+-- never actually reached the company's own bank account -- Stripe splits
+-- both off automatically before the deposit. Reports subtract them from
+-- Gross/Net Profit so those numbers reflect what the business actually kept.
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS stripe_processing_fee DECIMAL(10,2);
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS platform_fee DECIMAL(10,2);

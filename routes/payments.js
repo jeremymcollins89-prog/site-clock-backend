@@ -192,16 +192,47 @@ async function markInvoicePaidFromStripe(session) {
   if (result.rowCount === 0) return;
   const invoice = result.rows[0];
 
+  const detail = await db.query(
+    `SELECT c.name AS customer_name, c.email AS customer_email, co.name AS company_name, co.stripe_account_id
+     FROM invoices i
+     JOIN customers c ON c.id = i.customer_id
+     JOIN companies co ON co.id = i.company_id
+     WHERE i.id = $1`,
+    [invoiceId]
+  );
+  const row = detail.rows[0];
+
+  // Records what this payment actually cost to accept -- Stripe's own
+  // processing fee (varies by payment method, so it can't just be
+  // calculated) plus our platform cut -- so Reports can show real profit
+  // instead of pretending the full invoice total landed in the bank. Best
+  // effort: this is a nice-to-have on top of the payment itself already
+  // being recorded above, so a hiccup fetching it (or an older invoice with
+  // no connected account on file) shouldn't be treated as the payment
+  // failing.
+  if (session.payment_intent && row && row.stripe_account_id) {
+    try {
+      const pi = await stripe.paymentIntents.retrieve(
+        session.payment_intent,
+        { expand: ["latest_charge.balance_transaction"] },
+        { stripeAccount: row.stripe_account_id }
+      );
+      const charge = pi.latest_charge;
+      const balanceTxn = charge && charge.balance_transaction;
+      if (balanceTxn) {
+        const stripeFee = balanceTxn.fee / 100;
+        const platformFee = (charge.application_fee_amount || 0) / 100;
+        await db.query(
+          `UPDATE invoices SET stripe_processing_fee = $1, platform_fee = $2 WHERE id = $3`,
+          [stripeFee, platformFee, invoiceId]
+        );
+      }
+    } catch (err) {
+      console.error(`Failed to record processing fee for invoice ${invoiceId}:`, err.message);
+    }
+  }
+
   try {
-    const detail = await db.query(
-      `SELECT c.name AS customer_name, c.email AS customer_email, co.name AS company_name
-       FROM invoices i
-       JOIN customers c ON c.id = i.customer_id
-       JOIN companies co ON co.id = i.company_id
-       WHERE i.id = $1`,
-      [invoiceId]
-    );
-    const row = detail.rows[0];
     if (row && row.customer_email) {
       await sendPaymentReceiptEmail({ to: row.customer_email, companyName: row.company_name, invoice });
     }

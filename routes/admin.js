@@ -174,6 +174,34 @@ router.patch("/payroll-email", async (req, res) => {
   res.json(result.rows[0]);
 });
 
+// GET /api/admin/long-shift-alert
+// How many hours a shift can run before the admin gets pushed a "still
+// clocked in" notification (see the cron job in server.js). Null means the
+// alert is off. Defaults to 10 for every company.
+router.get("/long-shift-alert", async (req, res) => {
+  const result = await db.query(`SELECT long_shift_alert_hours FROM companies WHERE id = $1`, [req.companyId]);
+  if (result.rowCount === 0) return res.status(404).json({ error: "Company not found" });
+  res.json(result.rows[0]);
+});
+
+// PATCH /api/admin/long-shift-alert
+// Body: { long_shift_alert_hours } -- an integer 1-24, or null to turn the
+// alert off.
+router.patch("/long-shift-alert", async (req, res) => {
+  const { long_shift_alert_hours } = req.body;
+  if (long_shift_alert_hours !== null && long_shift_alert_hours !== undefined) {
+    const hours = Number(long_shift_alert_hours);
+    if (!Number.isInteger(hours) || hours < 1 || hours > 24) {
+      return res.status(400).json({ error: "long_shift_alert_hours must be an integer between 1 and 24, or null" });
+    }
+  }
+  const result = await db.query(
+    `UPDATE companies SET long_shift_alert_hours = $1 WHERE id = $2 RETURNING long_shift_alert_hours`,
+    [long_shift_alert_hours === undefined ? null : long_shift_alert_hours, req.companyId]
+  );
+  res.json(result.rows[0]);
+});
+
 // GET /api/admin/company-name
 // The business name shown on invoice/quote PDFs, in the "From" display name
 // of customer-facing emails (see utils/mailer.js's customerFacingFrom), and
@@ -328,10 +356,11 @@ router.patch("/pay-schedule", async (req, res) => {
 });
 
 const CLOCK_IN_ANIMATIONS = ["none", "fireworks", "birthday", "rocket"];
+const BREAK_MINUTES_OPTIONS = [30, 60];
 
 router.get("/employees", async (req, res) => {
   const result = await db.query(
-    `SELECT id, name, email, active, created_at, clock_in_animation, hourly_rate, phone, street, city, state, zip
+    `SELECT id, name, email, active, created_at, clock_in_animation, hourly_rate, phone, street, city, state, zip, break_minutes
      FROM employees WHERE company_id = $1 ORDER BY name`,
     [req.companyId]
   );
@@ -339,19 +368,22 @@ router.get("/employees", async (req, res) => {
 });
 
 router.post("/employees", async (req, res) => {
-  const { name, email, pin, clock_in_animation, hourly_rate } = req.body;
+  const { name, email, pin, clock_in_animation, hourly_rate, break_minutes } = req.body;
   if (!name || !email || !pin) {
     return res.status(400).json({ error: "name, email, and pin are required" });
   }
   if (clock_in_animation !== undefined && !CLOCK_IN_ANIMATIONS.includes(clock_in_animation)) {
     return res.status(400).json({ error: "Invalid clock_in_animation" });
   }
+  if (break_minutes !== undefined && !BREAK_MINUTES_OPTIONS.includes(Number(break_minutes))) {
+    return res.status(400).json({ error: "break_minutes must be 30 or 60" });
+  }
   const pin_hash = await hashPin(pin);
   try {
     const result = await db.query(
-      `INSERT INTO employees (name, email, pin_hash, company_id, clock_in_animation, hourly_rate) VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, name, email, active, created_at, clock_in_animation, hourly_rate`,
-      [name, email, pin_hash, req.companyId, clock_in_animation || "none", hourly_rate || null]
+      `INSERT INTO employees (name, email, pin_hash, company_id, clock_in_animation, hourly_rate, break_minutes) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, name, email, active, created_at, clock_in_animation, hourly_rate, break_minutes`,
+      [name, email, pin_hash, req.companyId, clock_in_animation || "none", hourly_rate || null, break_minutes || 30]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -364,13 +396,16 @@ router.post("/employees", async (req, res) => {
 
 router.patch("/employees/:id", async (req, res) => {
   const { id } = req.params;
-  const { name, email, active, pin, clock_in_animation, hourly_rate, phone, street, city, state, zip } = req.body;
+  const { name, email, active, pin, clock_in_animation, hourly_rate, phone, street, city, state, zip, break_minutes } = req.body;
 
   if (clock_in_animation !== undefined && !CLOCK_IN_ANIMATIONS.includes(clock_in_animation)) {
     return res.status(400).json({ error: "Invalid clock_in_animation" });
   }
   if (hourly_rate !== undefined && hourly_rate !== null && (isNaN(Number(hourly_rate)) || Number(hourly_rate) < 0)) {
     return res.status(400).json({ error: "hourly_rate must be a non-negative number" });
+  }
+  if (break_minutes !== undefined && !BREAK_MINUTES_OPTIONS.includes(Number(break_minutes))) {
+    return res.status(400).json({ error: "break_minutes must be 30 or 60" });
   }
 
   const fields = [];
@@ -386,6 +421,7 @@ router.patch("/employees/:id", async (req, res) => {
   if (city !== undefined) { values.push(city || null); fields.push(`city = $${values.length}`); }
   if (state !== undefined) { values.push(state || null); fields.push(`state = $${values.length}`); }
   if (zip !== undefined) { values.push(zip || null); fields.push(`zip = $${values.length}`); }
+  if (break_minutes !== undefined) { values.push(Number(break_minutes)); fields.push(`break_minutes = $${values.length}`); }
 
   if (fields.length === 0) return res.status(400).json({ error: "Nothing to update" });
 
@@ -393,7 +429,7 @@ router.patch("/employees/:id", async (req, res) => {
   try {
     const result = await db.query(
       `UPDATE employees SET ${fields.join(", ")} WHERE id = $${values.length - 1} AND company_id = $${values.length}
-       RETURNING id, name, email, active, created_at, clock_in_animation, hourly_rate, phone, street, city, state, zip`,
+       RETURNING id, name, email, active, created_at, clock_in_animation, hourly_rate, phone, street, city, state, zip, break_minutes`,
       values
     );
     if (result.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
@@ -465,7 +501,7 @@ router.patch("/time-entries/:id", async (req, res) => {
 
 router.get("/overview", async (req, res) => {
   const companyResult = await db.query(
-    `SELECT pay_frequency, pay_period_anchor, pay_period_custom_days FROM companies WHERE id = $1`,
+    `SELECT pay_frequency, pay_period_anchor, pay_period_custom_days, long_shift_alert_hours FROM companies WHERE id = $1`,
     [req.companyId]
   );
   const period = getPayPeriod(new Date(), companyResult.rows[0] || {});
@@ -489,7 +525,11 @@ router.get("/overview", async (req, res) => {
      ORDER BY e.active DESC, e.name`,
     [req.companyId, period.start, period.end]
   );
-  res.json({ period, employees: result.rows });
+  res.json({
+    period,
+    employees: result.rows,
+    long_shift_alert_hours: companyResult.rows[0] ? companyResult.rows[0].long_shift_alert_hours : 10,
+  });
 });
 
 router.post("/employees/:id/request-ping", async (req, res) => {
@@ -2152,6 +2192,22 @@ router.get("/reports/summary", async (req, res) => {
       [req.companyId, start, end]
     );
 
+    // What Stripe (processing) and the platform (0.5% cut) actually took out
+    // of online payments collected in this range -- money that was part of
+    // the invoice total but never reached this company's own bank account.
+    // Same paid_at-based range as paidResult above, so it lines up with
+    // paid_invoice_total. Only invoices paid through Stripe have anything
+    // here (the columns are NULL for cash/check/etc.), which COALESCE(...,0)
+    // on each column (not just the sum) handles correctly.
+    const feeResult = await db.query(
+      `SELECT COALESCE(SUM(COALESCE(stripe_processing_fee, 0)), 0) AS stripe_fee_total,
+              COALESCE(SUM(COALESCE(platform_fee, 0)), 0) AS platform_fee_total
+       FROM invoices
+       WHERE company_id = $1 AND status = 'paid'
+         AND paid_at >= $2::date AND paid_at < ($3::date + INTERVAL '1 day')`,
+      [req.companyId, start, end]
+    );
+
     res.json({
       labor_hours: Number(laborResult.rows[0].total_seconds) / 3600,
       invoice_total: Number(invoicedResult.rows[0].sum_total),
@@ -2161,6 +2217,8 @@ router.get("/reports/summary", async (req, res) => {
       labor_cost: Number(laborCostResult.rows[0].total_cost),
       expense_total: Number(expenseResult.rows[0].sum_total),
       expense_count: Number(expenseResult.rows[0].cnt),
+      stripe_fee_total: Number(feeResult.rows[0].stripe_fee_total),
+      platform_fee_total: Number(feeResult.rows[0].platform_fee_total),
     });
   } catch (err) {
     console.error("GET /admin/reports/summary failed:", err);
