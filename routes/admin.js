@@ -226,13 +226,14 @@ router.patch("/company-name", async (req, res) => {
 });
 
 // GET /api/admin/shop-location
-// Returns this company's shop coordinates and auto clock-out cutoff time,
-// used by the employee app for geo-based auto clock-in/out. shop_lat/shop_lng
-// are null until the admin sets them here; auto_clockout_time defaults to
-// 4:30pm until changed.
+// Returns this company's shop coordinates and auto clock-in/out cutoff
+// times, used by the employee app for geo-based auto clock-in/out.
+// shop_lat/shop_lng are null until the admin sets them here;
+// auto_clockout_time defaults to 4:30pm and auto_clockin_time defaults to
+// midnight (i.e. no earliest-time restriction) until changed.
 router.get("/shop-location", async (req, res) => {
   const result = await db.query(
-    `SELECT shop_lat, shop_lng, shop_radius_m, auto_clockout_time FROM companies WHERE id = $1`,
+    `SELECT shop_lat, shop_lng, shop_radius_m, auto_clockout_time, auto_clockin_time FROM companies WHERE id = $1`,
     [req.companyId]
   );
   if (result.rowCount === 0) return res.status(404).json({ error: "Company not found" });
@@ -240,10 +241,14 @@ router.get("/shop-location", async (req, res) => {
 });
 
 // PATCH /api/admin/shop-location
-// Body: { shop_lat, shop_lng, shop_radius_m, auto_clockout_time }
-// auto_clockout_time is optional and expected as "HH:MM" (24-hour).
+// Body: { shop_lat, shop_lng, shop_radius_m, auto_clockout_time, auto_clockin_time }
+// auto_clockout_time/auto_clockin_time are optional and expected as
+// "HH:MM" (24-hour). auto_clockin_time is the earliest time of day auto
+// clock-in is allowed to fire on arrival -- someone showing up before that
+// (e.g. well before their shift starts) won't get auto clocked in until it
+// passes, same idea as the existing auto clock-out cutoff.
 router.patch("/shop-location", async (req, res) => {
-  const { shop_lat, shop_lng, shop_radius_m, auto_clockout_time } = req.body;
+  const { shop_lat, shop_lng, shop_radius_m, auto_clockout_time, auto_clockin_time } = req.body;
   if (shop_lat == null || shop_lng == null) {
     return res.status(400).json({ error: "shop_lat and shop_lng are required" });
   }
@@ -256,6 +261,9 @@ router.patch("/shop-location", async (req, res) => {
   if (auto_clockout_time != null && !/^\d{1,2}:\d{2}(:\d{2})?$/.test(auto_clockout_time)) {
     return res.status(400).json({ error: "auto_clockout_time must be in HH:MM format" });
   }
+  if (auto_clockin_time != null && !/^\d{1,2}:\d{2}(:\d{2})?$/.test(auto_clockin_time)) {
+    return res.status(400).json({ error: "auto_clockin_time must be in HH:MM format" });
+  }
 
   const fields = ["shop_lat = $1", "shop_lng = $2", "shop_radius_m = $3"];
   const values = [lat, lng, radius];
@@ -263,11 +271,15 @@ router.patch("/shop-location", async (req, res) => {
     values.push(auto_clockout_time);
     fields.push(`auto_clockout_time = $${values.length}`);
   }
+  if (auto_clockin_time) {
+    values.push(auto_clockin_time);
+    fields.push(`auto_clockin_time = $${values.length}`);
+  }
   values.push(req.companyId);
 
   const result = await db.query(
     `UPDATE companies SET ${fields.join(", ")} WHERE id = $${values.length}
-     RETURNING shop_lat, shop_lng, shop_radius_m, auto_clockout_time`,
+     RETURNING shop_lat, shop_lng, shop_radius_m, auto_clockout_time, auto_clockin_time`,
     values
   );
   res.json(result.rows[0]);

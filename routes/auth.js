@@ -18,7 +18,7 @@ router.post("/login", async (req, res) => {
     }
 
     const result = await db.query(
-      `SELECT e.*, c.shop_lat, c.shop_lng, c.shop_radius_m, c.auto_clockout_time
+      `SELECT e.*, c.shop_lat, c.shop_lng, c.shop_radius_m, c.auto_clockout_time, c.auto_clockin_time
        FROM employees e
        LEFT JOIN companies c ON c.id = e.company_id
        WHERE e.email = $1 AND e.active = true`,
@@ -53,6 +53,7 @@ router.post("/login", async (req, res) => {
         shop_lng: employee.shop_lng,
         shop_radius_m: employee.shop_radius_m,
         auto_clockout_time: employee.auto_clockout_time,
+        auto_clockin_time: employee.auto_clockin_time,
         clock_in_animation: employee.clock_in_animation,
         break_minutes: employee.break_minutes,
       },
@@ -146,7 +147,7 @@ const requireAuth = require("../middleware/requireAuth");
 router.get("/me", requireAuth, async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT e.id, e.name, e.email, e.clock_in_animation, e.break_minutes, c.shop_lat, c.shop_lng, c.shop_radius_m, c.auto_clockout_time
+      `SELECT e.id, e.name, e.email, e.clock_in_animation, e.break_minutes, c.shop_lat, c.shop_lng, c.shop_radius_m, c.auto_clockout_time, c.auto_clockin_time
        FROM employees e
        LEFT JOIN companies c ON c.id = e.company_id
        WHERE e.id = $1`,
