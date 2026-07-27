@@ -109,11 +109,18 @@ router.post("/:id/clock-out", async (req, res) => {
 });
 
 // GET /api/time-entries?start=&end=
+// Only returns the open shift (if any) plus completed shifts that haven't
+// been submitted for payroll yet -- once submitHours() (POST
+// /api/timesheets/submit) marks a shift's submitted_at, it drops out of
+// this list entirely. The row still lives in the database for payroll and
+// admin reporting; this just keeps the employee's on-screen history from
+// re-showing hours they already turned in, without waiting for the pay
+// period itself to roll over.
 router.get("/", async (req, res) => {
   try {
     const employee_id = req.employee.employee_id;
     const { start, end } = req.query;
-    const conditions = [`employee_id = $1`];
+    const conditions = [`employee_id = $1`, `(clock_out IS NULL OR submitted_at IS NULL)`];
     const params = [employee_id];
 
     // Same fix as routes/admin.js's GET /time-entries: end is a plain
