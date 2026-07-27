@@ -2486,6 +2486,57 @@ router.patch("/catalog-items/:id", async (req, res) => {
   }
 });
 
+// POST /api/admin/catalog-items/import
+// Body: { items: [{ name, unit_price? }, ...] }
+// Bulk-imports catalog items from a spreadsheet (Excel or CSV, parsed
+// client-side into plain objects and sent here). Mirrors the customer
+// import route: rows missing a name are skipped, and rows whose name
+// case-insensitively matches an existing catalog item -- or an earlier row
+// in the same file -- are skipped as duplicates instead of creating a
+// second entry.
+router.post("/catalog-items/import", async (req, res) => {
+  try {
+    const { items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "No items to import." });
+    }
+    if (items.length > 2000) {
+      return res.status(400).json({ error: "That's more than 2000 rows at once -- please split the file up." });
+    }
+
+    const existing = await db.query(`SELECT name FROM catalog_items WHERE company_id = $1`, [req.companyId]);
+    const seenNames = new Set(existing.rows.map((r) => r.name.trim().toLowerCase()));
+
+    let imported = 0;
+    const skipped = [];
+
+    for (let i = 0; i < items.length; i++) {
+      const row = items[i] || {};
+      const name = (row.name || "").trim();
+      if (!name) {
+        skipped.push({ row: i + 1, reason: "missing_name" });
+        continue;
+      }
+      const key = name.toLowerCase();
+      if (seenNames.has(key)) {
+        skipped.push({ row: i + 1, reason: "duplicate", name });
+        continue;
+      }
+      seenNames.add(key);
+      await db.query(
+        `INSERT INTO catalog_items (company_id, name, unit_price) VALUES ($1, $2, $3)`,
+        [req.companyId, name, Number(row.unit_price) || 0]
+      );
+      imported++;
+    }
+
+    res.status(201).json({ imported, skipped });
+  } catch (err) {
+    console.error("POST /admin/catalog-items/import failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't import catalog items." });
+  }
+});
+
 // DELETE /api/admin/catalog-items/:id
 router.delete("/catalog-items/:id", async (req, res) => {
   try {
