@@ -13,7 +13,8 @@ const { getPayPeriod, PAY_FREQUENCIES } = require("../utils/payPeriod");
 const { JOB_COLORS } = require("../utils/jobColors");
 const { sendPushToEmployee } = require("../utils/webPush");
 
-const EVENT_TYPES = ["job", "personal", "other"];
+const EVENT_TYPES = ["job", "personal", "other", "time_off"];
+const TIME_OFF_STATUSES = ["approved", "denied"];
 const QUOTE_STATUSES = ["draft", "sent", "accepted", "declined"];
 const PAYMENT_TERMS = ["due_on_receipt", "net_15", "net_30", "net_60", "net_90"];
 const PAYMENT_TERMS_DAYS = { due_on_receipt: 0, net_15: 15, net_30: 30, net_60: 60, net_90: 90 };
@@ -1098,6 +1099,111 @@ router.delete("/jobs/:id", async (req, res) => {
   } catch (err) {
     console.error("DELETE /admin/jobs/:id failed:", err);
     res.status(500).json({ error: err.message || "Couldn't delete event." });
+  }
+});
+
+// ---------- Time off requests ----------
+// An employee submits a date range (a day, a week, whatever) with an
+// optional note from the Schedule tab in their own app. It sits 'pending'
+// until an admin approves or denies it here. Approving inserts a matching
+// row into `jobs` (event_type 'time_off', bright yellow) so it shows up on
+// the shared calendar exactly like any other event, and pushes the
+// employee a notification either way. See routes/schedule.js for the
+// employee-facing create/list/cancel endpoints.
+
+// GET /api/admin/time-off-requests?status=pending
+// Defaults to every request (any status), newest first, so the Schedule
+// tab can show both a "needs review" list and a history. Pass ?status= to
+// narrow it (the pending-requests badge count just checks the length of
+// that filtered call rather than a separate endpoint).
+router.get("/time-off-requests", async (req, res) => {
+  try {
+    const { status } = req.query;
+    const conditions = [`t.company_id = $1`];
+    const params = [req.companyId];
+    if (status) {
+      params.push(status);
+      conditions.push(`t.status = $${params.length}`);
+    }
+    const result = await db.query(
+      `SELECT t.id, t.employee_id, e.name AS employee_name, t.start_date, t.end_date, t.note,
+              t.status, t.job_id, t.reviewed_at, t.created_at
+       FROM time_off_requests t
+       JOIN employees e ON e.id = t.employee_id
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY t.created_at DESC`,
+      params
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/time-off-requests failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load time off requests." });
+  }
+});
+
+// PATCH /api/admin/time-off-requests/:id
+// Body: { status: "approved" | "denied" }. Only a still-'pending' request
+// can be reviewed -- once decided, it's final (the employee would submit a
+// fresh request rather than an admin flipping a decision back and forth).
+router.patch("/time-off-requests/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    if (!TIME_OFF_STATUSES.includes(status)) {
+      return res.status(400).json({ error: `status must be one of: ${TIME_OFF_STATUSES.join(", ")}` });
+    }
+
+    const owns = await db.query(
+      `SELECT t.*, e.name AS employee_name FROM time_off_requests t
+       JOIN employees e ON e.id = t.employee_id
+       WHERE t.id = $1 AND t.company_id = $2`,
+      [id, req.companyId]
+    );
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Request not found" });
+    const request = owns.rows[0];
+    if (request.status !== "pending") {
+      return res.status(400).json({ error: "This request has already been reviewed." });
+    }
+
+    const dateRange =
+      request.start_date === request.end_date
+        ? request.start_date
+        : `${request.start_date} to ${request.end_date}`;
+
+    let jobId = null;
+    if (status === "approved") {
+      const jobResult = await db.query(
+        `INSERT INTO jobs (company_id, title, notes, start_date, end_date, color, event_type)
+         VALUES ($1, $2, $3, $4, $5, 'yellow', 'time_off')
+         RETURNING id`,
+        [req.companyId, `Time off — ${request.employee_name}`, request.note || null, request.start_date, request.end_date]
+      );
+      jobId = jobResult.rows[0].id;
+      await db.query(
+        `INSERT INTO job_assignments (job_id, employee_id) VALUES ($1, $2)`,
+        [jobId, request.employee_id]
+      );
+    }
+
+    const updated = await db.query(
+      `UPDATE time_off_requests SET status = $1, job_id = $2, reviewed_at = now() WHERE id = $3
+       RETURNING id, employee_id, start_date, end_date, note, status, job_id, reviewed_at, created_at`,
+      [status, jobId, id]
+    );
+
+    sendPushToEmployee(request.employee_id, {
+      title: status === "approved" ? "Time off approved" : "Time off request denied",
+      body:
+        status === "approved"
+          ? `Your time off for ${dateRange} was approved.`
+          : `Your time off request for ${dateRange} was denied.`,
+      url: "/schedule",
+    }).catch((err) => console.error("Failed to send time-off decision notification:", err.message));
+
+    res.json(updated.rows[0]);
+  } catch (err) {
+    console.error("PATCH /admin/time-off-requests/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't update time off request." });
   }
 });
 

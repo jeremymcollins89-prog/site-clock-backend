@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const requireAuth = require("../middleware/requireAuth");
+const { sendPushToAdmin } = require("../utils/webPush");
 
 // GET /api/schedule/me?start=YYYY-MM-DD&end=YYYY-MM-DD
 // Returns every job for the logged-in employee's company (not just ones
@@ -86,6 +87,94 @@ router.get("/customers", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("GET /schedule/customers failed:", err);
     res.status(500).json({ error: err.message || "Couldn't load customers." });
+  }
+});
+
+// ---------- Time off requests ----------
+// An employee proposes a date range (a single day, a week, whatever) with
+// an optional note explaining why, and it sits 'pending' until the admin
+// approves or denies it (see PATCH /api/admin/time-off-requests/:id). Only
+// once approved does it become a real calendar event -- these routes never
+// touch `jobs` themselves.
+
+// POST /api/schedule/time-off
+// Body: { start_date, end_date, note? }
+router.post("/time-off", requireAuth, async (req, res) => {
+  try {
+    const { start_date, end_date, note } = req.body;
+    if (!start_date || !end_date) {
+      return res.status(400).json({ error: "start_date and end_date are required" });
+    }
+    if (end_date < start_date) {
+      return res.status(400).json({ error: "end_date can't be before start_date" });
+    }
+
+    const employeeResult = await db.query(
+      `SELECT company_id, name FROM employees WHERE id = $1`,
+      [req.employee.employee_id]
+    );
+    if (employeeResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    const { company_id: companyId, name: employeeName } = employeeResult.rows[0];
+
+    const result = await db.query(
+      `INSERT INTO time_off_requests (company_id, employee_id, start_date, end_date, note)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, employee_id, start_date, end_date, note, status, job_id, reviewed_at, created_at`,
+      [companyId, req.employee.employee_id, start_date, end_date, note || null]
+    );
+
+    const dateRange = start_date === end_date ? start_date : `${start_date} to ${end_date}`;
+    sendPushToAdmin(companyId, {
+      title: "New time off request",
+      body: `${employeeName} requested ${dateRange}${note ? ` — "${note}"` : ""}`,
+      url: "/admin.html?tab=schedule",
+    }).catch((err) => console.error("Failed to send time-off request notification:", err.message));
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("POST /schedule/time-off failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't submit time off request." });
+  }
+});
+
+// GET /api/schedule/time-off
+// Every request this employee has ever submitted, newest first, so they
+// can see what's pending/approved/denied without asking the admin.
+router.get("/time-off", requireAuth, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, start_date, end_date, note, status, job_id, reviewed_at, created_at
+       FROM time_off_requests
+       WHERE employee_id = $1
+       ORDER BY created_at DESC`,
+      [req.employee.employee_id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /schedule/time-off failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load time off requests." });
+  }
+});
+
+// DELETE /api/schedule/time-off/:id
+// Lets an employee withdraw their own request, but only while it's still
+// 'pending' -- once an admin has approved or denied it, it's final.
+router.delete("/time-off/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(
+      `UPDATE time_off_requests SET status = 'cancelled'
+       WHERE id = $1 AND employee_id = $2 AND status = 'pending'
+       RETURNING id`,
+      [id, req.employee.employee_id]
+    );
+    if (result.rowCount === 0) {
+      return res.status(400).json({ error: "Request not found, or it's already been reviewed." });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /schedule/time-off/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't cancel request." });
   }
 });
 

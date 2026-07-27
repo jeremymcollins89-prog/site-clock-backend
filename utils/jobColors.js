@@ -9,6 +9,10 @@ const JOB_COLORS = {
   purple: "#9B30FF",
   rose: "#FF2D95",
   charcoal: "#707B85",
+  // Bright yellow -- system-assigned for approved time-off events (see
+  // schema-time-off.sql), but also selectable manually like any other
+  // color since nothing stops an admin from picking it themselves.
+  yellow: "#FFE400",
 };
 
 module.exports = { JOB_COLORS };
