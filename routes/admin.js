@@ -2319,6 +2319,95 @@ router.get("/reports/labor-breakdown", async (req, res) => {
   }
 });
 
+// GET /api/admin/reports/monthly-profit?months=6
+// Gross AND Net Profit for each of the trailing N calendar months (default
+// 6, current month included), for the bar chart under the Reports tab's
+// stat cards. Uses the exact same definition as computeProfits() on the
+// frontend (paid revenue minus labor cost minus Stripe/platform fees, then
+// minus logged expenses for Net) so the chart always agrees with the stat
+// cards above it. Grouped with date_trunc('month', ...) against a single
+// cutoff date rather than EXTRACT(MONTH) -- that would incorrectly merge
+// e.g. January of two different years when the trailing window crosses a
+// year boundary, which a plain month-number match can't tell apart.
+router.get("/reports/monthly-profit", async (req, res) => {
+  try {
+    const months = Math.min(Math.max(parseInt(req.query.months, 10) || 6, 1), 24);
+
+    const now = new Date();
+    const rangeStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - (months - 1), 1));
+
+    const [paidResult, laborCostResult, feeResult, expenseResult] = await Promise.all([
+      db.query(
+        `SELECT date_trunc('month', paid_at) AS month, COALESCE(SUM(total), 0) AS paid_total
+         FROM invoices
+         WHERE company_id = $1 AND status = 'paid' AND paid_at >= $2
+         GROUP BY 1`,
+        [req.companyId, rangeStart]
+      ),
+      db.query(
+        `SELECT date_trunc('month', d.clock_in) AS month,
+                COALESCE(SUM((d.worked_seconds / 3600.0) * COALESCE(e.hourly_rate, 0)), 0) AS labor_cost
+         FROM time_entry_durations d
+         JOIN employees e ON e.id = d.employee_id
+         WHERE e.company_id = $1 AND d.clock_in >= $2
+         GROUP BY 1`,
+        [req.companyId, rangeStart]
+      ),
+      db.query(
+        `SELECT date_trunc('month', paid_at) AS month,
+                COALESCE(SUM(COALESCE(stripe_processing_fee, 0)), 0) AS stripe_fee_total,
+                COALESCE(SUM(COALESCE(platform_fee, 0)), 0) AS platform_fee_total
+         FROM invoices
+         WHERE company_id = $1 AND status = 'paid' AND paid_at >= $2
+         GROUP BY 1`,
+        [req.companyId, rangeStart]
+      ),
+      db.query(
+        `SELECT date_trunc('month', expense_date) AS month, COALESCE(SUM(amount), 0) AS expense_total
+         FROM expenses
+         WHERE company_id = $1 AND expense_date >= $2
+         GROUP BY 1`,
+        [req.companyId, rangeStart]
+      ),
+    ]);
+
+    const keyOf = (d) => {
+      const dt = new Date(d);
+      return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}`;
+    };
+    const paidByMonth = {}, laborByMonth = {}, feeByMonth = {}, expenseByMonth = {};
+    paidResult.rows.forEach((r) => { paidByMonth[keyOf(r.month)] = Number(r.paid_total); });
+    laborCostResult.rows.forEach((r) => { laborByMonth[keyOf(r.month)] = Number(r.labor_cost); });
+    feeResult.rows.forEach((r) => {
+      feeByMonth[keyOf(r.month)] = Number(r.stripe_fee_total) + Number(r.platform_fee_total);
+    });
+    expenseResult.rows.forEach((r) => { expenseByMonth[keyOf(r.month)] = Number(r.expense_total); });
+
+    const result = [];
+    for (let i = months - 1; i >= 0; i--) {
+      const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+      const paidTotal = paidByMonth[key] || 0;
+      const laborCost = laborByMonth[key] || 0;
+      const feesTotal = feeByMonth[key] || 0;
+      const expenseTotal = expenseByMonth[key] || 0;
+      const grossProfit = paidTotal - laborCost - feesTotal;
+      const netProfit = grossProfit - expenseTotal;
+      result.push({
+        month: key,
+        label: d.toLocaleString("en-US", { month: "short", timeZone: "UTC" }),
+        gross_profit: grossProfit,
+        net_profit: netProfit,
+      });
+    }
+
+    res.json({ months: result });
+  } catch (err) {
+    console.error("GET /admin/reports/monthly-profit failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load monthly profit." });
+  }
+});
+
 // ---------- Expenses ----------
 // Simple manually-logged business costs (materials, insurance, rent, etc.)
 // that feed into Net Profit on the Reports tab. Deliberately minimal --
