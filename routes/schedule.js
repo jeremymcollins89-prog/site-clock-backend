@@ -243,4 +243,58 @@ router.get("/routing/today", requireAuth, async (req, res) => {
   }
 });
 
+// GET /api/schedule/jobs/:jobId/attachments
+// Read-only: lets an employee see (and download) whatever files an admin
+// attached to a job -- reference photos, work orders, contracts -- without
+// giving them any ability to add or remove attachments themselves (that
+// stays admin-only, see routes/attachments.js). Scoped to the employee's
+// own company, matching the same "see every job company-wide" visibility
+// model as GET /me above, not just jobs they're personally assigned to.
+router.get("/jobs/:jobId/attachments", requireAuth, async (req, res) => {
+  try {
+    const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
+    if (employeeResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    const companyId = employeeResult.rows[0].company_id;
+
+    const jobOwns = await db.query(`SELECT id FROM jobs WHERE id = $1 AND company_id = $2`, [req.params.jobId, companyId]);
+    if (jobOwns.rowCount === 0) return res.status(404).json({ error: "Job not found" });
+
+    const result = await db.query(
+      `SELECT id, file_name, mime_type, file_size, created_at
+       FROM attachments
+       WHERE company_id = $1 AND entity_type = 'job' AND entity_id = $2
+       ORDER BY created_at ASC`,
+      [companyId, req.params.jobId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /schedule/jobs/:jobId/attachments failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load attachments." });
+  }
+});
+
+// GET /api/schedule/attachments/:id
+// Returns the actual file bytes for an employee viewing/downloading a job
+// attachment (see above) -- same company-scoping check as the list route.
+router.get("/attachments/:id", requireAuth, async (req, res) => {
+  try {
+    const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
+    if (employeeResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    const companyId = employeeResult.rows[0].company_id;
+
+    const result = await db.query(
+      `SELECT file_name, mime_type, file_data FROM attachments WHERE id = $1 AND company_id = $2 AND entity_type = 'job'`,
+      [req.params.id, companyId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Attachment not found" });
+    const { file_name, mime_type, file_data } = result.rows[0];
+    res.setHeader("Content-Type", mime_type);
+    res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(file_name)}"`);
+    res.send(file_data);
+  } catch (err) {
+    console.error("GET /schedule/attachments/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load that file." });
+  }
+});
+
 module.exports = router;

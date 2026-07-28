@@ -42,6 +42,7 @@ const { router: paymentsRoutes, handleStripeWebhook, handleStripeConnectWebhook 
 const connectRoutes = require("./routes/connect");
 const platformRoutes = require("./routes/platform");
 const routingRoutes = require("./routes/routing");
+const attachmentsRoutes = require("./routes/attachments");
 const { checkAndSendReminders } = require("./utils/invoiceReminders");
 const { checkAndSendLongShiftAlerts } = require("./utils/longShiftAlerts");
 
@@ -82,9 +83,12 @@ app.post("/api/payments/webhook", express.raw({ type: "application/json" }), han
 app.post("/api/payments/connect-webhook", express.raw({ type: "application/json" }), handleStripeConnectWebhook);
 
 // Raised from the 100kb default so a base64-encoded company logo upload
-// (see PUT /api/admin/company-logo) doesn't get rejected before it even
-// reaches the route handler's own size validation.
-app.use(express.json({ limit: "6mb" }));
+// (see PUT /api/admin/company-logo) or a job/invoice attachment upload (see
+// routes/attachments.js, capped at 10MB per file pre-base64) doesn't get
+// rejected before it even reaches the route handler's own size validation.
+// Base64 inflates the original file size by ~1/3, so 10MB -> ~13.3MB; 15mb
+// leaves headroom for the rest of the JSON payload around it.
+app.use(express.json({ limit: "15mb" }));
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
@@ -108,6 +112,7 @@ app.use("/api/payments", paymentsRoutes);
 app.use("/api/connect", connectRoutes);
 app.use("/api/platform", platformRoutes);
 app.use("/api/admin/routing", routingRoutes);
+app.use("/api/admin/attachments", attachmentsRoutes);
 
 // Must come after all routes, before any other error-handling middleware.
 Sentry.setupExpressErrorHandler(app);
