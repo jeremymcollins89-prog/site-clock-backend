@@ -69,6 +69,7 @@ router.get("/candidates", async (req, res) => {
       job_id: row.job_id,
       title: row.title,
       start_time: row.start_time,
+      customer_id: row.customer_id,
       customer_name: row.customer_name,
       address_label: addressLabel(row),
       lat: row.lat,
@@ -79,6 +80,59 @@ router.get("/candidates", async (req, res) => {
   } catch (err) {
     console.error("GET /admin/routing/candidates failed:", err);
     res.status(500).json({ error: err.message || "Couldn't load candidate stops." });
+  }
+});
+
+// POST /api/admin/routing/geocode-candidates
+// Body: { customer_ids: [...] }
+// Retries geocoding for a specific, small set of customers -- namely the
+// ones an admin is looking at right now in the Build a Route candidate list
+// that came back "no address on file". This is intentionally scoped to
+// only the customer_ids passed in (never "every customer missing lat/lng"):
+// Nominatim's usage policy (see utils/geocode.js) is fine with occasional,
+// user-triggered single-address lookups but explicitly discourages bulk
+// geocoding of an entire customer list, and a day's route candidates are
+// naturally a handful of stops, not the whole database. Existing customers
+// created before this feature shipped are the main case this fixes -- they
+// have a real address on file, it just never got geocoded, and simply
+// re-saving them from the Customers tab doesn't help since PATCH only
+// re-geocodes when the address text itself changed.
+router.post("/geocode-candidates", async (req, res) => {
+  try {
+    const { customer_ids } = req.body;
+    if (!Array.isArray(customer_ids) || customer_ids.length === 0) {
+      return res.status(400).json({ error: "customer_ids is required" });
+    }
+    const { geocodeAddress } = require("../utils/geocode");
+    const result = await db.query(
+      `SELECT id, street, city, state, zip FROM customers WHERE company_id = $1 AND id = ANY($2::uuid[]) AND lat IS NULL`,
+      [req.companyId, customer_ids]
+    );
+
+    const outcomes = [];
+    // Sequential, not Promise.all -- utils/geocode.js already serializes
+    // requests to stay under Nominatim's 1/sec cap, but awaiting one at a
+    // time here keeps this loop's intent (and any errors) easy to follow.
+    for (const customer of result.rows) {
+      const geocoded = await geocodeAddress({
+        street: customer.street,
+        city: customer.city,
+        state: customer.state,
+        zip: customer.zip,
+      }).catch(() => null);
+      if (geocoded) {
+        await db.query(`UPDATE customers SET lat = $1, lng = $2, geocoded_at = now() WHERE id = $3`, [
+          geocoded.lat,
+          geocoded.lng,
+          customer.id,
+        ]);
+      }
+      outcomes.push({ customer_id: customer.id, geocoded: Boolean(geocoded) });
+    }
+    res.json({ results: outcomes });
+  } catch (err) {
+    console.error("POST /admin/routing/geocode-candidates failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't retry geocoding those addresses." });
   }
 });
 
