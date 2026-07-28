@@ -180,12 +180,17 @@ router.delete("/time-off/:id", requireAuth, async (req, res) => {
 });
 
 // GET /api/schedule/routing/today
-// Returns the optimized route assigned to the logged-in employee for
-// today, if any -- whether it was built for them directly or for a whole
-// crew they belong to (see routes/routing.js for how these get built).
-// Includes a maps_url: a free Google Maps multi-stop directions link
-// (no API key needed) pre-loaded with every stop in the optimized order,
-// for the "Start Route" button to hand off to the real Google Maps app.
+// Returns the employee's next upcoming optimized route -- today's if one
+// exists, otherwise the soonest one built ahead of time (e.g. an admin
+// building Thursday's route on Monday) -- whether it was built for them
+// directly or for a whole crew they belong to (see routes/routing.js for
+// how these get built). Deliberately NOT scoped to route_date = today only:
+// routes are commonly built a few days in advance, and this is the
+// "Assigned routes" screen an employee can check anytime, not a
+// day-of-only widget. Includes a maps_url: a free Google Maps multi-stop
+// directions link (no API key needed) pre-loaded with every stop in the
+// optimized order, for the "Start Route" button to hand off to the real
+// Google Maps app.
 router.get("/routing/today", requireAuth, async (req, res) => {
   try {
     const employeeResult = await db.query(
@@ -197,19 +202,20 @@ router.get("/routing/today", requireAuth, async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
 
     const routeResult = await db.query(
-      `SELECT r.id, r.crew_id
+      `SELECT r.id, r.crew_id, r.route_date
        FROM delivery_routes r
-       WHERE r.company_id = $1 AND r.route_date = $2 AND r.status = 'optimized'
+       WHERE r.company_id = $1 AND r.route_date >= $2 AND r.status = 'optimized'
          AND (
            r.employee_id = $3
            OR r.crew_id IN (SELECT crew_id FROM crew_members WHERE employee_id = $3)
          )
-       ORDER BY r.optimized_at DESC
+       ORDER BY r.route_date ASC, r.optimized_at DESC
        LIMIT 1`,
       [companyId, today, req.employee.employee_id]
     );
     if (routeResult.rowCount === 0) return res.json(null);
     const routeId = routeResult.rows[0].id;
+    const routeDate = routeResult.rows[0].route_date;
 
     const stopsResult = await db.query(
       `SELECT rs.id, rs.sequence, rs.lat, rs.lng, rs.address_label, j.title, j.start_time
@@ -230,7 +236,7 @@ router.get("/routing/today", requireAuth, async (req, res) => {
       ? buildGoogleMapsUrl(shopLocation, stopsResult.rows, shopLocation)
       : null;
 
-    res.json({ id: routeId, stops: stopsResult.rows, maps_url: mapsUrl, shop_location: shopLocation });
+    res.json({ id: routeId, route_date: routeDate, stops: stopsResult.rows, maps_url: mapsUrl, shop_location: shopLocation });
   } catch (err) {
     console.error("GET /schedule/routing/today failed:", err);
     res.status(500).json({ error: err.message || "Couldn't load today's route." });

@@ -253,10 +253,36 @@ async function notifyRouteEmployees(route) {
     const url = route.maps_url || "/";
 
     await Promise.all(employeeIds.map((employeeId) => sendPushToEmployee(employeeId, { title, body, url })));
+    return employeeIds.length;
   } catch (err) {
     console.error("notifyRouteEmployees failed:", err.message);
+    return 0;
   }
 }
+
+// POST /api/admin/routing/:id/send
+// Explicit, admin-triggered resend of the "route ready" push notification --
+// on top of the automatic one that already fires the moment a route is
+// built (see notifyRouteEmployees call in POST / below). Useful for routes
+// built a day or more in advance, where the admin wants to deliberately
+// ping the employee/crew closer to when it matters, or just wants
+// visible confirmation it went out. Returns how many employees were
+// notified so the UI can show a real confirmation instead of a blind
+// "sent!" message.
+router.post("/:id/send", async (req, res) => {
+  try {
+    const route = await loadRouteDetail(req.params.id, req.companyId);
+    if (!route) return res.status(404).json({ error: "Route not found" });
+    if (!route.stops || route.stops.length === 0) {
+      return res.status(400).json({ error: "This route has no stops to send." });
+    }
+    const notified = await notifyRouteEmployees(route);
+    res.json({ ok: true, notified });
+  } catch (err) {
+    console.error("POST /admin/routing/:id/send failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't send route." });
+  }
+});
 
 // POST /api/admin/routing
 // Body: { date, employee_id? | crew_id?, job_ids: [...] }
