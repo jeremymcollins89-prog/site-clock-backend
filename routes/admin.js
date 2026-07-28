@@ -1410,7 +1410,7 @@ async function sendInvoiceNow(invoiceId, companyId) {
 router.get("/invoices", async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT i.id, i.invoice_number, i.status, i.payment_terms, i.payment_method,
+      `SELECT i.id, i.invoice_number, i.status, i.payment_terms, i.payment_method, i.check_number,
               i.issue_date, i.due_date, i.subtotal, i.tax_rate, i.tax_amount, i.total,
               i.sent_at, i.paid_at, i.created_at, i.reminder_count, i.last_reminder_sent_at,
               i.customer_id, c.name AS customer_name,
@@ -1750,14 +1750,17 @@ router.post("/invoices/:id/send", async (req, res) => {
 });
 
 // PATCH /api/admin/invoices/:id/mark-paid
-// Body: { payment_method } -- one of card/check/cash/other. Doesn't process
-// any payment itself; this just records how payment came in (a check that
-// arrived in the mail, a card run through a separate terminal, cash, etc.)
-// so the invoice's status reflects reality.
+// Body: { payment_method, check_number? } -- payment_method is one of
+// card/check/cash/other. Doesn't process any payment itself; this just
+// records how payment came in (a check that arrived in the mail, a card run
+// through a separate terminal, cash, etc.) so the invoice's status reflects
+// reality. check_number is optional and only kept when payment_method is
+// "check" -- lets an admin note which check paid an invoice for later
+// reference/reconciliation against a bank statement.
 router.patch("/invoices/:id/mark-paid", async (req, res) => {
   try {
     const { id } = req.params;
-    const { payment_method } = req.body;
+    const { payment_method, check_number } = req.body;
     if (!PAYMENT_METHODS.includes(payment_method)) {
       return res.status(400).json({ error: `payment_method must be one of: ${PAYMENT_METHODS.join(", ")}` });
     }
@@ -1765,9 +1768,11 @@ router.patch("/invoices/:id/mark-paid", async (req, res) => {
     if (owns.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
     if (owns.rows[0].status === "void") return res.status(400).json({ error: "Can't mark a voided invoice as paid." });
 
+    const checkNumberValue = payment_method === "check" && check_number ? String(check_number).trim().slice(0, 50) || null : null;
+
     const result = await db.query(
-      `UPDATE invoices SET status = 'paid', payment_method = $1, paid_at = now() WHERE id = $2 RETURNING *`,
-      [payment_method, id]
+      `UPDATE invoices SET status = 'paid', payment_method = $1, check_number = $2, paid_at = now() WHERE id = $3 RETURNING *`,
+      [payment_method, checkNumberValue, id]
     );
     res.json(result.rows[0]);
   } catch (err) {

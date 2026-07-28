@@ -297,4 +297,25 @@ router.get("/attachments/:id", requireAuth, async (req, res) => {
   }
 });
 
+// GET /api/schedule/company-logo
+// Read-only, employee-facing mirror of GET /api/admin/company-logo -- lets
+// the Employee PWA show the same logo in its header that already appears in
+// both admin apps, without needing an admin token. Returns { logo: null } if
+// the company hasn't uploaded one.
+router.get("/company-logo", requireAuth, async (req, res) => {
+  try {
+    const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
+    if (employeeResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    const companyId = employeeResult.rows[0].company_id;
+
+    const result = await db.query(`SELECT logo_data, logo_mime_type FROM companies WHERE id = $1`, [companyId]);
+    const row = result.rows[0];
+    if (!row || !row.logo_data) return res.json({ logo: null });
+    res.json({ logo: `data:${row.logo_mime_type};base64,${row.logo_data.toString("base64")}` });
+  } catch (err) {
+    console.error("GET /schedule/company-logo failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load logo." });
+  }
+});
+
 module.exports = router;
