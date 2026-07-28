@@ -112,6 +112,19 @@ async function geocodeAddress(addressFields) {
   return null;
 }
 
+// Rough distance in miles between two lat/lng points -- plenty accurate for
+// ranking nearby-vs-far suggestions against each other, not for anything
+// that needs to be precise.
+function roughMiles(lat1, lng1, lat2, lng2) {
+  const R = 3958.8;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
 // Powers the predictive-text address dropdown on the Add/Edit Customer
 // form: returns up to 5 candidate addresses (with lat/lng already attached)
 // for a partial, in-progress query. Same free Nominatim endpoint and the
@@ -122,7 +135,18 @@ async function geocodeAddress(addressFields) {
 // together. Returns [] (never throws) on a too-short query or any failure,
 // since a broken suggestion dropdown should never block typing an address
 // in by hand.
-async function suggestAddresses(query) {
+//
+// `bias` (optional { lat, lng }, typically the company's shop location) is
+// used two ways: as a Nominatim `viewbox` to prefer results near it (without
+// `bounded`, so a genuine exact match elsewhere still surfaces instead of
+// being hidden), and again client-side to re-sort the results by distance --
+// Nominatim's own relevance ranking is driven by place "importance"
+// (population, notability), which has nothing to do with which of several
+// same-named streets is actually near this business, so without a bias
+// point a "Nectar Street" three states away can easily outrank the correct
+// one a few miles from the shop. Results whose house number matches the
+// query exactly are always pinned to the top, bias or not.
+async function suggestAddresses(query, bias) {
   const trimmed = (query || "").trim();
   if (trimmed.length < 4) return [];
 
@@ -131,16 +155,25 @@ async function suggestAddresses(query) {
       const params = new URLSearchParams({
         format: "json",
         addressdetails: "1",
-        limit: "5",
+        limit: "8",
         countrycodes: "us",
         q: trimmed,
       });
+      if (bias && Number.isFinite(bias.lat) && Number.isFinite(bias.lng)) {
+        // Roughly a 60-mile-wide box around the shop -- wide enough to cover
+        // a normal service area, narrow enough to meaningfully bias ranking.
+        const d = 0.9;
+        params.set("viewbox", `${bias.lng - d},${bias.lat + d},${bias.lng + d},${bias.lat - d}`);
+      }
       const url = `${NOMINATIM_URL}?${params.toString()}`;
       const res = await fetch(url, { headers: { "User-Agent": USER_AGENT } });
       if (!res.ok) return [];
       const results = await res.json();
       if (!Array.isArray(results)) return [];
-      return results
+
+      const queryHouseNumber = (trimmed.match(/^(\d+)/) || [])[1];
+
+      const mapped = results
         .map((r) => {
           const addr = r.address || {};
           const street = [addr.house_number, addr.road].filter(Boolean).join(" ");
@@ -155,9 +188,20 @@ async function suggestAddresses(query) {
             zip: addr.postcode || "",
             lat,
             lng,
+            houseNumberMatch: Boolean(queryHouseNumber) && addr.house_number === queryHouseNumber,
           };
         })
         .filter((r) => Number.isFinite(r.lat) && Number.isFinite(r.lng));
+
+      mapped.sort((a, b) => {
+        if (a.houseNumberMatch !== b.houseNumberMatch) return a.houseNumberMatch ? -1 : 1;
+        if (bias && Number.isFinite(bias.lat) && Number.isFinite(bias.lng)) {
+          return roughMiles(bias.lat, bias.lng, a.lat, a.lng) - roughMiles(bias.lat, bias.lng, b.lat, b.lng);
+        }
+        return 0;
+      });
+
+      return mapped.slice(0, 5).map(({ houseNumberMatch, ...s }) => s);
     } catch (err) {
       console.error("suggestAddresses failed:", err.message);
       return [];

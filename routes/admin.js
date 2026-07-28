@@ -616,10 +616,15 @@ router.get("/customers/:id/events", async (req, res) => {
 // Powers the predictive-text dropdown under the street address field on
 // the Add/Edit Customer form. See utils/geocode.js for the rate-limiting
 // and usage-policy notes -- the frontend debounces keystrokes so this
-// doesn't fire on every character typed.
+// doesn't fire on every character typed. Biases results toward the
+// company's shop location (if set) so a same-named street near the
+// business outranks an unrelated one in another state.
 router.get("/geocode/suggest", async (req, res) => {
   try {
-    const suggestions = await suggestAddresses(req.query.q);
+    const shopResult = await db.query(`SELECT shop_lat, shop_lng FROM companies WHERE id = $1`, [req.companyId]);
+    const shop = shopResult.rows[0];
+    const bias = shop && shop.shop_lat != null && shop.shop_lng != null ? { lat: shop.shop_lat, lng: shop.shop_lng } : null;
+    const suggestions = await suggestAddresses(req.query.q, bias);
     res.json(suggestions);
   } catch (err) {
     console.error("GET /admin/geocode/suggest failed:", err);
