@@ -137,22 +137,27 @@ async function loadRouteDetail(routeId, companyId) {
   return route;
 }
 
-// GET /api/admin/routing/employee-location/:employeeId
-// Returns that employee's last-known lat/lng (pinged automatically every 5
-// minutes while clocked in -- see routes/timeEntries.js POST /ping-location)
-// so the route map preview can show a live-ish dot for them. Null if
-// they've never pinged (e.g. not currently clocked in).
-router.get("/employee-location/:employeeId", async (req, res) => {
+// GET /api/admin/routing/on-clock-locations
+// Returns every currently clocked-in employee (an open time_entry, i.e.
+// clock_out IS NULL) at this company who has a last-known lat/lng on file
+// (pinged automatically every 5 minutes while clocked in -- see
+// routes/timeEntries.js POST /ping-location). Used to show live-ish pins
+// for the whole crew on the Routes map preview, independent of which
+// employee/team a given route was built for.
+router.get("/on-clock-locations", async (req, res) => {
   try {
-    const { employeeId } = req.params;
-    const owns = await db.query(`SELECT id FROM employees WHERE id = $1 AND company_id = $2`, [employeeId, req.companyId]);
-    if (owns.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
-
-    const result = await db.query(`SELECT lat, lng, recorded_at FROM employee_locations WHERE employee_id = $1`, [employeeId]);
-    res.json(result.rows[0] || null);
+    const result = await db.query(
+      `SELECT DISTINCT e.id AS employee_id, e.name, l.lat, l.lng, l.recorded_at
+       FROM time_entries t
+       JOIN employees e ON e.id = t.employee_id
+       JOIN employee_locations l ON l.employee_id = e.id
+       WHERE t.clock_out IS NULL AND e.company_id = $1`,
+      [req.companyId]
+    );
+    res.json(result.rows);
   } catch (err) {
-    console.error("GET /admin/routing/employee-location failed:", err);
-    res.status(500).json({ error: err.message || "Couldn't load employee location." });
+    console.error("GET /admin/routing/on-clock-locations failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load on-the-clock locations." });
   }
 });
 
