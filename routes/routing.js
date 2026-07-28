@@ -11,6 +11,7 @@ const router = express.Router();
 const db = require("../db");
 const requireAdmin = require("../middleware/requireAdmin");
 const { optimizeStopOrder, buildGoogleMapsUrl } = require("../utils/routeOptimize");
+const { sendPushToEmployee } = require("../utils/webPush");
 
 router.use(requireAdmin);
 
@@ -227,6 +228,36 @@ router.get("/:id", async (req, res) => {
   }
 });
 
+// Notifies every employee this route applies to -- the one employee it was
+// built for, or every current member of the crew -- that a route is ready
+// for them. The push includes the stop count and job names right in the
+// notification body, and links straight to the same free Google Maps
+// deep link the in-app "Start route" button uses, so an employee can go
+// straight from the notification to turn-by-turn directions without
+// opening the app at all. Never throws -- a failed/undeliverable push
+// should never block the admin's route from being created.
+async function notifyRouteEmployees(route) {
+  try {
+    let employeeIds = [];
+    if (route.employee_id) {
+      employeeIds = [route.employee_id];
+    } else if (route.crew_id) {
+      const members = await db.query(`SELECT employee_id FROM crew_members WHERE crew_id = $1`, [route.crew_id]);
+      employeeIds = members.rows.map((r) => r.employee_id);
+    }
+    if (employeeIds.length === 0 || !route.stops || route.stops.length === 0) return;
+
+    const stopNames = route.stops.map((s) => s.title).join(", ");
+    const title = `Route ready for ${route.route_date}`;
+    const body = `${route.stops.length} stop${route.stops.length === 1 ? "" : "s"}: ${stopNames}`;
+    const url = route.maps_url || "/";
+
+    await Promise.all(employeeIds.map((employeeId) => sendPushToEmployee(employeeId, { title, body, url })));
+  } catch (err) {
+    console.error("notifyRouteEmployees failed:", err.message);
+  }
+}
+
 // POST /api/admin/routing
 // Body: { date, employee_id? | crew_id?, job_ids: [...] }
 // Creates the route, adds the given jobs as stops (each needs a geocoded
@@ -295,6 +326,7 @@ router.post("/", async (req, res) => {
     }
 
     const route = await loadRouteDetail(routeId, req.companyId);
+    await notifyRouteEmployees(route);
     res.status(201).json(route);
   } catch (err) {
     console.error("POST /admin/routing failed:", err);
