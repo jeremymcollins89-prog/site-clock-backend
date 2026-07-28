@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require("../db");
 const requireAuth = require("../middleware/requireAuth");
 const { sendPushToAdmin } = require("../utils/webPush");
+const { buildGoogleMapsUrl } = require("../utils/routeOptimize");
 
 // GET /api/schedule/me?start=YYYY-MM-DD&end=YYYY-MM-DD
 // Returns every job for the logged-in employee's company (not just ones
@@ -175,6 +176,64 @@ router.delete("/time-off/:id", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("DELETE /schedule/time-off/:id failed:", err);
     res.status(500).json({ error: err.message || "Couldn't cancel request." });
+  }
+});
+
+// GET /api/schedule/routing/today
+// Returns the optimized route assigned to the logged-in employee for
+// today, if any -- whether it was built for them directly or for a whole
+// crew they belong to (see routes/routing.js for how these get built).
+// Includes a maps_url: a free Google Maps multi-stop directions link
+// (no API key needed) pre-loaded with every stop in the optimized order,
+// for the "Start Route" button to hand off to the real Google Maps app.
+router.get("/routing/today", requireAuth, async (req, res) => {
+  try {
+    const employeeResult = await db.query(
+      `SELECT company_id FROM employees WHERE id = $1`,
+      [req.employee.employee_id]
+    );
+    if (employeeResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    const companyId = employeeResult.rows[0].company_id;
+    const today = new Date().toISOString().slice(0, 10);
+
+    const routeResult = await db.query(
+      `SELECT r.id, r.crew_id
+       FROM delivery_routes r
+       WHERE r.company_id = $1 AND r.route_date = $2 AND r.status = 'optimized'
+         AND (
+           r.employee_id = $3
+           OR r.crew_id IN (SELECT crew_id FROM crew_members WHERE employee_id = $3)
+         )
+       ORDER BY r.optimized_at DESC
+       LIMIT 1`,
+      [companyId, today, req.employee.employee_id]
+    );
+    if (routeResult.rowCount === 0) return res.json(null);
+    const routeId = routeResult.rows[0].id;
+
+    const stopsResult = await db.query(
+      `SELECT rs.id, rs.sequence, rs.lat, rs.lng, rs.address_label, j.title, j.start_time
+       FROM route_stops rs
+       JOIN jobs j ON j.id = rs.job_id
+       WHERE rs.route_id = $1
+       ORDER BY rs.sequence`,
+      [routeId]
+    );
+
+    const shopResult = await db.query(`SELECT shop_lat, shop_lng FROM companies WHERE id = $1`, [companyId]);
+    const shop = shopResult.rows[0];
+    const shopLocation = shop && shop.shop_lat != null && shop.shop_lng != null
+      ? { lat: shop.shop_lat, lng: shop.shop_lng }
+      : null;
+
+    const mapsUrl = shopLocation && stopsResult.rows.length > 0
+      ? buildGoogleMapsUrl(shopLocation, stopsResult.rows, shopLocation)
+      : null;
+
+    res.json({ id: routeId, stops: stopsResult.rows, maps_url: mapsUrl, shop_location: shopLocation });
+  } catch (err) {
+    console.error("GET /schedule/routing/today failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load today's route." });
   }
 });
 

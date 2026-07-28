@@ -12,6 +12,8 @@ const loginRateLimit = require("../middleware/loginRateLimit");
 const { getPayPeriod, PAY_FREQUENCIES } = require("../utils/payPeriod");
 const { JOB_COLORS } = require("../utils/jobColors");
 const { sendPushToEmployee } = require("../utils/webPush");
+const { geocodeAddress } = require("../utils/geocode");
+const { optimizeStopOrder, buildGoogleMapsUrl } = require("../utils/routeOptimize");
 
 const EVENT_TYPES = ["job", "personal", "other", "time_off"];
 const TIME_OFF_STATUSES = ["approved", "denied"];
@@ -617,11 +619,21 @@ router.post("/customers", async (req, res) => {
     const { name, phone, email, street, city, state, zip, notes } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
 
+    // Geocode up front so the address is route-ready immediately -- best
+    // effort only, a failed/slow lookup should never block adding a
+    // customer. (Rate-limited to ~1/sec across the whole server, see
+    // utils/geocode.js, so this can take a moment if other geocodes are
+    // already queued.)
+    const geocoded = await geocodeAddress({ street, city, state, zip }).catch(() => null);
+
     const result = await db.query(
-      `INSERT INTO customers (company_id, name, phone, email, street, city, state, zip, notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       RETURNING id, name, phone, email, street, city, state, zip, notes, created_at`,
-      [req.companyId, name, phone || null, email || null, street || null, city || null, state || null, zip || null, notes || null]
+      `INSERT INTO customers (company_id, name, phone, email, street, city, state, zip, notes, lat, lng, geocoded_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       RETURNING id, name, phone, email, street, city, state, zip, notes, lat, lng, created_at`,
+      [
+        req.companyId, name, phone || null, email || null, street || null, city || null, state || null, zip || null, notes || null,
+        geocoded ? geocoded.lat : null, geocoded ? geocoded.lng : null, geocoded ? new Date() : null,
+      ]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -697,8 +709,12 @@ router.patch("/customers/:id", async (req, res) => {
     const { id } = req.params;
     const { name, phone, email, street, city, state, zip, notes } = req.body;
 
-    const owns = await db.query(`SELECT id FROM customers WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    const owns = await db.query(
+      `SELECT id, street, city, state, zip FROM customers WHERE id = $1 AND company_id = $2`,
+      [id, req.companyId]
+    );
     if (owns.rowCount === 0) return res.status(404).json({ error: "Customer not found" });
+    const existing = owns.rows[0];
 
     const fields = [];
     const values = [];
@@ -711,12 +727,34 @@ router.patch("/customers/:id", async (req, res) => {
     if (zip !== undefined) { values.push(zip); fields.push(`zip = $${values.length}`); }
     if (notes !== undefined) { values.push(notes); fields.push(`notes = $${values.length}`); }
 
+    // Only re-geocode if an address field actually changed -- keeps this to
+    // one lookup per real address edit rather than every save.
+    const addressChanged =
+      (street !== undefined && street !== existing.street) ||
+      (city !== undefined && city !== existing.city) ||
+      (state !== undefined && state !== existing.state) ||
+      (zip !== undefined && zip !== existing.zip);
+    if (addressChanged) {
+      const geocoded = await geocodeAddress({
+        street: street !== undefined ? street : existing.street,
+        city: city !== undefined ? city : existing.city,
+        state: state !== undefined ? state : existing.state,
+        zip: zip !== undefined ? zip : existing.zip,
+      }).catch(() => null);
+      values.push(geocoded ? geocoded.lat : null);
+      fields.push(`lat = $${values.length}`);
+      values.push(geocoded ? geocoded.lng : null);
+      fields.push(`lng = $${values.length}`);
+      values.push(geocoded ? new Date() : null);
+      fields.push(`geocoded_at = $${values.length}`);
+    }
+
     let customer = owns.rows[0];
     if (fields.length > 0) {
       values.push(id);
       const result = await db.query(
         `UPDATE customers SET ${fields.join(", ")} WHERE id = $${values.length}
-         RETURNING id, name, phone, email, street, city, state, zip, notes, created_at`,
+         RETURNING id, name, phone, email, street, city, state, zip, notes, lat, lng, created_at`,
         values
       );
       customer = result.rows[0];
