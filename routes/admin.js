@@ -12,7 +12,7 @@ const loginRateLimit = require("../middleware/loginRateLimit");
 const { getPayPeriod, PAY_FREQUENCIES } = require("../utils/payPeriod");
 const { JOB_COLORS } = require("../utils/jobColors");
 const { sendPushToEmployee } = require("../utils/webPush");
-const { geocodeAddress } = require("../utils/geocode");
+const { geocodeAddress, suggestAddresses } = require("../utils/geocode");
 const { optimizeStopOrder, buildGoogleMapsUrl } = require("../utils/routeOptimize");
 
 const EVENT_TYPES = ["job", "personal", "other", "time_off"];
@@ -612,19 +612,50 @@ router.get("/customers/:id/events", async (req, res) => {
   }
 });
 
+// GET /api/admin/geocode/suggest?q=partial+address
+// Powers the predictive-text dropdown under the street address field on
+// the Add/Edit Customer form. See utils/geocode.js for the rate-limiting
+// and usage-policy notes -- the frontend debounces keystrokes so this
+// doesn't fire on every character typed.
+router.get("/geocode/suggest", async (req, res) => {
+  try {
+    const suggestions = await suggestAddresses(req.query.q);
+    res.json(suggestions);
+  } catch (err) {
+    console.error("GET /admin/geocode/suggest failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't look up addresses." });
+  }
+});
+
 // POST /api/admin/customers
-// Body: { name, phone?, email?, street?, city?, state?, zip?, notes? }
+// Body: { name, phone?, email?, street?, city?, state?, zip?, notes?, lat?, lng? }
 router.post("/customers", async (req, res) => {
   try {
-    const { name, phone, email, street, city, state, zip, notes } = req.body;
+    const { name, phone, email, street, city, state, zip, notes, lat, lng } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
 
-    // Geocode up front so the address is route-ready immediately -- best
-    // effort only, a failed/slow lookup should never block adding a
-    // customer. (Rate-limited to ~1/sec across the whole server, see
-    // utils/geocode.js, so this can take a moment if other geocodes are
-    // already queued.)
-    const geocoded = await geocodeAddress({ street, city, state, zip }).catch(() => null);
+    // If the admin picked a suggestion from the predictive-text dropdown,
+    // the client already has an exact, Nominatim-confirmed lat/lng for this
+    // address -- use it directly instead of re-geocoding (saves a lookup
+    // and is more accurate than re-deriving it from the typed-out fields).
+    // Otherwise fall back to geocoding server-side, best effort only: a
+    // failed/slow lookup should never block adding a customer. (Rate-limited
+    // to ~1/sec across the whole server, see utils/geocode.js.)
+    let resolvedLat = null;
+    let resolvedLng = null;
+    let geocodedAt = null;
+    if (Number.isFinite(Number(lat)) && Number.isFinite(Number(lng))) {
+      resolvedLat = Number(lat);
+      resolvedLng = Number(lng);
+      geocodedAt = new Date();
+    } else {
+      const geocoded = await geocodeAddress({ street, city, state, zip }).catch(() => null);
+      if (geocoded) {
+        resolvedLat = geocoded.lat;
+        resolvedLng = geocoded.lng;
+        geocodedAt = new Date();
+      }
+    }
 
     const result = await db.query(
       `INSERT INTO customers (company_id, name, phone, email, street, city, state, zip, notes, lat, lng, geocoded_at)
@@ -632,7 +663,7 @@ router.post("/customers", async (req, res) => {
        RETURNING id, name, phone, email, street, city, state, zip, notes, lat, lng, created_at`,
       [
         req.companyId, name, phone || null, email || null, street || null, city || null, state || null, zip || null, notes || null,
-        geocoded ? geocoded.lat : null, geocoded ? geocoded.lng : null, geocoded ? new Date() : null,
+        resolvedLat, resolvedLng, geocodedAt,
       ]
     );
     res.status(201).json(result.rows[0]);
@@ -703,11 +734,11 @@ router.post("/customers/import", async (req, res) => {
 });
 
 // PATCH /api/admin/customers/:id
-// Body: { name?, phone?, email?, street?, city?, state?, zip?, notes? }
+// Body: { name?, phone?, email?, street?, city?, state?, zip?, notes?, lat?, lng? }
 router.patch("/customers/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, phone, email, street, city, state, zip, notes } = req.body;
+    const { name, phone, email, street, city, state, zip, notes, lat, lng } = req.body;
 
     const owns = await db.query(
       `SELECT id, street, city, state, zip FROM customers WHERE id = $1 AND company_id = $2`,
@@ -727,14 +758,26 @@ router.patch("/customers/:id", async (req, res) => {
     if (zip !== undefined) { values.push(zip); fields.push(`zip = $${values.length}`); }
     if (notes !== undefined) { values.push(notes); fields.push(`notes = $${values.length}`); }
 
-    // Only re-geocode if an address field actually changed -- keeps this to
-    // one lookup per real address edit rather than every save.
+    // If the admin picked a suggestion from the predictive-text dropdown,
+    // the client already has an exact, Nominatim-confirmed lat/lng for this
+    // address -- trust it directly rather than re-geocoding from the typed
+    // fields. Otherwise fall back to the original behavior: only re-geocode
+    // if an address field actually changed, keeping this to one lookup per
+    // real address edit rather than every save.
+    const hasClientLatLng = Number.isFinite(Number(lat)) && Number.isFinite(Number(lng));
     const addressChanged =
       (street !== undefined && street !== existing.street) ||
       (city !== undefined && city !== existing.city) ||
       (state !== undefined && state !== existing.state) ||
       (zip !== undefined && zip !== existing.zip);
-    if (addressChanged) {
+    if (hasClientLatLng) {
+      values.push(Number(lat));
+      fields.push(`lat = $${values.length}`);
+      values.push(Number(lng));
+      fields.push(`lng = $${values.length}`);
+      values.push(new Date());
+      fields.push(`geocoded_at = $${values.length}`);
+    } else if (addressChanged) {
       const geocoded = await geocodeAddress({
         street: street !== undefined ? street : existing.street,
         city: city !== undefined ? city : existing.city,

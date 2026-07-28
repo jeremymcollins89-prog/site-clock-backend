@@ -112,4 +112,57 @@ async function geocodeAddress(addressFields) {
   return null;
 }
 
-module.exports = { geocodeAddress, buildAddressQuery };
+// Powers the predictive-text address dropdown on the Add/Edit Customer
+// form: returns up to 5 candidate addresses (with lat/lng already attached)
+// for a partial, in-progress query. Same free Nominatim endpoint and the
+// same shared rate-limit queue as geocodeAddress above -- Nominatim's usage
+// policy explicitly allows autocomplete-style use as long as the caller
+// debounces keystrokes and stays within 1 request/second, which is exactly
+// what this queue (MIN_INTERVAL_MS) and the frontend's debounce timer do
+// together. Returns [] (never throws) on a too-short query or any failure,
+// since a broken suggestion dropdown should never block typing an address
+// in by hand.
+async function suggestAddresses(query) {
+  const trimmed = (query || "").trim();
+  if (trimmed.length < 4) return [];
+
+  return enqueue(async () => {
+    try {
+      const params = new URLSearchParams({
+        format: "json",
+        addressdetails: "1",
+        limit: "5",
+        countrycodes: "us",
+        q: trimmed,
+      });
+      const url = `${NOMINATIM_URL}?${params.toString()}`;
+      const res = await fetch(url, { headers: { "User-Agent": USER_AGENT } });
+      if (!res.ok) return [];
+      const results = await res.json();
+      if (!Array.isArray(results)) return [];
+      return results
+        .map((r) => {
+          const addr = r.address || {};
+          const street = [addr.house_number, addr.road].filter(Boolean).join(" ");
+          const city = addr.city || addr.town || addr.village || addr.hamlet || addr.county || "";
+          const lat = Number(r.lat);
+          const lng = Number(r.lon);
+          return {
+            label: r.display_name,
+            street,
+            city,
+            state: addr.state || "",
+            zip: addr.postcode || "",
+            lat,
+            lng,
+          };
+        })
+        .filter((r) => Number.isFinite(r.lat) && Number.isFinite(r.lng));
+    } catch (err) {
+      console.error("suggestAddresses failed:", err.message);
+      return [];
+    }
+  });
+}
+
+module.exports = { geocodeAddress, buildAddressQuery, suggestAddresses };
