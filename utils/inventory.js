@@ -1,0 +1,97 @@
+const db = require("../db");
+const { sendPushToAdmin } = require("./webPush");
+
+// Inventory holds/consumption, hung off the existing catalog_items table
+// (see schema-inventory.sql). Only items with track_inventory = true are
+// ever touched -- everything here is a no-op for line items that don't
+// reference a catalog_item_id, or reference one that isn't being tracked.
+//
+// Model: quantity_on_hold is a running reservation counter, bumped up when
+// a quote/invoice line item referencing the item is saved, and brought back
+// down when that quote/invoice is deleted, declined, or voided (the
+// reservation falls through) or when the invoice is paid (the reservation
+// is fulfilled and the stock is actually gone). "Available" for display is
+// always quantity_on_hand - quantity_on_hold, computed at read time.
+
+// Call after inserting a quote/invoice's line items. `lineItems` is the
+// plain array of { catalog_item_id, quantity, ... } rows already written to
+// quote_line_items/invoice_line_items.
+async function placeHoldsForLineItems(lineItems, companyId) {
+  for (const item of lineItems || []) {
+    if (!item.catalog_item_id || !item.quantity) continue;
+    await db.query(
+      `UPDATE catalog_items SET quantity_on_hold = quantity_on_hold + $1
+       WHERE id = $2 AND company_id = $3 AND track_inventory = true`,
+      [item.quantity, item.catalog_item_id, companyId]
+    );
+    await checkLowStock(item.catalog_item_id, companyId);
+  }
+}
+
+// Call when a quote/invoice that had holds is deleted, declined, or voided --
+// releases the reservation back to available stock. Floored at 0 so a
+// double-release (e.g. a bug, or manual data cleanup) can't push a hold
+// negative.
+async function releaseHoldsForLineItems(lineItems, companyId) {
+  for (const item of lineItems || []) {
+    if (!item.catalog_item_id || !item.quantity) continue;
+    await db.query(
+      `UPDATE catalog_items SET quantity_on_hold = GREATEST(0, quantity_on_hold - $1)
+       WHERE id = $2 AND company_id = $3 AND track_inventory = true`,
+      [item.quantity, item.catalog_item_id, companyId]
+    );
+    await checkLowStock(item.catalog_item_id, companyId);
+  }
+}
+
+// Call once an invoice is marked paid (either the manual mark-paid route or
+// the Stripe webhook path) -- permanently removes the reserved stock: both
+// the on-hand total and the hold drop by the same quantity, since the goods
+// are now gone for good rather than just reserved.
+async function consumeInventoryForLineItems(lineItems, companyId) {
+  for (const item of lineItems || []) {
+    if (!item.catalog_item_id || !item.quantity) continue;
+    await db.query(
+      `UPDATE catalog_items
+       SET quantity_on_hand = GREATEST(0, quantity_on_hand - $1),
+           quantity_on_hold = GREATEST(0, quantity_on_hold - $1)
+       WHERE id = $2 AND company_id = $3 AND track_inventory = true`,
+      [item.quantity, item.catalog_item_id, companyId]
+    );
+    await checkLowStock(item.catalog_item_id, companyId);
+  }
+}
+
+// Fires the low-stock push once available (on_hand - on_hold) drops to or
+// below the item's own low_stock_threshold, and resets the sent-flag once
+// it's back above threshold (e.g. after a restock) so a future dip can
+// alert again. low_stock_alert_sent keeps this from re-firing on every
+// single hold placed while already below threshold.
+async function checkLowStock(catalogItemId, companyId) {
+  const result = await db.query(
+    `SELECT id, name, quantity_on_hand, quantity_on_hold, low_stock_threshold, low_stock_alert_sent
+     FROM catalog_items WHERE id = $1 AND company_id = $2`,
+    [catalogItemId, companyId]
+  );
+  const item = result.rows[0];
+  if (!item || item.low_stock_threshold == null) return;
+
+  const available = item.quantity_on_hand - item.quantity_on_hold;
+
+  if (available <= item.low_stock_threshold && !item.low_stock_alert_sent) {
+    try {
+      await sendPushToAdmin(companyId, {
+        title: "Low inventory alert",
+        body: `${item.name} is down to ${available} available (alert set at ${item.low_stock_threshold}).`,
+        url: "/admin.html?view=inventory",
+      });
+    } catch (err) {
+      console.error(`Failed to send low-stock alert for catalog item ${catalogItemId}:`, err.message);
+    }
+    await db.query(`UPDATE catalog_items SET low_stock_alert_sent = true WHERE id = $1`, [catalogItemId]);
+  } else if (available > item.low_stock_threshold && item.low_stock_alert_sent) {
+    await db.query(`UPDATE catalog_items SET low_stock_alert_sent = false WHERE id = $1`, [catalogItemId]);
+  }
+}
+
+module.exports = { placeHoldsForLineItems, releaseHoldsForLineItems, consumeInventoryForLineItems, checkLowStock };

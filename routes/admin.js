@@ -14,6 +14,7 @@ const { JOB_COLORS } = require("../utils/jobColors");
 const { sendPushToEmployee } = require("../utils/webPush");
 const { geocodeAddress, suggestAddresses } = require("../utils/geocode");
 const { optimizeStopOrder, buildGoogleMapsUrl } = require("../utils/routeOptimize");
+const { placeHoldsForLineItems, releaseHoldsForLineItems, consumeInventoryForLineItems, checkLowStock } = require("../utils/inventory");
 
 const EVENT_TYPES = ["job", "personal", "other", "time_off"];
 const TIME_OFF_STATUSES = ["approved", "denied"];
@@ -1597,13 +1598,18 @@ router.post("/invoices", async (req, res) => {
     for (let i = 0; i < line_items.length; i++) {
       const item = line_items[i];
       await client.query(
-        `INSERT INTO invoice_line_items (invoice_id, description, quantity, unit_price, sort_order)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [invoice.id, item.description, item.quantity, item.unit_price, i]
+        `INSERT INTO invoice_line_items (invoice_id, description, quantity, unit_price, sort_order, catalog_item_id)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [invoice.id, item.description, item.quantity, item.unit_price, i, item.catalog_item_id || null]
       );
     }
 
     await client.query("COMMIT");
+
+    // Reserves stock for any line item picked from a tracked catalog item --
+    // covers an invoice created directly rather than via quote conversion
+    // (that path places its own hold when the quote is first saved).
+    await placeHoldsForLineItems(line_items, req.companyId);
 
     let finalInvoice = invoice;
     let sendWarning = null;
@@ -1660,6 +1666,14 @@ router.patch("/invoices/:id", async (req, res) => {
       return res.status(400).json({ error: `payment_terms must be one of: ${PAYMENT_TERMS.join(", ")}` });
     }
 
+    // Fetched before any replacement so the old holds can be released after
+    // commit, regardless of whether line_items is being replaced this call.
+    const oldItemsResult = await client.query(
+      `SELECT catalog_item_id, quantity FROM invoice_line_items WHERE invoice_id = $1`,
+      [id]
+    );
+    const oldItemsForRelease = oldItemsResult.rows;
+
     let items = line_items;
     if (items !== undefined) {
       if (!Array.isArray(items) || items.length === 0) {
@@ -1709,14 +1723,21 @@ router.patch("/invoices/:id", async (req, res) => {
       for (let i = 0; i < items.length; i++) {
         const item = items[i];
         await client.query(
-          `INSERT INTO invoice_line_items (invoice_id, description, quantity, unit_price, sort_order)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [id, item.description, item.quantity, item.unit_price, i]
+          `INSERT INTO invoice_line_items (invoice_id, description, quantity, unit_price, sort_order, catalog_item_id)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [id, item.description, item.quantity, item.unit_price, i, item.catalog_item_id || null]
         );
       }
     }
 
     await client.query("COMMIT");
+
+    // Line items were replaced -- release the old reservation and place a
+    // fresh one for the new quantities/items (same approach as PATCH quotes).
+    if (line_items !== undefined) {
+      await releaseHoldsForLineItems(oldItemsForRelease, req.companyId);
+      await placeHoldsForLineItems(items, req.companyId);
+    }
 
     let finalInvoice = result.rows[0];
     let sendWarning = null;
@@ -1748,7 +1769,12 @@ router.delete("/invoices/:id", async (req, res) => {
     if (owns.rows[0].status !== "draft") {
       return res.status(400).json({ error: "Only draft invoices can be deleted. Void it instead." });
     }
+    const itemsForRelease = await db.query(
+      `SELECT catalog_item_id, quantity FROM invoice_line_items WHERE invoice_id = $1`,
+      [id]
+    );
     await db.query(`DELETE FROM invoices WHERE id = $1`, [id]);
+    await releaseHoldsForLineItems(itemsForRelease.rows, req.companyId);
     res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /admin/invoices/:id failed:", err);
@@ -1796,6 +1822,13 @@ router.patch("/invoices/:id/mark-paid", async (req, res) => {
       `UPDATE invoices SET status = 'paid', payment_method = $1, check_number = $2, paid_at = now() WHERE id = $3 RETURNING *`,
       [payment_method, checkNumberValue, id]
     );
+    // Paid means the reserved stock is actually gone now -- consume it
+    // rather than just release the hold.
+    const paidItems = await db.query(
+      `SELECT catalog_item_id, quantity FROM invoice_line_items WHERE invoice_id = $1`,
+      [id]
+    );
+    await consumeInventoryForLineItems(paidItems.rows, req.companyId);
     res.json(result.rows[0]);
   } catch (err) {
     console.error("PATCH /admin/invoices/:id/mark-paid failed:", err);
@@ -1855,6 +1888,15 @@ router.patch("/invoices/:id/void", async (req, res) => {
       [id, req.companyId]
     );
     if (result.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
+    // Voided before payment -- release whatever stock this invoice had
+    // reserved (a paid invoice can't reach this route -- mark-paid already
+    // consumed the hold, and mark-paid rejects already-void invoices, so
+    // there's no risk of double-releasing a consumed reservation).
+    const itemsForRelease = await db.query(
+      `SELECT catalog_item_id, quantity FROM invoice_line_items WHERE invoice_id = $1`,
+      [id]
+    );
+    await releaseHoldsForLineItems(itemsForRelease.rows, req.companyId);
     res.json(result.rows[0]);
   } catch (err) {
     console.error("PATCH /admin/invoices/:id/void failed:", err);
@@ -2086,13 +2128,19 @@ router.post("/quotes", async (req, res) => {
     for (let i = 0; i < line_items.length; i++) {
       const item = line_items[i];
       await client.query(
-        `INSERT INTO quote_line_items (quote_id, description, quantity, unit_price, sort_order)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [quote.id, item.description, item.quantity, item.unit_price, i]
+        `INSERT INTO quote_line_items (quote_id, description, quantity, unit_price, sort_order, catalog_item_id)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [quote.id, item.description, item.quantity, item.unit_price, i, item.catalog_item_id || null]
       );
     }
 
     await client.query("COMMIT");
+
+    // Reserves stock for any line item picked from a tracked catalog item --
+    // per Jeremy's call, this happens as soon as the quote is saved (even as
+    // a draft), not just once it's sent, so two quotes being built at once
+    // can't both promise the same last unit.
+    await placeHoldsForLineItems(line_items, req.companyId);
 
     let finalQuote = quote;
     let sendWarning = null;
@@ -2139,6 +2187,14 @@ router.patch("/quotes/:id", async (req, res) => {
       if (ownsCustomer.rowCount === 0) return res.status(400).json({ error: "Customer not found" });
     }
 
+    // Fetched before any replacement so the old holds can be released after
+    // commit, regardless of whether line_items is being replaced this call.
+    const oldItemsResult = await client.query(
+      `SELECT catalog_item_id, quantity FROM quote_line_items WHERE quote_id = $1`,
+      [id]
+    );
+    const oldItemsForRelease = oldItemsResult.rows;
+
     let items = line_items;
     if (items !== undefined) {
       if (!Array.isArray(items) || items.length === 0) {
@@ -2184,14 +2240,23 @@ router.patch("/quotes/:id", async (req, res) => {
       for (let i = 0; i < items.length; i++) {
         const item = items[i];
         await client.query(
-          `INSERT INTO quote_line_items (quote_id, description, quantity, unit_price, sort_order)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [id, item.description, item.quantity, item.unit_price, i]
+          `INSERT INTO quote_line_items (quote_id, description, quantity, unit_price, sort_order, catalog_item_id)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [id, item.description, item.quantity, item.unit_price, i, item.catalog_item_id || null]
         );
       }
     }
 
     await client.query("COMMIT");
+
+    // Line items were replaced -- release the old reservation and place a
+    // fresh one for the new quantities/items, rather than trying to diff
+    // old vs. new (simpler and correct even if items were reordered/removed).
+    if (line_items !== undefined) {
+      await releaseHoldsForLineItems(oldItemsForRelease, req.companyId);
+      await placeHoldsForLineItems(items, req.companyId);
+    }
+
     res.json(result.rows[0]);
   } catch (err) {
     await client.query("ROLLBACK");
@@ -2212,7 +2277,12 @@ router.delete("/quotes/:id", async (req, res) => {
     if (owns.rows[0].status !== "draft") {
       return res.status(400).json({ error: "Only draft quotes can be deleted." });
     }
+    const itemsForRelease = await db.query(
+      `SELECT catalog_item_id, quantity FROM quote_line_items WHERE quote_id = $1`,
+      [id]
+    );
     await db.query(`DELETE FROM quotes WHERE id = $1`, [id]);
+    await releaseHoldsForLineItems(itemsForRelease.rows, req.companyId);
     res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /admin/quotes/:id failed:", err);
@@ -2262,6 +2332,12 @@ router.patch("/quotes/:id/mark-declined", async (req, res) => {
       [req.params.id, req.companyId]
     );
     if (result.rowCount === 0) return res.status(404).json({ error: "Quote not found" });
+    // Customer said no -- release whatever stock this quote had reserved.
+    const itemsForRelease = await db.query(
+      `SELECT catalog_item_id, quantity FROM quote_line_items WHERE quote_id = $1`,
+      [req.params.id]
+    );
+    await releaseHoldsForLineItems(itemsForRelease.rows, req.companyId);
     res.json(result.rows[0]);
   } catch (err) {
     console.error("PATCH /admin/quotes/:id/mark-declined failed:", err);
@@ -2350,7 +2426,7 @@ router.post("/quotes/:id/convert-to-invoice", async (req, res) => {
     const quote = quoteResult.rows[0];
 
     const itemsResult = await client.query(
-      `SELECT description, quantity, unit_price FROM quote_line_items WHERE quote_id = $1 ORDER BY sort_order`,
+      `SELECT description, quantity, unit_price, catalog_item_id FROM quote_line_items WHERE quote_id = $1 ORDER BY sort_order`,
       [id]
     );
     if (itemsResult.rowCount === 0) return res.status(400).json({ error: "This quote has no line items to invoice." });
@@ -2383,11 +2459,15 @@ router.post("/quotes/:id/convert-to-invoice", async (req, res) => {
     for (let i = 0; i < itemsResult.rows.length; i++) {
       const item = itemsResult.rows[i];
       await client.query(
-        `INSERT INTO invoice_line_items (invoice_id, description, quantity, unit_price, sort_order)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [invoice.id, item.description, item.quantity, item.unit_price, i]
+        `INSERT INTO invoice_line_items (invoice_id, description, quantity, unit_price, sort_order, catalog_item_id)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [invoice.id, item.description, item.quantity, item.unit_price, i, item.catalog_item_id]
       );
     }
+    // No inventory hold change here on purpose -- the reservation placed
+    // when the quote was saved simply carries forward to the new invoice
+    // (same catalog items, same quantities). It gets released if this
+    // invoice is later voided/deleted, or consumed once it's paid.
 
     const updatedQuote = await client.query(
       `UPDATE quotes SET converted_invoice_id = $1, status = CASE WHEN status IN ('draft', 'sent') THEN 'accepted' ELSE status END
@@ -2736,7 +2816,9 @@ router.delete("/expenses/:id", async (req, res) => {
 router.get("/catalog-items", async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT id, name, unit_price, created_at FROM catalog_items WHERE company_id = $1 ORDER BY name`,
+      `SELECT id, name, unit_price, created_at,
+              track_inventory, quantity_on_hand, quantity_on_hold, unit_cost, low_stock_threshold
+       FROM catalog_items WHERE company_id = $1 ORDER BY name`,
       [req.companyId]
     );
     res.json(result.rows);
@@ -2765,11 +2847,18 @@ router.post("/catalog-items", async (req, res) => {
 });
 
 // PATCH /api/admin/catalog-items/:id
-// Body: { name?, unit_price? }
+// Body: any of { name?, unit_price?, track_inventory?, quantity_on_hand?,
+// unit_cost?, low_stock_threshold? } -- the last four are set from the
+// Inventory tab's Settings view rather than the regular Catalog editor.
+// Directly editing quantity_on_hand here is also how a restock gets
+// recorded (there's no separate "receive stock" action -- just bump the
+// number). Turning low_stock_threshold back to null clears the alert (and
+// resets the sent-flag so a future threshold wouldn't immediately re-fire
+// off a stale flag).
 router.patch("/catalog-items/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, unit_price } = req.body;
+    const { name, unit_price, track_inventory, quantity_on_hand, unit_cost, low_stock_threshold } = req.body;
     const owns = await db.query(`SELECT id FROM catalog_items WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
     if (owns.rowCount === 0) return res.status(404).json({ error: "Catalog item not found" });
 
@@ -2777,21 +2866,67 @@ router.patch("/catalog-items/:id", async (req, res) => {
     const values = [];
     if (name !== undefined) { values.push(name); fields.push(`name = $${values.length}`); }
     if (unit_price !== undefined) { values.push(Number(unit_price) || 0); fields.push(`unit_price = $${values.length}`); }
+    if (track_inventory !== undefined) { values.push(!!track_inventory); fields.push(`track_inventory = $${values.length}`); }
+    if (quantity_on_hand !== undefined) {
+      const qty = Math.max(0, Math.round(Number(quantity_on_hand)) || 0);
+      values.push(qty); fields.push(`quantity_on_hand = $${values.length}`);
+    }
+    if (unit_cost !== undefined) { values.push(unit_cost === null || unit_cost === "" ? null : Number(unit_cost) || 0); fields.push(`unit_cost = $${values.length}`); }
+    if (low_stock_threshold !== undefined) {
+      const threshold = low_stock_threshold === null || low_stock_threshold === "" ? null : Math.max(0, Math.round(Number(low_stock_threshold)) || 0);
+      values.push(threshold); fields.push(`low_stock_threshold = $${values.length}`);
+      fields.push(`low_stock_alert_sent = false`);
+    }
 
     let item = owns.rows[0];
     if (fields.length > 0) {
       values.push(id);
       const result = await db.query(
         `UPDATE catalog_items SET ${fields.join(", ")} WHERE id = $${values.length}
-         RETURNING id, name, unit_price, created_at`,
+         RETURNING id, name, unit_price, created_at,
+                   track_inventory, quantity_on_hand, quantity_on_hold, unit_cost, low_stock_threshold`,
         values
       );
       item = result.rows[0];
+      // Restocking or changing the threshold can move an item across the
+      // low-stock line in either direction -- re-check right away rather
+      // than waiting for the next hold/consume to notice.
+      if (quantity_on_hand !== undefined || low_stock_threshold !== undefined) {
+        await checkLowStock(id, req.companyId);
+      }
     }
     res.json(item);
   } catch (err) {
     console.error("PATCH /admin/catalog-items/:id failed:", err);
     res.status(500).json({ error: err.message || "Couldn't update catalog item." });
+  }
+});
+
+// GET /api/admin/inventory
+// Only catalog items with track_inventory = true. "Available" is computed
+// here (on_hand - on_hold) rather than stored, so it's always consistent
+// with whatever the last hold/consume operation left behind. The two
+// summary figures mirror the Overview/Reports profit bubbles pattern:
+// total inventory value (on-hand x cost, everything you currently own) and
+// total on-hold value (the subset of that already spoken for by an open
+// quote or unpaid invoice).
+router.get("/inventory", async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, name, unit_price, unit_cost, quantity_on_hand, quantity_on_hold, low_stock_threshold,
+              (quantity_on_hand - quantity_on_hold) AS quantity_available
+       FROM catalog_items
+       WHERE company_id = $1 AND track_inventory = true
+       ORDER BY name`,
+      [req.companyId]
+    );
+    const items = result.rows;
+    const totalValue = items.reduce((sum, it) => sum + Number(it.quantity_on_hand) * Number(it.unit_cost || 0), 0);
+    const totalOnHoldValue = items.reduce((sum, it) => sum + Number(it.quantity_on_hold) * Number(it.unit_cost || 0), 0);
+    res.json({ items, total_value: totalValue, total_on_hold_value: totalOnHoldValue });
+  } catch (err) {
+    console.error("GET /admin/inventory failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load inventory." });
   }
 });
 

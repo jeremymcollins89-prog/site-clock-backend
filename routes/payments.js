@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require("../db");
 const stripe = require("../utils/stripeClient");
 const { sendPaymentReceiptEmail } = require("../utils/mailer");
+const { consumeInventoryForLineItems } = require("../utils/inventory");
 
 // Where the customer lands after paying (or backing out of) a Checkout
 // page -- static pages in the frontend site, not behind any login.
@@ -191,6 +192,15 @@ async function markInvoicePaidFromStripe(session) {
   // Nothing new happened, so there's nothing new to send a receipt for.
   if (result.rowCount === 0) return;
   const invoice = result.rows[0];
+
+  // Same "paid means the reserved stock is actually gone" consumption as the
+  // manual mark-paid route -- this is the other of the two paths that can
+  // ever set an invoice to "paid" (see admin.js PATCH /invoices/:id/mark-paid).
+  const paidItems = await db.query(
+    `SELECT catalog_item_id, quantity FROM invoice_line_items WHERE invoice_id = $1`,
+    [invoiceId]
+  );
+  await consumeInventoryForLineItems(paidItems.rows, invoice.company_id);
 
   const detail = await db.query(
     `SELECT c.name AS customer_name, c.email AS customer_email, co.name AS company_name, co.stripe_account_id
