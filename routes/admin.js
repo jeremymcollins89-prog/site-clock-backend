@@ -206,6 +206,27 @@ router.patch("/long-shift-alert", async (req, res) => {
   res.json(result.rows[0]);
 });
 
+// GET /api/admin/show-profit-bubbles
+// Whether the Gross/Net Profit bubbles render on the Overview tab's home
+// screen. Defaults to true for every company (see schema-show-profit-
+// bubbles.sql) so this is purely an opt-out.
+router.get("/show-profit-bubbles", async (req, res) => {
+  const result = await db.query(`SELECT show_profit_bubbles FROM companies WHERE id = $1`, [req.companyId]);
+  if (result.rowCount === 0) return res.status(404).json({ error: "Company not found" });
+  res.json(result.rows[0]);
+});
+
+// PATCH /api/admin/show-profit-bubbles
+// Body: { show_profit_bubbles: boolean }
+router.patch("/show-profit-bubbles", async (req, res) => {
+  const { show_profit_bubbles } = req.body;
+  const result = await db.query(
+    `UPDATE companies SET show_profit_bubbles = $1 WHERE id = $2 RETURNING show_profit_bubbles`,
+    [!!show_profit_bubbles, req.companyId]
+  );
+  res.json(result.rows[0]);
+});
+
 // GET /api/admin/company-name
 // The business name shown on invoice/quote PDFs, in the "From" display name
 // of customer-facing emails (see utils/mailer.js's customerFacingFrom), and
@@ -517,7 +538,7 @@ router.patch("/time-entries/:id", async (req, res) => {
 
 router.get("/overview", async (req, res) => {
   const companyResult = await db.query(
-    `SELECT pay_frequency, pay_period_anchor, pay_period_custom_days, long_shift_alert_hours FROM companies WHERE id = $1`,
+    `SELECT pay_frequency, pay_period_anchor, pay_period_custom_days, long_shift_alert_hours, show_profit_bubbles FROM companies WHERE id = $1`,
     [req.companyId]
   );
   const period = getPayPeriod(new Date(), companyResult.rows[0] || {});
@@ -545,6 +566,7 @@ router.get("/overview", async (req, res) => {
     period,
     employees: result.rows,
     long_shift_alert_hours: companyResult.rows[0] ? companyResult.rows[0].long_shift_alert_hours : 10,
+    show_profit_bubbles: companyResult.rows[0] ? companyResult.rows[0].show_profit_bubbles : true,
   });
 });
 
