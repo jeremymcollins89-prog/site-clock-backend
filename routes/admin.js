@@ -6,7 +6,7 @@ const { loginAdmin } = require("../utils/adminAuth");
 const { hashPin } = require("../utils/auth");
 const { generateResetToken, hashResetToken } = require("../utils/resetToken");
 const { sendAdminPasswordResetEmail, sendInvoiceEmail, sendQuoteEmail, sendPaymentReceiptEmail } = require("../utils/mailer");
-const { renderInvoicePdf, renderQuotePdf } = require("../utils/invoicePdf");
+const { renderInvoicePdf, renderQuotePdf, renderPullSheetPdf } = require("../utils/invoicePdf");
 const requireAdmin = require("../middleware/requireAdmin");
 const loginRateLimit = require("../middleware/loginRateLimit");
 const { getPayPeriod, PAY_FREQUENCIES } = require("../utils/payPeriod");
@@ -14,7 +14,7 @@ const { JOB_COLORS } = require("../utils/jobColors");
 const { sendPushToEmployee } = require("../utils/webPush");
 const { geocodeAddress, suggestAddresses } = require("../utils/geocode");
 const { optimizeStopOrder, buildGoogleMapsUrl } = require("../utils/routeOptimize");
-const { placeHoldsForLineItems, releaseHoldsForLineItems, consumeInventoryForLineItems, checkLowStock } = require("../utils/inventory");
+const { placeHoldsForLineItems, releaseHoldsForLineItems, consumeInventoryForLineItems, checkLowStock, consumeRemainingAfterPulls, getPulledQuantities } = require("../utils/inventory");
 
 const EVENT_TYPES = ["job", "personal", "other", "time_off"];
 const TIME_OFF_STATUSES = ["approved", "denied"];
@@ -1014,6 +1014,37 @@ async function notifyAssigned(employeeIds, job) {
   );
 }
 
+// Notifies whichever employees are assigned to the job a newly-built,
+// job-based pull sheet (source_type 'quote'/'invoice') is tied to. Solo/
+// manual pull sheets never call this -- they're not tied to a job, so
+// there's no crew to notify. Best-effort: a missing job link, a job with no
+// assignments yet, or a push failure should never fail the pull-sheet build
+// itself, so every step here is wrapped to swallow its own errors.
+async function notifyPullSheetBuilt(sheet, sourceType, sourceId, companyId) {
+  try {
+    const jobField = sourceType === "quote" ? "converted_job_id" : "job_id";
+    const table = sourceType === "quote" ? "quotes" : "invoices";
+    const jobResult = await db.query(`SELECT ${jobField} AS job_id FROM ${table} WHERE id = $1`, [sourceId]);
+    const jobId = jobResult.rows[0]?.job_id;
+    if (!jobId) return;
+
+    const assignedResult = await db.query(`SELECT employee_id FROM job_assignments WHERE job_id = $1`, [jobId]);
+    if (assignedResult.rowCount === 0) return;
+
+    await Promise.all(
+      assignedResult.rows.map((row) =>
+        sendPushToEmployee(row.employee_id, {
+          title: "Pull sheet ready",
+          body: `A pull sheet was built for ${sheet.source_label}${sheet.customer_name ? ` — ${sheet.customer_name}` : ""}`,
+          url: "/schedule",
+        }).catch((err) => console.error("Failed to send pull sheet notification:", err.message))
+      )
+    );
+  } catch (err) {
+    console.error("notifyPullSheetBuilt failed:", err.message);
+  }
+}
+
 // GET /api/admin/jobs?start=YYYY-MM-DD&end=YYYY-MM-DD
 // Returns jobs overlapping the given range (both optional -- omit both to
 // get every job) along with their assigned employees.
@@ -1823,12 +1854,15 @@ router.patch("/invoices/:id/mark-paid", async (req, res) => {
       [payment_method, checkNumberValue, id]
     );
     // Paid means the reserved stock is actually gone now -- consume it
-    // rather than just release the hold.
+    // rather than just release the hold. Only whatever hasn't already been
+    // physically pulled (via a fulfilled pull sheet for this invoice) gets
+    // subtracted here, so a job that had its material pulled ahead of
+    // payment isn't double-consumed.
     const paidItems = await db.query(
       `SELECT catalog_item_id, quantity FROM invoice_line_items WHERE invoice_id = $1`,
       [id]
     );
-    await consumeInventoryForLineItems(paidItems.rows, req.companyId);
+    await consumeRemainingAfterPulls(paidItems.rows, "invoice", id, req.companyId);
     res.json(result.rows[0]);
   } catch (err) {
     console.error("PATCH /admin/invoices/:id/mark-paid failed:", err);
@@ -2469,6 +2503,16 @@ router.post("/quotes/:id/convert-to-invoice", async (req, res) => {
     // (same catalog items, same quantities). It gets released if this
     // invoice is later voided/deleted, or consumed once it's paid.
 
+    // Any pull sheet already built (and possibly fulfilled) against the
+    // quote needs to follow the job to its new invoice id -- otherwise the
+    // "how much has already been pulled for this job" lookup used by both
+    // pull-sheet building and mark-paid would stop finding it, and the same
+    // material could get consumed a second time once this invoice is paid.
+    await client.query(
+      `UPDATE pull_sheets SET source_type = 'invoice', source_id = $1 WHERE source_type = 'quote' AND source_id = $2 AND company_id = $3`,
+      [invoice.id, id, req.companyId]
+    );
+
     const updatedQuote = await client.query(
       `UPDATE quotes SET converted_invoice_id = $1, status = CASE WHEN status IN ('draft', 'sent') THEN 'accepted' ELSE status END
        WHERE id = $2 RETURNING *`,
@@ -2927,6 +2971,287 @@ router.get("/inventory", async (req, res) => {
   } catch (err) {
     console.error("GET /admin/inventory failed:", err);
     res.status(500).json({ error: err.message || "Couldn't load inventory." });
+  }
+});
+
+// GET /api/admin/pull-sheets/sources
+// Lists the open quotes/invoices a pull sheet could be built from -- only
+// ones that actually have at least one inventory-tracked catalog-linked line
+// item (no point offering a job with nothing to pull), and excluding
+// declined quotes / voided invoices. Powers the picker shown when Building a
+// pull sheet.
+router.get("/pull-sheets/sources", async (req, res) => {
+  try {
+    const quotes = await db.query(
+      `SELECT q.id, q.quote_number AS number, q.status, c.name AS customer_name
+       FROM quotes q
+       JOIN customers c ON c.id = q.customer_id
+       WHERE q.company_id = $1 AND q.status != 'declined'
+         AND EXISTS (
+           SELECT 1 FROM quote_line_items qli
+           JOIN catalog_items ci ON ci.id = qli.catalog_item_id
+           WHERE qli.quote_id = q.id AND ci.track_inventory = true
+         )
+       ORDER BY q.quote_number DESC`,
+      [req.companyId]
+    );
+    const invoices = await db.query(
+      `SELECT i.id, i.invoice_number AS number, i.status, c.name AS customer_name
+       FROM invoices i
+       JOIN customers c ON c.id = i.customer_id
+       WHERE i.company_id = $1 AND i.status != 'void'
+         AND EXISTS (
+           SELECT 1 FROM invoice_line_items ili
+           JOIN catalog_items ci ON ci.id = ili.catalog_item_id
+           WHERE ili.invoice_id = i.id AND ci.track_inventory = true
+         )
+       ORDER BY i.invoice_number DESC`,
+      [req.companyId]
+    );
+    res.json({ quotes: quotes.rows, invoices: invoices.rows });
+  } catch (err) {
+    console.error("GET /admin/pull-sheets/sources failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load quotes/invoices." });
+  }
+});
+
+// GET /api/admin/pull-sheets
+// Recent pull sheets (both open and fulfilled), newest first, for the list
+// shown on the Inventory tab.
+router.get("/pull-sheets", async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT ps.id, ps.source_type, ps.source_id, ps.source_label, ps.customer_name, ps.status,
+              ps.created_at, ps.fulfilled_at,
+              COALESCE(SUM(psi.quantity), 0) AS item_count
+       FROM pull_sheets ps
+       LEFT JOIN pull_sheet_items psi ON psi.pull_sheet_id = ps.id
+       WHERE ps.company_id = $1
+       GROUP BY ps.id
+       ORDER BY ps.created_at DESC
+       LIMIT 200`,
+      [req.companyId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/pull-sheets failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load pull sheets." });
+  }
+});
+
+// GET /api/admin/pull-sheets/:id
+router.get("/pull-sheets/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(`SELECT * FROM pull_sheets WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (result.rowCount === 0) return res.status(404).json({ error: "Pull sheet not found" });
+    const items = await db.query(
+      `SELECT id, catalog_item_id, name, quantity FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY name`,
+      [id]
+    );
+    res.json({ ...result.rows[0], items: items.rows });
+  } catch (err) {
+    console.error("GET /admin/pull-sheets/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load pull sheet." });
+  }
+});
+
+// GET /api/admin/pull-sheets/:id/pdf
+// Regenerated fresh every time, same as the invoice/quote PDFs -- nothing is
+// stored.
+router.get("/pull-sheets/:id/pdf", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const sheetResult = await db.query(`SELECT * FROM pull_sheets WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (sheetResult.rowCount === 0) return res.status(404).json({ error: "Pull sheet not found" });
+    const sheet = sheetResult.rows[0];
+    const items = await db.query(
+      `SELECT name, quantity FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY name`,
+      [id]
+    );
+    const companyResult = await db.query(`SELECT name FROM companies WHERE id = $1`, [req.companyId]);
+
+    const pdfBuffer = await renderPullSheetPdf({
+      companyName: companyResult.rows[0] ? companyResult.rows[0].name : null,
+      sheet,
+      items: items.rows,
+    });
+
+    res.set("Content-Type", "application/pdf");
+    res.set("Content-Disposition", `inline; filename="pull-sheet-${id}.pdf"`);
+    res.send(pdfBuffer);
+  } catch (err) {
+    console.error("GET /admin/pull-sheets/:id/pdf failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't generate pull sheet PDF." });
+  }
+});
+
+// POST /api/admin/pull-sheets
+// Body: { source_type: 'quote'|'invoice', source_id }
+// Builds a new pull sheet snapshotting the source's inventory-tracked line
+// items. Each item's quantity is (that line item's quantity minus whatever a
+// previously-fulfilled pull sheet for this same job already accounted for),
+// so re-building a sheet for a partially-pulled job only asks for what's
+// left, and the same units can never be pulled (and later consumed) twice.
+router.post("/pull-sheets", async (req, res) => {
+  try {
+    const { source_type, source_id, items, label } = req.body;
+
+    // Solo/standalone sheet: items picked by hand, not tied to any job. No
+    // "already pulled" bookkeeping applies here (nothing to double-count
+    // against), so this path is much simpler than the job-based one below.
+    if (source_type === "manual") {
+      if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ error: "Add at least one item to build a pull sheet." });
+      }
+      const catalogIds = items.map((i) => i.catalog_item_id).filter(Boolean);
+      const catalogResult = await db.query(
+        `SELECT id, name FROM catalog_items WHERE company_id = $1 AND track_inventory = true AND id = ANY($2::uuid[])`,
+        [req.companyId, catalogIds]
+      );
+      const catalogById = new Map(catalogResult.rows.map((r) => [r.id, r.name]));
+      const toPull = items
+        .map((item) => ({
+          catalog_item_id: item.catalog_item_id,
+          name: catalogById.get(item.catalog_item_id),
+          quantity: Math.max(0, Math.round(Number(item.quantity)) || 0),
+        }))
+        .filter((item) => item.catalog_item_id && item.name && item.quantity > 0);
+
+      if (toPull.length === 0) {
+        return res.status(400).json({ error: "None of those items are trackable, or all quantities were 0." });
+      }
+
+      const sheetResult = await db.query(
+        `INSERT INTO pull_sheets (company_id, source_type, source_label)
+         VALUES ($1, 'manual', $2) RETURNING *`,
+        [req.companyId, (label && String(label).trim().slice(0, 200)) || "Solo pull sheet"]
+      );
+      const sheet = sheetResult.rows[0];
+
+      for (const item of toPull) {
+        await db.query(
+          `INSERT INTO pull_sheet_items (pull_sheet_id, catalog_item_id, name, quantity) VALUES ($1, $2, $3, $4)`,
+          [sheet.id, item.catalog_item_id, item.name, item.quantity]
+        );
+      }
+
+      return res.status(201).json({ ...sheet, items: toPull });
+    }
+
+    if (!["quote", "invoice"].includes(source_type) || !source_id) {
+      return res.status(400).json({ error: "source_type must be 'quote', 'invoice', or 'manual'." });
+    }
+
+    const table = source_type === "quote" ? "quotes" : "invoices";
+    const lineItemsTable = source_type === "quote" ? "quote_line_items" : "invoice_line_items";
+    const numberField = source_type === "quote" ? "quote_number" : "invoice_number";
+    const fkField = source_type === "quote" ? "quote_id" : "invoice_id";
+
+    const sourceResult = await db.query(
+      `SELECT s.id, s.${numberField} AS number, c.name AS customer_name
+       FROM ${table} s JOIN customers c ON c.id = s.customer_id
+       WHERE s.id = $1 AND s.company_id = $2`,
+      [source_id, req.companyId]
+    );
+    if (sourceResult.rowCount === 0) return res.status(404).json({ error: `${source_type === "quote" ? "Quote" : "Invoice"} not found` });
+    const source = sourceResult.rows[0];
+
+    const lineItemsResult = await db.query(
+      `SELECT li.catalog_item_id, li.description, li.quantity
+       FROM ${lineItemsTable} li
+       JOIN catalog_items ci ON ci.id = li.catalog_item_id
+       WHERE li.${fkField} = $1 AND ci.track_inventory = true`,
+      [source_id]
+    );
+
+    const pulled = await getPulledQuantities(source_type, source_id, req.companyId);
+    const toPull = lineItemsResult.rows
+      .map((item) => ({
+        catalog_item_id: item.catalog_item_id,
+        name: item.description,
+        quantity: Math.max(0, Math.round(Number(item.quantity)) - (pulled.get(item.catalog_item_id) || 0)),
+      }))
+      .filter((item) => item.quantity > 0);
+
+    if (toPull.length === 0) {
+      const message = lineItemsResult.rowCount === 0
+        ? "This job has no inventory-tracked items."
+        : "Everything on this job has already been pulled.";
+      return res.status(400).json({ error: message });
+    }
+
+    const sourceLabel = `${source_type === "quote" ? "Quote" : "Invoice"} #${source.number}`;
+    const sheetResult = await db.query(
+      `INSERT INTO pull_sheets (company_id, source_type, source_id, source_label, customer_name)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [req.companyId, source_type, source_id, sourceLabel, source.customer_name]
+    );
+    const sheet = sheetResult.rows[0];
+
+    for (const item of toPull) {
+      await db.query(
+        `INSERT INTO pull_sheet_items (pull_sheet_id, catalog_item_id, name, quantity) VALUES ($1, $2, $3, $4)`,
+        [sheet.id, item.catalog_item_id, item.name, item.quantity]
+      );
+    }
+
+    notifyPullSheetBuilt(sheet, source_type, source_id, req.companyId).catch((err) =>
+      console.error("notifyPullSheetBuilt failed:", err.message)
+    );
+
+    res.status(201).json({ ...sheet, items: toPull });
+  } catch (err) {
+    console.error("POST /admin/pull-sheets failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't build pull sheet." });
+  }
+});
+
+// PATCH /api/admin/pull-sheets/:id/fulfill
+// Marks a pull sheet fulfilled and actually removes its items from stock --
+// decrementing both quantity_on_hand and quantity_on_hold, same as an
+// invoice being marked paid. This is the one moment a pull sheet changes any
+// real inventory number; building one earlier was just a snapshot/checklist.
+router.patch("/pull-sheets/:id/fulfill", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const sheetResult = await db.query(`SELECT * FROM pull_sheets WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (sheetResult.rowCount === 0) return res.status(404).json({ error: "Pull sheet not found" });
+    const sheet = sheetResult.rows[0];
+    if (sheet.status === "fulfilled") return res.status(400).json({ error: "This pull sheet has already been fulfilled." });
+
+    const items = await db.query(`SELECT catalog_item_id, quantity FROM pull_sheet_items WHERE pull_sheet_id = $1`, [id]);
+    await consumeInventoryForLineItems(items.rows, req.companyId);
+
+    const updated = await db.query(
+      `UPDATE pull_sheets SET status = 'fulfilled', fulfilled_at = now() WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    res.json(updated.rows[0]);
+  } catch (err) {
+    console.error("PATCH /admin/pull-sheets/:id/fulfill failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't mark pull sheet as fulfilled." });
+  }
+});
+
+// DELETE /api/admin/pull-sheets/:id
+// Only an open (not-yet-fulfilled) pull sheet can be deleted -- deleting a
+// fulfilled one would erase the record of inventory already having been
+// physically removed, causing it to be double-consumed the next time this
+// job's invoice is marked paid.
+router.delete("/pull-sheets/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const sheetResult = await db.query(`SELECT status FROM pull_sheets WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (sheetResult.rowCount === 0) return res.status(404).json({ error: "Pull sheet not found" });
+    if (sheetResult.rows[0].status === "fulfilled") {
+      return res.status(400).json({ error: "A fulfilled pull sheet can't be deleted." });
+    }
+    await db.query(`DELETE FROM pull_sheets WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("DELETE /admin/pull-sheets/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't delete pull sheet." });
   }
 });
 

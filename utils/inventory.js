@@ -94,4 +94,47 @@ async function checkLowStock(catalogItemId, companyId) {
   }
 }
 
-module.exports = { placeHoldsForLineItems, releaseHoldsForLineItems, consumeInventoryForLineItems, checkLowStock };
+// How much of each catalog item has already been physically removed via a
+// *fulfilled* pull sheet built from this specific quote/invoice. Used so a
+// job's stock never gets consumed twice -- once when a pull sheet is
+// fulfilled, and again when the invoice is later marked paid.
+async function getPulledQuantities(sourceType, sourceId, companyId) {
+  const result = await db.query(
+    `SELECT psi.catalog_item_id, SUM(psi.quantity) AS total
+     FROM pull_sheet_items psi
+     JOIN pull_sheets ps ON ps.id = psi.pull_sheet_id
+     WHERE ps.source_type = $1 AND ps.source_id = $2 AND ps.company_id = $3 AND ps.status = 'fulfilled'
+     GROUP BY psi.catalog_item_id`,
+    [sourceType, sourceId, companyId]
+  );
+  const map = new Map();
+  result.rows.forEach((r) => {
+    if (r.catalog_item_id) map.set(r.catalog_item_id, Number(r.total));
+  });
+  return map;
+}
+
+// Consumes only what a fulfilled pull sheet hasn't already taken care of.
+// Called instead of consumeInventoryForLineItems directly whenever an
+// invoice is marked paid (manual route and Stripe webhook both funnel
+// through here), so a job that had some or all of its material pulled ahead
+// of payment doesn't get double-subtracted from stock.
+async function consumeRemainingAfterPulls(lineItems, sourceType, sourceId, companyId) {
+  const pulled = await getPulledQuantities(sourceType, sourceId, companyId);
+  const remaining = (lineItems || [])
+    .map((item) => ({
+      catalog_item_id: item.catalog_item_id,
+      quantity: Math.max(0, Number(item.quantity) - (pulled.get(item.catalog_item_id) || 0)),
+    }))
+    .filter((item) => item.catalog_item_id && item.quantity > 0);
+  await consumeInventoryForLineItems(remaining, companyId);
+}
+
+module.exports = {
+  placeHoldsForLineItems,
+  releaseHoldsForLineItems,
+  consumeInventoryForLineItems,
+  checkLowStock,
+  getPulledQuantities,
+  consumeRemainingAfterPulls,
+};

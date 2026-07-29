@@ -297,6 +297,108 @@ router.get("/attachments/:id", requireAuth, async (req, res) => {
   }
 });
 
+// ---------- Pull sheets ----------
+// Read-only, employee-facing view of pull sheets. A pull sheet is only ever
+// visible to an employee if it was built from a quote/invoice tied to a job
+// they're assigned to (see job_assignments join below) -- solo/manual pull
+// sheets aren't tied to any job, so they never show up here; they're purely
+// an internal admin tool for restocking, not something to notify a crew
+// about. "Visible" is intentionally not the same as "fulfilled" -- an
+// employee should see a pull sheet as soon as it's built (so they know
+// what's been pulled/is being pulled for their job), not just once an admin
+// marks it fulfilled.
+
+// GET /api/schedule/pull-sheets
+router.get("/pull-sheets", requireAuth, async (req, res) => {
+  try {
+    const employeeId = req.employee.employee_id;
+    const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [employeeId]);
+    if (employeeResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    const companyId = employeeResult.rows[0].company_id;
+
+    const result = await db.query(
+      `SELECT ps.id, ps.source_type, ps.source_label, ps.customer_name, ps.status, ps.created_at, ps.fulfilled_at,
+              COALESCE(
+                (SELECT json_agg(json_build_object('id', psi.id, 'name', psi.name, 'quantity', psi.quantity) ORDER BY psi.name)
+                 FROM pull_sheet_items psi WHERE psi.pull_sheet_id = ps.id),
+                '[]'::json
+              ) AS items
+       FROM pull_sheets ps
+       LEFT JOIN invoices inv ON ps.source_type = 'invoice' AND inv.id = ps.source_id
+       LEFT JOIN quotes q ON ps.source_type = 'quote' AND q.id = ps.source_id
+       JOIN job_assignments ja ON ja.job_id = COALESCE(inv.job_id, q.converted_job_id) AND ja.employee_id = $1
+       WHERE ps.company_id = $2
+       ORDER BY ps.created_at DESC`,
+      [employeeId, companyId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /schedule/pull-sheets failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load pull sheets." });
+  }
+});
+
+// GET /api/schedule/pull-sheets/unseen-count
+// "Unseen" here just means "open" (not yet fulfilled) -- same idea as the
+// Time off menu badge showing a pending count, no separate per-employee
+// seen-tracking needed. Lightweight, safe to poll.
+router.get("/pull-sheets/unseen-count", requireAuth, async (req, res) => {
+  try {
+    const employeeId = req.employee.employee_id;
+    const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [employeeId]);
+    if (employeeResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    const companyId = employeeResult.rows[0].company_id;
+
+    const result = await db.query(
+      `SELECT COUNT(*)::int AS count
+       FROM pull_sheets ps
+       LEFT JOIN invoices inv ON ps.source_type = 'invoice' AND inv.id = ps.source_id
+       LEFT JOIN quotes q ON ps.source_type = 'quote' AND q.id = ps.source_id
+       JOIN job_assignments ja ON ja.job_id = COALESCE(inv.job_id, q.converted_job_id) AND ja.employee_id = $1
+       WHERE ps.company_id = $2 AND ps.status = 'open'`,
+      [employeeId, companyId]
+    );
+    res.json({ count: result.rows[0].count });
+  } catch (err) {
+    console.error("GET /schedule/pull-sheets/unseen-count failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load unseen count." });
+  }
+});
+
+// GET /api/schedule/pull-sheets/:id
+// Item-level detail for one pull sheet -- same job-assignment visibility
+// check as the list route above, just scoped to a single row.
+router.get("/pull-sheets/:id", requireAuth, async (req, res) => {
+  try {
+    const employeeId = req.employee.employee_id;
+    const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [employeeId]);
+    if (employeeResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    const companyId = employeeResult.rows[0].company_id;
+
+    const sheetResult = await db.query(
+      `SELECT ps.id, ps.source_type, ps.source_label, ps.customer_name, ps.status, ps.created_at, ps.fulfilled_at
+       FROM pull_sheets ps
+       LEFT JOIN invoices inv ON ps.source_type = 'invoice' AND inv.id = ps.source_id
+       LEFT JOIN quotes q ON ps.source_type = 'quote' AND q.id = ps.source_id
+       JOIN job_assignments ja ON ja.job_id = COALESCE(inv.job_id, q.converted_job_id) AND ja.employee_id = $1
+       WHERE ps.id = $2 AND ps.company_id = $3`,
+      [employeeId, req.params.id, companyId]
+    );
+    if (sheetResult.rowCount === 0) return res.status(404).json({ error: "Pull sheet not found" });
+
+    const itemsResult = await db.query(
+      `SELECT id, name, quantity FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY name`,
+      [req.params.id]
+    );
+
+    res.json({ ...sheetResult.rows[0], items: itemsResult.rows });
+  } catch (err) {
+    console.error("GET /schedule/pull-sheets/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load pull sheet." });
+  }
+});
+
 // GET /api/schedule/company-logo
 // Read-only, employee-facing mirror of GET /api/admin/company-logo -- lets
 // the Employee PWA show the same logo in its header that already appears in

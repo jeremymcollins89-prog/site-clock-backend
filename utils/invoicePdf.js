@@ -207,4 +207,56 @@ function renderQuotePdf({ companyName, quote, customer, lineItems, logoBuffer })
   });
 }
 
-module.exports = { renderInvoicePdf, renderQuotePdf };
+// Renders a printable pull sheet -- a plain picking list, not a billing
+// document, so there's no pricing on it at all: just what job it's for, who
+// it's for, and a checkbox + item + quantity per row so whoever's gathering
+// stock can physically tick items off while pulling them.
+function renderPullSheetPdf({ companyName, sheet, items }) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: "letter", margin: 50 });
+    const chunks = [];
+    doc.on("data", (chunk) => chunks.push(chunk));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    const headerTop = 50;
+    doc.fontSize(18).fillColor("#000").text(companyName || "Pull Sheet", 50, headerTop, { width: 300 });
+    doc.fontSize(10).fillColor("#666").text("PULL SHEET", 350, headerTop + 4, { width: 200, align: "right" });
+
+    doc.x = 50;
+    doc.y = headerTop + 50;
+    const topY = doc.y;
+    doc.fontSize(10).fillColor("#000");
+    doc.font("Helvetica-Bold").text("For:", 50, topY);
+    doc.font("Helvetica").text(sheet.source_label || "", 90, topY);
+    doc.font("Helvetica-Bold").text("Customer:", 50, topY + 16);
+    doc.font("Helvetica").text(sheet.customer_name || "", 110, topY + 16);
+    doc.font("Helvetica-Bold").text("Built:", 350, topY, { width: 60 });
+    doc.font("Helvetica").text(fmtDate(sheet.created_at), 410, topY, { width: 140 });
+    if (sheet.status === "fulfilled" && sheet.fulfilled_at) {
+      doc.font("Helvetica-Bold").text("Fulfilled:", 350, topY + 16, { width: 60 });
+      doc.font("Helvetica").text(fmtDate(sheet.fulfilled_at), 410, topY + 16, { width: 140 });
+    }
+
+    doc.moveDown(4);
+    const tableTop = doc.y + 16;
+    doc.font("Helvetica-Bold").fontSize(10);
+    doc.text("", 50, tableTop, { width: 24 });
+    doc.text("Item", 84, tableTop);
+    doc.text("Quantity", 470, tableTop, { width: 80, align: "right" });
+    doc.moveTo(50, tableTop + 16).lineTo(550, tableTop + 16).strokeColor("#ccc").stroke();
+
+    doc.font("Helvetica").fontSize(10);
+    let rowY = tableTop + 24;
+    items.forEach((item) => {
+      doc.rect(50, rowY - 2, 14, 14).strokeColor("#666").stroke();
+      doc.text(item.name, 84, rowY, { width: 370 });
+      doc.text(String(item.quantity), 470, rowY, { width: 80, align: "right" });
+      rowY += 26;
+    });
+
+    doc.end();
+  });
+}
+
+module.exports = { renderInvoicePdf, renderQuotePdf, renderPullSheetPdf };
