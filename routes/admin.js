@@ -2931,13 +2931,26 @@ router.get("/inventory", async (req, res) => {
 });
 
 // POST /api/admin/catalog-items/import
-// Body: { items: [{ name, unit_price? }, ...] }
+// Body: { items: [{ name, unit_price?, quantity_on_hand?, unit_cost? }, ...] }
 // Bulk-imports catalog items from a spreadsheet (Excel or CSV, parsed
 // client-side into plain objects and sent here). Mirrors the customer
-// import route: rows missing a name are skipped, and rows whose name
-// case-insensitively matches an existing catalog item -- or an earlier row
-// in the same file -- are skipped as duplicates instead of creating a
-// second entry.
+// import route: rows missing a name are skipped.
+//
+// quantity_on_hand/unit_cost are optional, for importing an existing
+// physical inventory count/cost sheet (rather than just a price list) in one
+// pass. Providing either one turns tracking on for that item automatically,
+// since there'd be no reason to supply a stock count for an item you don't
+// want tracked.
+//
+// Rows whose name case-insensitively matches an existing catalog item are
+// NOT simply skipped like a plain duplicate would be if the row carries a
+// quantity or cost -- instead that existing item's inventory fields are
+// backfilled/updated. This matters for re-running an import: if a sheet was
+// first imported before inventory tracking existed (or before this file had
+// quantity/cost columns), re-importing the same names with quantity/cost
+// added now updates those already-created items instead of silently doing
+// nothing. A duplicate row with no quantity/cost data is still just skipped,
+// same as before.
 router.post("/catalog-items/import", async (req, res) => {
   try {
     const { items } = req.body;
@@ -2948,10 +2961,11 @@ router.post("/catalog-items/import", async (req, res) => {
       return res.status(400).json({ error: "That's more than 2000 rows at once -- please split the file up." });
     }
 
-    const existing = await db.query(`SELECT name FROM catalog_items WHERE company_id = $1`, [req.companyId]);
-    const seenNames = new Set(existing.rows.map((r) => r.name.trim().toLowerCase()));
+    const existing = await db.query(`SELECT id, name FROM catalog_items WHERE company_id = $1`, [req.companyId]);
+    const existingByName = new Map(existing.rows.map((r) => [r.name.trim().toLowerCase(), r.id]));
 
     let imported = 0;
+    let updated = 0;
     const skipped = [];
 
     for (let i = 0; i < items.length; i++) {
@@ -2962,19 +2976,41 @@ router.post("/catalog-items/import", async (req, res) => {
         continue;
       }
       const key = name.toLowerCase();
-      if (seenNames.has(key)) {
-        skipped.push({ row: i + 1, reason: "duplicate", name });
+
+      const hasQuantity = row.quantity_on_hand !== undefined && row.quantity_on_hand !== null && row.quantity_on_hand !== "";
+      const hasCost = row.unit_cost !== undefined && row.unit_cost !== null && row.unit_cost !== "";
+      const quantityOnHand = hasQuantity ? Math.max(0, Math.round(Number(row.quantity_on_hand)) || 0) : 0;
+      const unitCost = hasCost ? Number(row.unit_cost) || 0 : null;
+      const trackInventory = hasQuantity || hasCost;
+
+      const existingId = existingByName.get(key);
+      if (existingId) {
+        if (!trackInventory) {
+          skipped.push({ row: i + 1, reason: "duplicate", name });
+          continue;
+        }
+        await db.query(
+          `UPDATE catalog_items
+           SET track_inventory = true,
+               quantity_on_hand = CASE WHEN $1 THEN $2 ELSE quantity_on_hand END,
+               unit_cost = CASE WHEN $3 THEN $4 ELSE unit_cost END
+           WHERE id = $5 AND company_id = $6`,
+          [hasQuantity, quantityOnHand, hasCost, unitCost, existingId, req.companyId]
+        );
+        updated++;
         continue;
       }
-      seenNames.add(key);
-      await db.query(
-        `INSERT INTO catalog_items (company_id, name, unit_price) VALUES ($1, $2, $3)`,
-        [req.companyId, name, Number(row.unit_price) || 0]
+
+      const inserted = await db.query(
+        `INSERT INTO catalog_items (company_id, name, unit_price, track_inventory, quantity_on_hand, unit_cost)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [req.companyId, name, Number(row.unit_price) || 0, trackInventory, quantityOnHand, unitCost]
       );
+      existingByName.set(key, inserted.rows[0].id);
       imported++;
     }
 
-    res.status(201).json({ imported, skipped });
+    res.status(201).json({ imported, updated, skipped });
   } catch (err) {
     console.error("POST /admin/catalog-items/import failed:", err);
     res.status(500).json({ error: err.message || "Couldn't import catalog items." });
