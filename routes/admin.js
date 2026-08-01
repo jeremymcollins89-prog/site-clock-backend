@@ -1931,7 +1931,31 @@ router.patch("/invoices/:id/void", async (req, res) => {
       [id]
     );
     await releaseHoldsForLineItems(itemsForRelease.rows, req.companyId);
-    res.json(result.rows[0]);
+
+    const invoice = result.rows[0];
+
+    // If this invoice came from a quote, the quote shouldn't keep showing
+    // as "accepted" once the work it was for has been called off -- mark it
+    // void too (distinct from "declined", which means the customer said no;
+    // this means the job/invoice itself got cancelled after being accepted).
+    if (invoice.quote_id) {
+      await db.query(`UPDATE quotes SET status = 'void' WHERE id = $1 AND company_id = $2`, [invoice.quote_id, req.companyId]);
+    }
+
+    // Any pull sheet still open (or reported-pulled but not yet fulfilled)
+    // for this job is no longer relevant -- there's nothing left to pull
+    // for a cancelled invoice. A fulfilled one is left alone since it's
+    // already a real record of inventory that was actually removed.
+    // Matches both a pull sheet already reassigned to this invoice, and one
+    // that was built against the quote and never got that far.
+    await db.query(
+      `DELETE FROM pull_sheets
+       WHERE company_id = $1 AND status != 'fulfilled'
+         AND ((source_type = 'invoice' AND source_id = $2) OR (source_type = 'quote' AND source_id = $3))`,
+      [req.companyId, id, invoice.quote_id]
+    );
+
+    res.json(invoice);
   } catch (err) {
     console.error("PATCH /admin/invoices/:id/void failed:", err);
     res.status(500).json({ error: err.message || "Couldn't void invoice." });
@@ -2372,6 +2396,16 @@ router.patch("/quotes/:id/mark-declined", async (req, res) => {
       [req.params.id]
     );
     await releaseHoldsForLineItems(itemsForRelease.rows, req.companyId);
+
+    // A declined quote isn't happening -- any pull sheet still open (or
+    // reported-pulled but not yet fulfilled) for it is no longer relevant.
+    // A fulfilled one is left alone since it's already a real record of
+    // inventory that was actually removed.
+    await db.query(
+      `DELETE FROM pull_sheets WHERE company_id = $1 AND source_type = 'quote' AND source_id = $2 AND status != 'fulfilled'`,
+      [req.companyId, req.params.id]
+    );
+
     res.json(result.rows[0]);
   } catch (err) {
     console.error("PATCH /admin/quotes/:id/mark-declined failed:", err);
@@ -3020,15 +3054,15 @@ router.get("/catalog-items/:id/holds", async (req, res) => {
 // Lists the open quotes/invoices a pull sheet could be built from -- only
 // ones that actually have at least one inventory-tracked catalog-linked line
 // item (no point offering a job with nothing to pull), and excluding
-// declined quotes / voided invoices. Powers the picker shown when Building a
-// pull sheet.
+// declined/void quotes / voided invoices. Powers the picker shown when
+// Building a pull sheet.
 router.get("/pull-sheets/sources", async (req, res) => {
   try {
     const quotes = await db.query(
       `SELECT q.id, q.quote_number AS number, q.status, c.name AS customer_name
        FROM quotes q
        JOIN customers c ON c.id = q.customer_id
-       WHERE q.company_id = $1 AND q.status != 'declined'
+       WHERE q.company_id = $1 AND q.status NOT IN ('declined', 'void')
          AND EXISTS (
            SELECT 1 FROM quote_line_items qli
            JOIN catalog_items ci ON ci.id = qli.catalog_item_id
@@ -3191,13 +3225,32 @@ router.post("/pull-sheets", async (req, res) => {
     const fkField = source_type === "quote" ? "quote_id" : "invoice_id";
 
     const sourceResult = await db.query(
-      `SELECT s.id, s.${numberField} AS number, c.name AS customer_name
+      `SELECT s.id, s.status, s.${numberField} AS number, c.name AS customer_name
        FROM ${table} s JOIN customers c ON c.id = s.customer_id
        WHERE s.id = $1 AND s.company_id = $2`,
       [source_id, req.companyId]
     );
     if (sourceResult.rowCount === 0) return res.status(404).json({ error: `${source_type === "quote" ? "Quote" : "Invoice"} not found` });
     const source = sourceResult.rows[0];
+
+    const deadStatuses = source_type === "quote" ? ["declined", "void"] : ["void"];
+    if (deadStatuses.includes(source.status)) {
+      return res.status(400).json({ error: `This ${source_type} has been ${source.status} -- nothing to pull for it anymore.` });
+    }
+
+    // Building a second pull sheet for the same job only makes sense once
+    // the first one has actually been fulfilled (see getPulledQuantities --
+    // that's how a partial pull gets topped off later). While one's still
+    // open or just reported-pulled, a second "Build Pull Sheet" click would
+    // just create a confusing duplicate of the exact same not-yet-done
+    // work, so block it here instead.
+    const existingOpen = await db.query(
+      `SELECT id FROM pull_sheets WHERE source_type = $1 AND source_id = $2 AND company_id = $3 AND status != 'fulfilled'`,
+      [source_type, source_id, req.companyId]
+    );
+    if (existingOpen.rowCount > 0) {
+      return res.status(400).json({ error: "This job already has an open pull sheet. Fulfill or cancel it before building another." });
+    }
 
     const lineItemsResult = await db.query(
       `SELECT li.catalog_item_id, li.description, li.quantity
