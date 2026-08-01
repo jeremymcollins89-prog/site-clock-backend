@@ -316,6 +316,10 @@ router.get("/attachments/:id", requireAuth, async (req, res) => {
 // actually changes real inventory numbers).
 
 // GET /api/schedule/pull-sheets
+// Only 'open' sheets are returned -- once an employee marks one pulled (or
+// an admin fulfills it), it's done from the employee's side and drops out
+// of their list entirely. If a reported quantity turns out wrong, the fix
+// happens through the admin now rather than the employee re-opening it.
 router.get("/pull-sheets", requireAuth, async (req, res) => {
   try {
     const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
@@ -330,7 +334,7 @@ router.get("/pull-sheets", requireAuth, async (req, res) => {
                 '[]'::json
               ) AS items
        FROM pull_sheets ps
-       WHERE ps.company_id = $1
+       WHERE ps.company_id = $1 AND ps.status = 'open'
        ORDER BY ps.created_at DESC`,
       [companyId]
     );
@@ -343,9 +347,9 @@ router.get("/pull-sheets", requireAuth, async (req, res) => {
 });
 
 // GET /api/schedule/pull-sheets/unseen-count
-// "Unseen" here just means "not yet fulfilled" -- same idea as the Time off
-// menu badge showing a pending count, no separate per-employee
-// seen-tracking needed. Lightweight, safe to poll.
+// Counts only 'open' sheets now, matching the list above -- once marked
+// pulled it's off the employee's plate, so it shouldn't keep the menu
+// badge lit.
 router.get("/pull-sheets/unseen-count", requireAuth, async (req, res) => {
   try {
     const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
@@ -353,7 +357,7 @@ router.get("/pull-sheets/unseen-count", requireAuth, async (req, res) => {
     const companyId = employeeResult.rows[0].company_id;
 
     const result = await db.query(
-      `SELECT COUNT(*)::int AS count FROM pull_sheets WHERE company_id = $1 AND status != 'fulfilled'`,
+      `SELECT COUNT(*)::int AS count FROM pull_sheets WHERE company_id = $1 AND status = 'open'`,
       [companyId]
     );
     res.json({ count: result.rows[0].count });
@@ -400,9 +404,9 @@ router.get("/pull-sheets/:id", requireAuth, async (req, res) => {
 // anything.
 router.patch("/pull-sheets/:id/pulled", requireAuth, async (req, res) => {
   try {
-    const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
+    const employeeResult = await db.query(`SELECT company_id, name FROM employees WHERE id = $1`, [req.employee.employee_id]);
     if (employeeResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
-    const companyId = employeeResult.rows[0].company_id;
+    const { company_id: companyId, name: employeeName } = employeeResult.rows[0];
 
     const { items } = req.body;
     if (!Array.isArray(items) || items.length === 0) {
@@ -435,7 +439,14 @@ router.patch("/pull-sheets/:id/pulled", requireAuth, async (req, res) => {
       [req.params.id]
     );
 
-    res.json({ ...updated.rows[0], items: itemsResult.rows });
+    const sheet = updated.rows[0];
+    sendPushToAdmin(companyId, {
+      title: "Pull sheet reported",
+      body: `${employeeName} marked "${sheet.source_label}" as pulled -- ready to review and fulfill.`,
+      url: "/admin.html?tab=inventory",
+    }).catch((err) => console.error("Failed to send pull-sheet-pulled notification:", err.message));
+
+    res.json({ ...sheet, items: itemsResult.rows });
   } catch (err) {
     console.error("PATCH /schedule/pull-sheets/:id/pulled failed:", err);
     res.status(500).json({ error: err.message || "Couldn't save what you pulled." });
