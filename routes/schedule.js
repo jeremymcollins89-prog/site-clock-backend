@@ -298,38 +298,41 @@ router.get("/attachments/:id", requireAuth, async (req, res) => {
 });
 
 // ---------- Pull sheets ----------
-// Read-only, employee-facing view of pull sheets. A pull sheet is only ever
-// visible to an employee if it was built from a quote/invoice tied to a job
-// they're assigned to (see job_assignments join below) -- solo/manual pull
-// sheets aren't tied to any job, so they never show up here; they're purely
-// an internal admin tool for restocking, not something to notify a crew
-// about. "Visible" is intentionally not the same as "fulfilled" -- an
-// employee should see a pull sheet as soon as it's built (so they know
-// what's been pulled/is being pulled for their job), not just once an admin
-// marks it fulfilled.
+// Read/write, employee-facing view of pull sheets. Visible to every
+// employee in the company, regardless of source type (quote/invoice/
+// manual) or job assignment -- an earlier version of this only showed a
+// sheet if it could trace a job_assignments link back through the source
+// quote/invoice, but plenty of invoices/quotes are never tied to a
+// scheduled job at all, which meant those pull sheets silently never
+// reached anyone. Company-wide visibility guarantees every pull sheet an
+// admin builds actually shows up for the crew. "Visible" is intentionally
+// not the same as "fulfilled" -- an employee should see a pull sheet as
+// soon as it's built, not just once an admin marks it fulfilled.
+//
+// Status flow: 'open' (nothing reported yet) -> 'pulled' (an employee
+// submitted actual quantities via PATCH .../pulled, see below) ->
+// 'fulfilled' (admin reviewed and confirmed -- see PATCH
+// /api/admin/pull-sheets/:id/fulfill -- this is the only step that
+// actually changes real inventory numbers).
 
 // GET /api/schedule/pull-sheets
 router.get("/pull-sheets", requireAuth, async (req, res) => {
   try {
-    const employeeId = req.employee.employee_id;
-    const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [employeeId]);
+    const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
     if (employeeResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
     const companyId = employeeResult.rows[0].company_id;
 
     const result = await db.query(
-      `SELECT ps.id, ps.source_type, ps.source_label, ps.customer_name, ps.status, ps.created_at, ps.fulfilled_at,
+      `SELECT ps.id, ps.source_type, ps.source_label, ps.customer_name, ps.status, ps.created_at, ps.fulfilled_at, ps.pulled_at,
               COALESCE(
-                (SELECT json_agg(json_build_object('id', psi.id, 'name', psi.name, 'quantity', psi.quantity) ORDER BY psi.name)
+                (SELECT json_agg(json_build_object('id', psi.id, 'name', psi.name, 'quantity', psi.quantity, 'quantity_pulled', psi.quantity_pulled) ORDER BY psi.name)
                  FROM pull_sheet_items psi WHERE psi.pull_sheet_id = ps.id),
                 '[]'::json
               ) AS items
        FROM pull_sheets ps
-       LEFT JOIN invoices inv ON ps.source_type = 'invoice' AND inv.id = ps.source_id
-       LEFT JOIN quotes q ON ps.source_type = 'quote' AND q.id = ps.source_id
-       JOIN job_assignments ja ON ja.job_id = COALESCE(inv.job_id, q.converted_job_id) AND ja.employee_id = $1
-       WHERE ps.company_id = $2
+       WHERE ps.company_id = $1
        ORDER BY ps.created_at DESC`,
-      [employeeId, companyId]
+      [companyId]
     );
 
     res.json(result.rows);
@@ -340,24 +343,18 @@ router.get("/pull-sheets", requireAuth, async (req, res) => {
 });
 
 // GET /api/schedule/pull-sheets/unseen-count
-// "Unseen" here just means "open" (not yet fulfilled) -- same idea as the
-// Time off menu badge showing a pending count, no separate per-employee
+// "Unseen" here just means "not yet fulfilled" -- same idea as the Time off
+// menu badge showing a pending count, no separate per-employee
 // seen-tracking needed. Lightweight, safe to poll.
 router.get("/pull-sheets/unseen-count", requireAuth, async (req, res) => {
   try {
-    const employeeId = req.employee.employee_id;
-    const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [employeeId]);
+    const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
     if (employeeResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
     const companyId = employeeResult.rows[0].company_id;
 
     const result = await db.query(
-      `SELECT COUNT(*)::int AS count
-       FROM pull_sheets ps
-       LEFT JOIN invoices inv ON ps.source_type = 'invoice' AND inv.id = ps.source_id
-       LEFT JOIN quotes q ON ps.source_type = 'quote' AND q.id = ps.source_id
-       JOIN job_assignments ja ON ja.job_id = COALESCE(inv.job_id, q.converted_job_id) AND ja.employee_id = $1
-       WHERE ps.company_id = $2 AND ps.status = 'open'`,
-      [employeeId, companyId]
+      `SELECT COUNT(*)::int AS count FROM pull_sheets WHERE company_id = $1 AND status != 'fulfilled'`,
+      [companyId]
     );
     res.json({ count: result.rows[0].count });
   } catch (err) {
@@ -367,28 +364,21 @@ router.get("/pull-sheets/unseen-count", requireAuth, async (req, res) => {
 });
 
 // GET /api/schedule/pull-sheets/:id
-// Item-level detail for one pull sheet -- same job-assignment visibility
-// check as the list route above, just scoped to a single row.
 router.get("/pull-sheets/:id", requireAuth, async (req, res) => {
   try {
-    const employeeId = req.employee.employee_id;
-    const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [employeeId]);
+    const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
     if (employeeResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
     const companyId = employeeResult.rows[0].company_id;
 
     const sheetResult = await db.query(
-      `SELECT ps.id, ps.source_type, ps.source_label, ps.customer_name, ps.status, ps.created_at, ps.fulfilled_at
-       FROM pull_sheets ps
-       LEFT JOIN invoices inv ON ps.source_type = 'invoice' AND inv.id = ps.source_id
-       LEFT JOIN quotes q ON ps.source_type = 'quote' AND q.id = ps.source_id
-       JOIN job_assignments ja ON ja.job_id = COALESCE(inv.job_id, q.converted_job_id) AND ja.employee_id = $1
-       WHERE ps.id = $2 AND ps.company_id = $3`,
-      [employeeId, req.params.id, companyId]
+      `SELECT id, source_type, source_label, customer_name, status, created_at, fulfilled_at, pulled_at
+       FROM pull_sheets WHERE id = $1 AND company_id = $2`,
+      [req.params.id, companyId]
     );
     if (sheetResult.rowCount === 0) return res.status(404).json({ error: "Pull sheet not found" });
 
     const itemsResult = await db.query(
-      `SELECT id, name, quantity FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY name`,
+      `SELECT id, name, quantity, quantity_pulled FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY name`,
       [req.params.id]
     );
 
@@ -396,6 +386,59 @@ router.get("/pull-sheets/:id", requireAuth, async (req, res) => {
   } catch (err) {
     console.error("GET /schedule/pull-sheets/:id failed:", err);
     res.status(500).json({ error: err.message || "Couldn't load pull sheet." });
+  }
+});
+
+// PATCH /api/schedule/pull-sheets/:id/pulled
+// Body: { items: [{ id, quantity_pulled }] }
+// An employee reports what they actually grabbed off the shelf for each
+// item -- purely informational, does NOT touch real inventory. Moves the
+// sheet from 'open' to 'pulled' (or leaves it 'pulled' if re-submitted --
+// e.g. correcting a number before the admin fulfills it). Blocked once the
+// admin has already fulfilled the sheet, since at that point inventory has
+// already been consumed and reported quantities can no longer change
+// anything.
+router.patch("/pull-sheets/:id/pulled", requireAuth, async (req, res) => {
+  try {
+    const employeeResult = await db.query(`SELECT company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
+    if (employeeResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    const companyId = employeeResult.rows[0].company_id;
+
+    const { items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "No items to report." });
+    }
+
+    const sheetResult = await db.query(`SELECT id, status FROM pull_sheets WHERE id = $1 AND company_id = $2`, [req.params.id, companyId]);
+    if (sheetResult.rowCount === 0) return res.status(404).json({ error: "Pull sheet not found" });
+    if (sheetResult.rows[0].status === "fulfilled") {
+      return res.status(400).json({ error: "This pull sheet has already been fulfilled." });
+    }
+
+    for (const item of items) {
+      if (!item.id) continue;
+      const qty = item.quantity_pulled === "" || item.quantity_pulled == null ? null : Math.max(0, Math.round(Number(item.quantity_pulled)));
+      await db.query(
+        `UPDATE pull_sheet_items SET quantity_pulled = $1 WHERE id = $2 AND pull_sheet_id = $3`,
+        [qty, item.id, req.params.id]
+      );
+    }
+
+    const updated = await db.query(
+      `UPDATE pull_sheets SET status = 'pulled', pulled_at = now(), pulled_by_employee_id = $1
+       WHERE id = $2 RETURNING id, source_type, source_label, customer_name, status, created_at, fulfilled_at, pulled_at`,
+      [req.employee.employee_id, req.params.id]
+    );
+
+    const itemsResult = await db.query(
+      `SELECT id, name, quantity, quantity_pulled FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY name`,
+      [req.params.id]
+    );
+
+    res.json({ ...updated.rows[0], items: itemsResult.rows });
+  } catch (err) {
+    console.error("PATCH /schedule/pull-sheets/:id/pulled failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't save what you pulled." });
   }
 });
 

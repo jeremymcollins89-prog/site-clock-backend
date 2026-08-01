@@ -97,10 +97,16 @@ async function checkLowStock(catalogItemId, companyId) {
 // How much of each catalog item has already been physically removed via a
 // *fulfilled* pull sheet built from this specific quote/invoice. Used so a
 // job's stock never gets consumed twice -- once when a pull sheet is
-// fulfilled, and again when the invoice is later marked paid.
+// fulfilled, and again when the invoice is later marked paid. Sums whatever
+// an employee actually reported pulling (quantity_pulled) when they
+// reported it, falling back to the originally requested quantity for any
+// item nobody reported on -- this has to match what fulfilling the sheet
+// actually consumed (see PATCH /api/admin/pull-sheets/:id/fulfill), or a
+// partial pull would throw off every later "how much is left to pull/pay
+// for" calculation.
 async function getPulledQuantities(sourceType, sourceId, companyId) {
   const result = await db.query(
-    `SELECT psi.catalog_item_id, SUM(psi.quantity) AS total
+    `SELECT psi.catalog_item_id, SUM(COALESCE(psi.quantity_pulled, psi.quantity)) AS total
      FROM pull_sheet_items psi
      JOIN pull_sheets ps ON ps.id = psi.pull_sheet_id
      WHERE ps.source_type = $1 AND ps.source_id = $2 AND ps.company_id = $3 AND ps.status = 'fulfilled'

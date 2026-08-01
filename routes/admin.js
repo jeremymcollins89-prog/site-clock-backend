@@ -3046,7 +3046,7 @@ router.get("/pull-sheets/:id", async (req, res) => {
     const result = await db.query(`SELECT * FROM pull_sheets WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
     if (result.rowCount === 0) return res.status(404).json({ error: "Pull sheet not found" });
     const items = await db.query(
-      `SELECT id, catalog_item_id, name, quantity FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY name`,
+      `SELECT id, catalog_item_id, name, quantity, quantity_pulled FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY name`,
       [id]
     );
     res.json({ ...result.rows[0], items: items.rows });
@@ -3220,8 +3220,17 @@ router.patch("/pull-sheets/:id/fulfill", async (req, res) => {
     const sheet = sheetResult.rows[0];
     if (sheet.status === "fulfilled") return res.status(400).json({ error: "This pull sheet has already been fulfilled." });
 
-    const items = await db.query(`SELECT catalog_item_id, quantity FROM pull_sheet_items WHERE pull_sheet_id = $1`, [id]);
-    await consumeInventoryForLineItems(items.rows, req.companyId);
+    // Prefer whatever the employee actually reported pulling (see PATCH
+    // /api/schedule/pull-sheets/:id/pulled) over the originally requested
+    // quantity -- e.g. they only had 8 in stock when 10 was asked for, or
+    // grabbed a couple extra. Falls back to the requested quantity for any
+    // item nobody ever reported on.
+    const items = await db.query(`SELECT catalog_item_id, quantity, quantity_pulled FROM pull_sheet_items WHERE pull_sheet_id = $1`, [id]);
+    const toConsume = items.rows.map((item) => ({
+      catalog_item_id: item.catalog_item_id,
+      quantity: item.quantity_pulled != null ? item.quantity_pulled : item.quantity,
+    }));
+    await consumeInventoryForLineItems(toConsume, req.companyId);
 
     const updated = await db.query(
       `UPDATE pull_sheets SET status = 'fulfilled', fulfilled_at = now() WHERE id = $1 RETURNING *`,
