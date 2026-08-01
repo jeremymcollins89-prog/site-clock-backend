@@ -2974,6 +2974,48 @@ router.get("/inventory", async (req, res) => {
   }
 });
 
+// GET /api/admin/catalog-items/:id/holds
+// Lists every quote/invoice currently responsible for this item's
+// quantity_on_hold, so clicking an "on hold" number can answer "held by
+// what, exactly". Only counts sources that still actually hold a
+// reservation right now, matching the same rules placeHoldsForLineItems/
+// releaseHoldsForLineItems apply everywhere else:
+//   - Invoices: 'draft' or 'sent' only -- 'paid' already consumed the hold
+//     (not still "on hold"), 'void' already released it.
+//   - Quotes: 'draft', 'sent', or 'accepted' AND not yet converted to an
+//     invoice -- 'declined' already released it, and once a quote is
+//     converted the same reservation carries forward to the new invoice
+//     (see convert-to-invoice) rather than being held twice, so a
+//     converted quote is deliberately excluded here to avoid double-listing
+//     the same hold under both the quote and its invoice.
+router.get("/catalog-items/:id/holds", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const owns = await db.query(`SELECT id FROM catalog_items WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Item not found" });
+
+    const result = await db.query(
+      `SELECT 'invoice' AS source_type, i.id, i.invoice_number AS number, i.status, c.name AS customer_name, ili.quantity
+       FROM invoice_line_items ili
+       JOIN invoices i ON i.id = ili.invoice_id
+       JOIN customers c ON c.id = i.customer_id
+       WHERE ili.catalog_item_id = $1 AND i.company_id = $2 AND i.status IN ('draft', 'sent')
+       UNION ALL
+       SELECT 'quote' AS source_type, q.id, q.quote_number AS number, q.status, c.name AS customer_name, qli.quantity
+       FROM quote_line_items qli
+       JOIN quotes q ON q.id = qli.quote_id
+       JOIN customers c ON c.id = q.customer_id
+       WHERE qli.catalog_item_id = $1 AND q.company_id = $2 AND q.status IN ('draft', 'sent', 'accepted') AND q.converted_invoice_id IS NULL
+       ORDER BY source_type, number`,
+      [id, req.companyId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/catalog-items/:id/holds failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load what's holding this item." });
+  }
+});
+
 // GET /api/admin/pull-sheets/sources
 // Lists the open quotes/invoices a pull sheet could be built from -- only
 // ones that actually have at least one inventory-tracked catalog-linked line
