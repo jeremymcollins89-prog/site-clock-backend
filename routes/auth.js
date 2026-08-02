@@ -57,6 +57,7 @@ router.post("/login", loginRateLimit, async (req, res) => {
         auto_clockin_time: employee.auto_clockin_time,
         clock_in_animation: employee.clock_in_animation,
         break_minutes: employee.break_minutes,
+        can_manage_inventory: employee.can_manage_inventory,
       },
     });
   } catch (err) {
@@ -148,7 +149,7 @@ const requireAuth = require("../middleware/requireAuth");
 router.get("/me", requireAuth, async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT e.id, e.name, e.email, e.clock_in_animation, e.break_minutes, c.shop_lat, c.shop_lng, c.shop_radius_m, c.auto_clockout_time, c.auto_clockin_time
+      `SELECT e.id, e.name, e.email, e.clock_in_animation, e.break_minutes, e.can_manage_inventory, c.shop_lat, c.shop_lng, c.shop_radius_m, c.auto_clockout_time, c.auto_clockin_time
        FROM employees e
        LEFT JOIN companies c ON c.id = e.company_id
        WHERE e.id = $1`,
