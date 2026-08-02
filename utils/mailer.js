@@ -41,7 +41,7 @@ function fmtTime(d) {
 // payrollEmail: this employee's own company's payroll inbox — never a
 // global fallback, since that would risk sending one company's timesheet
 // data to a different company's owner.
-async function sendTimesheetEmail({ employee, period, entries, payrollEmail }) {
+async function sendTimesheetEmail({ employee, period, entries, payrollEmail, autoSubmitted = false }) {
   const totalSeconds = entries.reduce((s, e) => s + Number(e.worked_seconds || 0), 0);
 
   const rows = entries
@@ -60,6 +60,7 @@ async function sendTimesheetEmail({ employee, period, entries, payrollEmail }) {
   const html = `
     <div style="font-family: -apple-system, sans-serif;">
       <h2>Timesheet — ${employee.name}</h2>
+      ${autoSubmitted ? `<p style="color:#b45309;">Submitted automatically — ${employee.name} didn't submit before payday, so these hours went in as-is.</p>` : ""}
       <p>Pay period: ${fmtDate(period.start)} – ${fmtDate(period.end)}</p>
       <p><strong>Total: ${fmtDuration(totalSeconds)}</strong></p>
       <table style="border-collapse: collapse; width: 100%;">
@@ -87,7 +88,7 @@ async function sendTimesheetEmail({ employee, period, entries, payrollEmail }) {
       from: FROM_ADDRESS,
       to: [payrollEmail],
       cc: [employee.email],
-      subject: `Timesheet — ${employee.name} — ${fmtDate(period.start)} to ${fmtDate(period.end)}`,
+      subject: `Timesheet${autoSubmitted ? " (auto-submitted)" : ""} — ${employee.name} — ${fmtDate(period.start)} to ${fmtDate(period.end)}`,
       html,
     }),
   });

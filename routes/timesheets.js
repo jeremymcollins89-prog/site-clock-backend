@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const { getPayPeriod } = require("../utils/payPeriod");
-const { sendTimesheetEmail } = require("../utils/mailer");
+const { submitTimesheetForEmployee } = require("../utils/timesheetSubmission");
 const requireAuth = require("../middleware/requireAuth");
 
 // POST /api/timesheets/submit
@@ -36,37 +36,19 @@ router.post("/submit", requireAuth, async (req, res) => {
     pay_period_custom_days: employee.pay_period_custom_days,
   });
 
-  const entriesResult = await db.query(
-    `SELECT * FROM time_entry_durations
-     WHERE employee_id = $1
-       AND clock_out IS NOT NULL
-       AND clock_out BETWEEN $2 AND $3
-       AND submitted_at IS NULL
-     ORDER BY clock_in ASC`,
-    [employee_id, period.start, period.end]
-  );
-
-  if (entriesResult.rowCount === 0) {
-    return res.status(400).json({ error: "No unsubmitted hours in the current pay period" });
-  }
-
+  let result;
   try {
-    await sendTimesheetEmail({ employee, period, entries: entriesResult.rows, payrollEmail: employee.payroll_email });
+    result = await submitTimesheetForEmployee({ employee, payrollEmail: employee.payroll_email, period });
   } catch (err) {
     console.error("Failed to send timesheet email:", err.message);
     return res.status(502).json({ error: `Couldn't send the timesheet email: ${err.message}` });
   }
 
-  const ids = entriesResult.rows.map((e) => e.time_entry_id);
-  await db.query(
-    `UPDATE time_entries SET submitted_at = now() WHERE id = ANY($1::uuid[])`,
-    [ids]
-  );
+  if (!result) {
+    return res.status(400).json({ error: "No unsubmitted hours in the current pay period" });
+  }
 
-  res.json({
-    submitted: entriesResult.rowCount,
-    period,
-  });
+  res.json(result);
 });
 
 module.exports = router;

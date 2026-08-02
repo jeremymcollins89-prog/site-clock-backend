@@ -45,6 +45,7 @@ const routingRoutes = require("./routes/routing");
 const attachmentsRoutes = require("./routes/attachments");
 const { checkAndSendReminders } = require("./utils/invoiceReminders");
 const { checkAndSendLongShiftAlerts } = require("./utils/longShiftAlerts");
+const { checkAndAutoSubmitTimesheets } = require("./utils/autoSubmitTimesheets");
 
 const app = express();
 
@@ -148,6 +149,20 @@ cron.schedule("*/10 * * * *", () => {
     .then((sent) => console.log(`Long shift alert job sent ${sent} alert(s).`))
     .catch((err) => {
       console.error("Long shift alert job failed:", err);
+      Sentry.captureException(err);
+    });
+});
+
+// Runs hourly, same pattern as the invoice reminder job above -- catches any
+// employee who didn't submit their hours before payday and auto-submits
+// them so payroll still gets sent on time. TARGET_LOCAL_HOUR in
+// utils/autoSubmitTimesheets.js decides the actual moment per company, using
+// that company's own timezone.
+cron.schedule("0 * * * *", () => {
+  checkAndAutoSubmitTimesheets()
+    .then((sent) => console.log(`Auto-submit timesheet job submitted ${sent} entrie(s).`))
+    .catch((err) => {
+      console.error("Auto-submit timesheet job failed:", err);
       Sentry.captureException(err);
     });
 });
