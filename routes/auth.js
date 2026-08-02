@@ -78,6 +78,67 @@ router.post("/activity-ping", requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// POST /api/auth/snake-score
+// Body: { score }
+// Authenticated. Fed by the hidden Snake easter egg's game-over handler.
+// Upserts this employee's personal best (name/company snapshotted fresh each
+// time) -- GREATEST means a lower score than their existing best never
+// overwrites it, so this is safe to call after every game, not just new
+// records. Returns their (possibly-unchanged) personal best so the frontend
+// can trust the server's number over its own optimistic local one.
+router.post("/snake-score", requireAuth, async (req, res) => {
+  try {
+    const score = Math.round(Number(req.body.score));
+    if (!Number.isFinite(score) || score < 0 || score > 5000) {
+      return res.status(400).json({ error: "Invalid score" });
+    }
+    const empResult = await db.query(
+      `SELECT e.name, co.name AS company_name
+       FROM employees e
+       LEFT JOIN companies co ON co.id = e.company_id
+       WHERE e.id = $1`,
+      [req.employee.employee_id]
+    );
+    if (empResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    const { name, company_name } = empResult.rows[0];
+
+    const result = await db.query(
+      `INSERT INTO snake_scores (employee_id, employee_name, company_name, best_score)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (employee_id) DO UPDATE SET
+         best_score = GREATEST(snake_scores.best_score, EXCLUDED.best_score),
+         employee_name = EXCLUDED.employee_name,
+         company_name = EXCLUDED.company_name,
+         updated_at = now()
+       RETURNING best_score`,
+      [req.employee.employee_id, name, company_name, score]
+    );
+    res.json({ best_score: result.rows[0].best_score });
+  } catch (err) {
+    console.error("POST /auth/snake-score failed:", err);
+    res.status(500).json({ error: "Couldn't save score." });
+  }
+});
+
+// GET /api/auth/snake-leaderboard
+// Authenticated (any logged-in employee at any company can see it -- that's
+// the whole point of a platform-wide leaderboard). Top 10 personal bests,
+// highest first.
+router.get("/snake-leaderboard", requireAuth, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT employee_name, company_name, best_score
+       FROM snake_scores
+       ORDER BY best_score DESC, updated_at ASC
+       LIMIT 10`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /auth/snake-leaderboard failed:", err);
+    res.status(500).json({ error: "Couldn't load leaderboard." });
+  }
+});
+
 // POST /api/auth/forgot-pin
 // Body: { email }
 // Public — no auth required, since the whole point is recovering access.
