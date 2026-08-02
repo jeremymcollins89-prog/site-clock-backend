@@ -19,9 +19,13 @@ router.post("/signup", loginRateLimit, async (req, res) => {
       return res.status(409).json({ error: "An account with that email already exists" });
     }
     const password_hash = await bcrypt.hash(admin_password, 12);
+    // last_active_at is set right at creation -- signing up is itself a real
+    // use of the app, not a "never used" account waiting on some later login
+    // to register. Without this, a brand-new company would show as dormant
+    // on the platform dashboard until its very next authenticated request.
     const result = await db.query(
-      `INSERT INTO companies (name, admin_email, admin_password_hash)
-       VALUES ($1, $2, $3) RETURNING id, name, admin_email`,
+      `INSERT INTO companies (name, admin_email, admin_password_hash, last_active_at)
+       VALUES ($1, $2, $3, now()) RETURNING id, name, admin_email`,
       [company_name, admin_email, password_hash]
     );
     const company = result.rows[0];
