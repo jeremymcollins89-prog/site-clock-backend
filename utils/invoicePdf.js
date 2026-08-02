@@ -16,6 +16,26 @@ function fmtDate(d) {
   return new Date(d).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
 }
 
+// Draws a customer's identity for a "Bill to:"/"Prepared for:" block. When a
+// company name is on file, that's what should read first and bold -- a
+// business's own paperwork/checks reference the company, not necessarily
+// whichever person happened to be the contact -- with the person's name
+// underneath in normal weight. Falls back to just the person's name (bold)
+// when there's no company on file. Returns the y position right after the
+// name block so the caller can keep stacking email/phone/address below it.
+function drawCustomerIdentity(doc, customer, x, y) {
+  let cursorY = y;
+  if (customer.company_name) {
+    doc.font("Helvetica-Bold").text(customer.company_name, x, cursorY);
+    cursorY += 14;
+    doc.font("Helvetica").text(customer.name, x, cursorY);
+  } else {
+    doc.font("Helvetica-Bold").text(customer.name, x, cursorY);
+    doc.font("Helvetica");
+  }
+  return cursorY + 14;
+}
+
 // Renders a single-page invoice PDF and resolves with a Buffer. logoBuffer
 // is optional (a company's uploaded logo, read straight from the bytea
 // column) -- if present it's drawn top-left and the company name shifts
@@ -52,10 +72,7 @@ function renderInvoicePdf({ companyName, invoice, customer, lineItems, logoBuffe
 
     const topY = doc.y;
     doc.fontSize(10).fillColor("#000").text("Bill to:", 50, topY);
-    doc.font("Helvetica-Bold").text(customer.name, 50, topY + 14);
-    doc.font("Helvetica");
-    let billY = topY + 28;
-    if (customer.company_name) { doc.text(customer.company_name, 50, billY); billY += 14; }
+    let billY = drawCustomerIdentity(doc, customer, 50, topY + 14);
     if (customer.email) { doc.text(customer.email, 50, billY); billY += 14; }
     if (customer.phone) { doc.text(customer.phone, 50, billY); billY += 14; }
     const addressParts = [customer.street, [customer.city, customer.state].filter(Boolean).join(", "), customer.zip]
@@ -150,10 +167,7 @@ function renderQuotePdf({ companyName, quote, customer, lineItems, logoBuffer })
 
     const topY = doc.y;
     doc.fontSize(10).fillColor("#000").text("Prepared for:", 50, topY);
-    doc.font("Helvetica-Bold").text(customer.name, 50, topY + 14);
-    doc.font("Helvetica");
-    let billY = topY + 28;
-    if (customer.company_name) { doc.text(customer.company_name, 50, billY); billY += 14; }
+    let billY = drawCustomerIdentity(doc, customer, 50, topY + 14);
     if (customer.email) { doc.text(customer.email, 50, billY); billY += 14; }
     if (customer.phone) { doc.text(customer.phone, 50, billY); billY += 14; }
     const addressParts = [customer.street, [customer.city, customer.state].filter(Boolean).join(", "), customer.zip]
@@ -232,7 +246,14 @@ function renderPullSheetPdf({ companyName, sheet, items }) {
     doc.font("Helvetica-Bold").text("For:", 50, topY);
     doc.font("Helvetica").text(sheet.source_label || "", 90, topY);
     doc.font("Helvetica-Bold").text("Customer:", 50, topY + 16);
-    doc.font("Helvetica").text(sheet.customer_name || "", 110, topY + 16);
+    // Company name leads (when the customer has one on file), person's name
+    // after in parens -- same "company first" treatment as the invoice/quote
+    // Bill to/Prepared for blocks, just kept to one line here since this is
+    // a compact picking-list header, not a full address block.
+    const pullSheetCustomerLabel = sheet.customer_company_name
+      ? `${sheet.customer_company_name} (${sheet.customer_name || ""})`
+      : (sheet.customer_name || "");
+    doc.font("Helvetica").text(pullSheetCustomerLabel, 110, topY + 16);
     doc.font("Helvetica-Bold").text("Built:", 350, topY, { width: 60 });
     doc.font("Helvetica").text(fmtDate(sheet.created_at), 410, topY, { width: 140 });
     if (sheet.status === "fulfilled" && sheet.fulfilled_at) {

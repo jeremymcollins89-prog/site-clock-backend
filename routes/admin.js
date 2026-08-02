@@ -1076,7 +1076,7 @@ router.get("/jobs", async (req, res) => {
 
     const result = await db.query(
       `SELECT j.id, j.title, j.notes, j.start_date, j.end_date, j.start_time, j.color, j.event_type, j.created_at,
-              j.customer_id, c.name AS customer_name, c.phone AS customer_phone,
+              j.customer_id, c.name AS customer_name, c.company_name AS customer_company_name, c.phone AS customer_phone,
               c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip,
               COALESCE(
                 json_agg(
@@ -1485,7 +1485,7 @@ router.get("/invoices", async (req, res) => {
       `SELECT i.id, i.invoice_number, i.status, i.payment_terms, i.payment_method, i.check_number,
               i.issue_date, i.due_date, i.subtotal, i.tax_rate, i.tax_amount, i.total,
               i.sent_at, i.paid_at, i.created_at, i.reminder_count, i.last_reminder_sent_at,
-              i.allow_partial_payments, i.customer_id, c.name AS customer_name,
+              i.allow_partial_payments, i.customer_id, c.name AS customer_name, c.company_name AS customer_company_name,
               (i.status = 'sent' AND i.due_date < CURRENT_DATE) AS is_overdue,
               COALESCE((SELECT SUM(ip.amount) FROM invoice_payments ip WHERE ip.invoice_id = i.id), 0) AS amount_paid
        FROM invoices i
@@ -1510,7 +1510,7 @@ router.get("/invoices/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
-      `SELECT i.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+      `SELECT i.*, c.name AS customer_name, c.company_name AS customer_company_name, c.email AS customer_email, c.phone AS customer_phone,
               c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip,
               (i.status = 'sent' AND i.due_date < CURRENT_DATE) AS is_overdue
        FROM invoices i
@@ -2146,7 +2146,7 @@ router.get("/quotes", async (req, res) => {
       `SELECT q.id, q.quote_number, q.status, q.issue_date, q.expiration_date,
               q.subtotal, q.tax_rate, q.tax_amount, q.total, q.sent_at, q.created_at,
               q.converted_job_id, q.converted_invoice_id,
-              q.customer_id, c.name AS customer_name,
+              q.customer_id, c.name AS customer_name, c.company_name AS customer_company_name,
               (q.status = 'sent' AND q.expiration_date IS NOT NULL AND q.expiration_date < CURRENT_DATE) AS is_expired
        FROM quotes q
        JOIN customers c ON c.id = q.customer_id
@@ -2166,7 +2166,7 @@ router.get("/quotes/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
-      `SELECT q.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+      `SELECT q.*, c.name AS customer_name, c.company_name AS customer_company_name, c.email AS customer_email, c.phone AS customer_phone,
               c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip,
               (q.status = 'sent' AND q.expiration_date IS NOT NULL AND q.expiration_date < CURRENT_DATE) AS is_expired
        FROM quotes q
@@ -2902,7 +2902,7 @@ router.get("/reports/payments", async (req, res) => {
     if (!start || !end) return res.status(400).json({ error: "start and end are required" });
 
     const result = await db.query(
-      `SELECT ip.id, ip.invoice_id, i.invoice_number, c.name AS customer_name,
+      `SELECT ip.id, ip.invoice_id, i.invoice_number, c.name AS customer_name, c.company_name AS customer_company_name,
               ip.amount, ip.payment_method, ip.check_number, ip.paid_at,
               i.status AS invoice_status, i.total AS invoice_total
        FROM invoice_payments ip
@@ -3287,13 +3287,13 @@ router.get("/catalog-items/:id/holds", async (req, res) => {
     if (owns.rowCount === 0) return res.status(404).json({ error: "Item not found" });
 
     const result = await db.query(
-      `SELECT 'invoice' AS source_type, i.id, ('Invoice #' || i.invoice_number) AS label, i.status, c.name AS customer_name, ili.quantity
+      `SELECT 'invoice' AS source_type, i.id, ('Invoice #' || i.invoice_number) AS label, i.status, c.name AS customer_name, c.company_name AS customer_company_name, ili.quantity
        FROM invoice_line_items ili
        JOIN invoices i ON i.id = ili.invoice_id
        JOIN customers c ON c.id = i.customer_id
        WHERE ili.catalog_item_id = $1 AND i.company_id = $2 AND i.status IN ('draft', 'sent')
        UNION ALL
-       SELECT 'pull_sheet' AS source_type, ps.id, ps.source_label AS label, ps.status, ps.customer_name, psi.quantity
+       SELECT 'pull_sheet' AS source_type, ps.id, ps.source_label AS label, ps.status, ps.customer_name, ps.customer_company_name, psi.quantity
        FROM pull_sheet_items psi
        JOIN pull_sheets ps ON ps.id = psi.pull_sheet_id
        WHERE psi.catalog_item_id = $1 AND ps.company_id = $2 AND ps.status != 'fulfilled' AND ps.source_type IN ('quote', 'manual')
@@ -3316,7 +3316,7 @@ router.get("/catalog-items/:id/holds", async (req, res) => {
 router.get("/pull-sheets/sources", async (req, res) => {
   try {
     const quotes = await db.query(
-      `SELECT q.id, q.quote_number AS number, q.status, c.name AS customer_name
+      `SELECT q.id, q.quote_number AS number, q.status, c.name AS customer_name, c.company_name AS customer_company_name
        FROM quotes q
        JOIN customers c ON c.id = q.customer_id
        WHERE q.company_id = $1 AND q.status NOT IN ('declined', 'void')
@@ -3329,7 +3329,7 @@ router.get("/pull-sheets/sources", async (req, res) => {
       [req.companyId]
     );
     const invoices = await db.query(
-      `SELECT i.id, i.invoice_number AS number, i.status, c.name AS customer_name
+      `SELECT i.id, i.invoice_number AS number, i.status, c.name AS customer_name, c.company_name AS customer_company_name
        FROM invoices i
        JOIN customers c ON c.id = i.customer_id
        WHERE i.company_id = $1 AND i.status != 'void'
@@ -3354,7 +3354,7 @@ router.get("/pull-sheets/sources", async (req, res) => {
 router.get("/pull-sheets", async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT ps.id, ps.source_type, ps.source_id, ps.source_label, ps.customer_name, ps.status,
+      `SELECT ps.id, ps.source_type, ps.source_id, ps.source_label, ps.customer_name, ps.customer_company_name, ps.status,
               ps.created_at, ps.fulfilled_at,
               COALESCE(SUM(psi.quantity), 0) AS item_count
        FROM pull_sheets ps
@@ -3486,7 +3486,7 @@ router.post("/pull-sheets", async (req, res) => {
     const fkField = source_type === "quote" ? "quote_id" : "invoice_id";
 
     const sourceResult = await db.query(
-      `SELECT s.id, s.status, s.${numberField} AS number, c.name AS customer_name
+      `SELECT s.id, s.status, s.${numberField} AS number, c.name AS customer_name, c.company_name AS customer_company_name
        FROM ${table} s JOIN customers c ON c.id = s.customer_id
        WHERE s.id = $1 AND s.company_id = $2`,
       [source_id, req.companyId]
@@ -3539,9 +3539,9 @@ router.post("/pull-sheets", async (req, res) => {
 
     const sourceLabel = `${source_type === "quote" ? "Quote" : "Invoice"} #${source.number}`;
     const sheetResult = await db.query(
-      `INSERT INTO pull_sheets (company_id, source_type, source_id, source_label, customer_name)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [req.companyId, source_type, source_id, sourceLabel, source.customer_name]
+      `INSERT INTO pull_sheets (company_id, source_type, source_id, source_label, customer_name, customer_company_name)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [req.companyId, source_type, source_id, sourceLabel, source.customer_name, source.customer_company_name]
     );
     const sheet = sheetResult.rows[0];
 
