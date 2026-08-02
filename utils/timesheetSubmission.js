@@ -10,7 +10,7 @@ const { sendTimesheetEmail } = require("./mailer");
 // Returns null (does nothing, sends nothing) if there's nothing unsubmitted
 // in this period -- callers decide what that means for them (the manual
 // route turns it into a 400, the cron job just moves on).
-async function submitTimesheetForEmployee({ employee, payrollEmail, period, autoSubmitted = false }) {
+async function submitTimesheetForEmployee({ employee, payrollEmail, period, autoSubmitted = false, timezone }) {
   const entriesResult = await db.query(
     `SELECT * FROM time_entry_durations
      WHERE employee_id = $1
@@ -23,7 +23,7 @@ async function submitTimesheetForEmployee({ employee, payrollEmail, period, auto
 
   if (entriesResult.rowCount === 0) return null;
 
-  await sendTimesheetEmail({ employee, period, entries: entriesResult.rows, payrollEmail, autoSubmitted });
+  await sendTimesheetEmail({ employee, period, entries: entriesResult.rows, payrollEmail, autoSubmitted, timezone });
 
   const ids = entriesResult.rows.map((e) => e.time_entry_id);
   await db.query(

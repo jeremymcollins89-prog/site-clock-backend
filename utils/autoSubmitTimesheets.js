@@ -85,6 +85,7 @@ async function checkAndAutoSubmitTimesheets() {
             payrollEmail: company.payroll_email,
             period,
             autoSubmitted: true,
+            timezone: company.timezone,
           });
           if (result) submitted += result.submitted;
 

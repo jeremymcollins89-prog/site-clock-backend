@@ -29,29 +29,42 @@ function fmtDuration(totalSeconds) {
   return h === 0 ? `${m}m` : `${h}h ${m}m`;
 }
 
-function fmtDate(d) {
-  return new Date(d).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+// timezone is optional and only passed by the timesheet email below --
+// every other caller (invoice/quote due dates, reminders, etc.) leaves it
+// out and gets the old behavior (the server's own local time), which is
+// correct for those since those are plain calendar DATE fields, not a
+// moment in time that could land on a different day depending on zone.
+function fmtDate(d, timezone) {
+  return new Date(d).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: timezone || undefined });
 }
 
-function fmtTime(d) {
-  return new Date(d).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+function fmtTime(d, timezone) {
+  return new Date(d).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: timezone || undefined });
 }
 
 // entries: rows from time_entry_durations for one employee + pay period.
 // payrollEmail: this employee's own company's payroll inbox — never a
 // global fallback, since that would risk sending one company's timesheet
 // data to a different company's owner.
-async function sendTimesheetEmail({ employee, period, entries, payrollEmail, autoSubmitted = false }) {
+// timezone: the company's own IANA zone (companies.timezone). clock_in/
+// clock_out are stored as real UTC instants, so without this, the times
+// below rendered in whatever timezone the server happens to run in
+// (Railway defaults to UTC) instead of the zone the employee actually
+// punched in from -- which is exactly what the employee PWA itself shows,
+// since it renders times in the device's own local zone. Passing the
+// company's zone here is what keeps the emailed timesheet matching what
+// the employee actually saw when they clocked in/out.
+async function sendTimesheetEmail({ employee, period, entries, payrollEmail, autoSubmitted = false, timezone }) {
   const totalSeconds = entries.reduce((s, e) => s + Number(e.worked_seconds || 0), 0);
 
   const rows = entries
     .map(
       (e) => `
         <tr>
-          <td style="padding:4px 8px;">${fmtDate(e.clock_in)}</td>
+          <td style="padding:4px 8px;">${fmtDate(e.clock_in, timezone)}</td>
           <td style="padding:4px 8px;">${e.job_name}</td>
           <td style="padding:4px 8px;">${e.location_type === "in_town" ? "In town" : "Traveling"}</td>
-          <td style="padding:4px 8px;">${fmtTime(e.clock_in)}–${fmtTime(e.clock_out)}</td>
+          <td style="padding:4px 8px;">${fmtTime(e.clock_in, timezone)}–${fmtTime(e.clock_out, timezone)}</td>
           <td style="padding:4px 8px;">${fmtDuration(e.worked_seconds)}</td>
         </tr>`
     )
@@ -61,7 +74,7 @@ async function sendTimesheetEmail({ employee, period, entries, payrollEmail, aut
     <div style="font-family: -apple-system, sans-serif;">
       <h2>Timesheet — ${employee.name}</h2>
       ${autoSubmitted ? `<p style="color:#b45309;">Submitted automatically — ${employee.name} didn't submit before payday, so these hours went in as-is.</p>` : ""}
-      <p>Pay period: ${fmtDate(period.start)} – ${fmtDate(period.end)}</p>
+      <p>Pay period: ${fmtDate(period.start, timezone)} – ${fmtDate(period.end, timezone)}</p>
       <p><strong>Total: ${fmtDuration(totalSeconds)}</strong></p>
       <table style="border-collapse: collapse; width: 100%;">
         <thead>
@@ -88,7 +101,7 @@ async function sendTimesheetEmail({ employee, period, entries, payrollEmail, aut
       from: FROM_ADDRESS,
       to: [payrollEmail],
       cc: [employee.email],
-      subject: `Timesheet${autoSubmitted ? " (auto-submitted)" : ""} — ${employee.name} — ${fmtDate(period.start)} to ${fmtDate(period.end)}`,
+      subject: `Timesheet${autoSubmitted ? " (auto-submitted)" : ""} — ${employee.name} — ${fmtDate(period.start, timezone)} to ${fmtDate(period.end, timezone)}`,
       html,
     }),
   });

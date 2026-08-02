@@ -13,7 +13,7 @@ router.post("/submit", requireAuth, async (req, res) => {
   const employee_id = req.employee.employee_id;
 
   const employeeResult = await db.query(
-    `SELECT e.*, c.payroll_email, c.pay_frequency, c.pay_period_anchor, c.pay_period_custom_days
+    `SELECT e.*, c.payroll_email, c.pay_frequency, c.pay_period_anchor, c.pay_period_custom_days, c.timezone
      FROM employees e
      LEFT JOIN companies c ON c.id = e.company_id
      WHERE e.id = $1`,
@@ -38,7 +38,7 @@ router.post("/submit", requireAuth, async (req, res) => {
 
   let result;
   try {
-    result = await submitTimesheetForEmployee({ employee, payrollEmail: employee.payroll_email, period });
+    result = await submitTimesheetForEmployee({ employee, payrollEmail: employee.payroll_email, period, timezone: employee.timezone });
   } catch (err) {
     console.error("Failed to send timesheet email:", err.message);
     return res.status(502).json({ error: `Couldn't send the timesheet email: ${err.message}` });
