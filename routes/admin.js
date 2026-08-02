@@ -3151,7 +3151,7 @@ router.delete("/expenses/:id", async (req, res) => {
 router.get("/catalog-items", async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT id, name, unit_price, created_at,
+      `SELECT id, name, unit_price, barcode, created_at,
               track_inventory, quantity_on_hand, quantity_on_hold, unit_cost, low_stock_threshold
        FROM catalog_items WHERE company_id = $1 ORDER BY name`,
       [req.companyId]
@@ -3163,19 +3163,73 @@ router.get("/catalog-items", async (req, res) => {
   }
 });
 
+// GET /api/admin/catalog-items/lookup-barcode/:barcode
+// Powers "scan to restock/add": checks the company's own catalog first (an
+// existing item -> the caller bumps its quantity_on_hand) before falling
+// back to a free public UPC database to suggest a name for a brand-new item.
+// The external lookup is best-effort only -- trade/industrial barcodes often
+// aren't in these consumer-goods-oriented databases, so a miss there isn't
+// an error, just an empty suggestion (the admin types the name in by hand).
+router.get("/catalog-items/lookup-barcode/:barcode", async (req, res) => {
+  try {
+    const barcode = String(req.params.barcode || "").trim();
+    if (!barcode) return res.status(400).json({ error: "barcode is required" });
+
+    const existing = await db.query(
+      `SELECT id, name, unit_price, barcode, created_at,
+              track_inventory, quantity_on_hand, quantity_on_hold, unit_cost, low_stock_threshold
+       FROM catalog_items WHERE company_id = $1 AND barcode = $2`,
+      [req.companyId, barcode]
+    );
+    if (existing.rowCount > 0) {
+      return res.json({ found_in_catalog: true, item: existing.rows[0] });
+    }
+
+    let suggestion = null;
+    try {
+      const upcResp = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(barcode)}`, {
+        headers: { Accept: "application/json" },
+      });
+      if (upcResp.ok) {
+        const upcData = await upcResp.json();
+        const found = upcData.items && upcData.items[0];
+        if (found) {
+          suggestion = { name: found.title || found.brand || null, brand: found.brand || null };
+        }
+      }
+    } catch (lookupErr) {
+      console.error("UPC lookup failed (non-fatal):", lookupErr.message);
+    }
+
+    res.json({ found_in_catalog: false, suggestion });
+  } catch (err) {
+    console.error("GET /admin/catalog-items/lookup-barcode failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't look up that barcode." });
+  }
+});
+
 // POST /api/admin/catalog-items
-// Body: { name, unit_price }
+// Body: { name, unit_price, barcode? }
 router.post("/catalog-items", async (req, res) => {
   try {
-    const { name, unit_price } = req.body;
+    const { name, unit_price, barcode } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
+    const cleanBarcode = barcode ? String(barcode).trim() : null;
+    if (cleanBarcode) {
+      const dupe = await db.query(
+        `SELECT id FROM catalog_items WHERE company_id = $1 AND barcode = $2`,
+        [req.companyId, cleanBarcode]
+      );
+      if (dupe.rowCount > 0) return res.status(400).json({ error: "Another catalog item already uses this barcode." });
+    }
     const result = await db.query(
-      `INSERT INTO catalog_items (company_id, name, unit_price) VALUES ($1, $2, $3)
-       RETURNING id, name, unit_price, created_at`,
-      [req.companyId, name, Number(unit_price) || 0]
+      `INSERT INTO catalog_items (company_id, name, unit_price, barcode) VALUES ($1, $2, $3, $4)
+       RETURNING id, name, unit_price, barcode, created_at`,
+      [req.companyId, name, Number(unit_price) || 0, cleanBarcode]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
+    if (err.code === "23505") return res.status(400).json({ error: "Another catalog item already uses this barcode." });
     console.error("POST /admin/catalog-items failed:", err);
     res.status(500).json({ error: err.message || "Couldn't create catalog item." });
   }
@@ -3193,7 +3247,7 @@ router.post("/catalog-items", async (req, res) => {
 router.patch("/catalog-items/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, unit_price, track_inventory, quantity_on_hand, unit_cost, low_stock_threshold } = req.body;
+    const { name, unit_price, barcode, track_inventory, quantity_on_hand, unit_cost, low_stock_threshold } = req.body;
     const owns = await db.query(`SELECT id FROM catalog_items WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
     if (owns.rowCount === 0) return res.status(404).json({ error: "Catalog item not found" });
 
@@ -3201,6 +3255,17 @@ router.patch("/catalog-items/:id", async (req, res) => {
     const values = [];
     if (name !== undefined) { values.push(name); fields.push(`name = $${values.length}`); }
     if (unit_price !== undefined) { values.push(Number(unit_price) || 0); fields.push(`unit_price = $${values.length}`); }
+    if (barcode !== undefined) {
+      const cleanBarcode = barcode ? String(barcode).trim() : null;
+      if (cleanBarcode) {
+        const dupe = await db.query(
+          `SELECT id FROM catalog_items WHERE company_id = $1 AND barcode = $2 AND id != $3`,
+          [req.companyId, cleanBarcode, id]
+        );
+        if (dupe.rowCount > 0) return res.status(400).json({ error: "Another catalog item already uses this barcode." });
+      }
+      values.push(cleanBarcode); fields.push(`barcode = $${values.length}`);
+    }
     if (track_inventory !== undefined) { values.push(!!track_inventory); fields.push(`track_inventory = $${values.length}`); }
     if (quantity_on_hand !== undefined) {
       const qty = Math.max(0, Math.round(Number(quantity_on_hand)) || 0);
@@ -3218,7 +3283,7 @@ router.patch("/catalog-items/:id", async (req, res) => {
       values.push(id);
       const result = await db.query(
         `UPDATE catalog_items SET ${fields.join(", ")} WHERE id = $${values.length}
-         RETURNING id, name, unit_price, created_at,
+         RETURNING id, name, unit_price, barcode, created_at,
                    track_inventory, quantity_on_hand, quantity_on_hold, unit_cost, low_stock_threshold`,
         values
       );
@@ -3232,6 +3297,7 @@ router.patch("/catalog-items/:id", async (req, res) => {
     }
     res.json(item);
   } catch (err) {
+    if (err.code === "23505") return res.status(400).json({ error: "Another catalog item already uses this barcode." });
     console.error("PATCH /admin/catalog-items/:id failed:", err);
     res.status(500).json({ error: err.message || "Couldn't update catalog item." });
   }
