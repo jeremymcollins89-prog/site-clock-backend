@@ -2872,6 +2872,38 @@ router.get("/reports/labor-breakdown", async (req, res) => {
   }
 });
 
+// GET /api/admin/reports/payments?start=YYYY-MM-DD&end=YYYY-MM-DD
+// One row per payment recorded against an invoice in this date range --
+// pulled from the invoice_payments ledger, not invoices.total/status='paid'
+// -- for the Transactions list on the Billing tab. Every installment of a
+// partial-payments invoice shows up on the day it was actually collected,
+// instead of the whole invoice only appearing once (or not at all) on
+// whatever day it eventually reaches "paid".
+router.get("/reports/payments", async (req, res) => {
+  try {
+    const { start, end } = req.query;
+    if (!start || !end) return res.status(400).json({ error: "start and end are required" });
+
+    const result = await db.query(
+      `SELECT ip.id, ip.invoice_id, i.invoice_number, c.name AS customer_name,
+              ip.amount, ip.payment_method, ip.check_number, ip.paid_at,
+              i.status AS invoice_status, i.total AS invoice_total
+       FROM invoice_payments ip
+       JOIN invoices i ON i.id = ip.invoice_id
+       JOIN customers c ON c.id = i.customer_id
+       WHERE ip.company_id = $1
+         AND ip.paid_at >= $2::date AND ip.paid_at < ($3::date + INTERVAL '1 day')
+       ORDER BY ip.paid_at DESC`,
+      [req.companyId, start, end]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /admin/reports/payments failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load payments." });
+  }
+});
+
 // GET /api/admin/reports/monthly-profit?months=6
 // Gross AND Net Profit for each of the trailing N calendar months (default
 // 6, current month included), for the bar chart under the Reports tab's
