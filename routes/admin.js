@@ -24,6 +24,10 @@ const PAYMENT_TERMS_DAYS = { due_on_receipt: 0, net_15: 15, net_30: 30, net_60: 
 // "online" isn't in this list on purpose -- it's only ever set by the Stripe
 // webhook (see routes/payments.js), never a manual "Mark as paid" option.
 const PAYMENT_METHODS = ["card", "check", "cash", "other"];
+// Hard cap on how many separate payments (partial or otherwise) an invoice
+// can ever collect, whether recorded manually or paid online through Stripe.
+// A normal (non-partial) invoice only ever uses 1 of these.
+const MAX_INVOICE_PAYMENTS = 4;
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://site-clock-frontend-production.up.railway.app";
 
 // Every company -- including Jeremy's own -- must connect its own Stripe
@@ -1467,8 +1471,9 @@ router.get("/invoices", async (req, res) => {
       `SELECT i.id, i.invoice_number, i.status, i.payment_terms, i.payment_method, i.check_number,
               i.issue_date, i.due_date, i.subtotal, i.tax_rate, i.tax_amount, i.total,
               i.sent_at, i.paid_at, i.created_at, i.reminder_count, i.last_reminder_sent_at,
-              i.customer_id, c.name AS customer_name,
-              (i.status = 'sent' AND i.due_date < CURRENT_DATE) AS is_overdue
+              i.allow_partial_payments, i.customer_id, c.name AS customer_name,
+              (i.status = 'sent' AND i.due_date < CURRENT_DATE) AS is_overdue,
+              COALESCE((SELECT SUM(ip.amount) FROM invoice_payments ip WHERE ip.invoice_id = i.id), 0) AS amount_paid
        FROM invoices i
        JOIN customers c ON c.id = i.customer_id
        WHERE i.company_id = $1
@@ -1483,8 +1488,10 @@ router.get("/invoices", async (req, res) => {
 });
 
 // GET /api/admin/invoices/:id
-// Full detail, including line items and the customer's contact info (used
-// both for the edit form and to render/send the PDF).
+// Full detail, including line items, the customer's contact info (used both
+// for the edit form and to render/send the PDF), and -- for a partial-
+// payments-enabled invoice -- the full payment ledger plus what's still
+// owed.
 router.get("/invoices/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -1504,7 +1511,20 @@ router.get("/invoices/:id", async (req, res) => {
        FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
       [id]
     );
-    res.json({ ...result.rows[0], line_items: items.rows });
+    const payments = await db.query(
+      `SELECT id, amount, payment_method, check_number, paid_at FROM invoice_payments WHERE invoice_id = $1 ORDER BY paid_at`,
+      [id]
+    );
+    const amountPaid = payments.rows.reduce((sum, p) => sum + Number(p.amount), 0);
+    const invoice = result.rows[0];
+    res.json({
+      ...invoice,
+      line_items: items.rows,
+      payments: payments.rows,
+      amount_paid: amountPaid,
+      balance_due: Math.max(0, Number(invoice.total) - amountPaid),
+      payments_remaining: Math.max(0, MAX_INVOICE_PAYMENTS - payments.rowCount),
+    });
   } catch (err) {
     console.error("GET /admin/invoices/:id failed:", err);
     res.status(500).json({ error: err.message || "Couldn't load invoice." });
@@ -1579,7 +1599,7 @@ router.get("/invoices/:id/pdf", async (req, res) => {
 router.post("/invoices", async (req, res) => {
   const client = await db.pool.connect();
   try {
-    const { customer_id, job_id, payment_terms, issue_date, tax_rate, notes, line_items } = req.body;
+    const { customer_id, job_id, payment_terms, issue_date, tax_rate, notes, line_items, allow_partial_payments } = req.body;
     if (!customer_id) return res.status(400).json({ error: "customer_id is required" });
     if (!Array.isArray(line_items) || line_items.length === 0) {
       return res.status(400).json({ error: "At least one line item is required" });
@@ -1619,10 +1639,10 @@ router.post("/invoices", async (req, res) => {
     const invoiceNumber = numResult.rows[0].next;
 
     const invoiceResult = await client.query(
-      `INSERT INTO invoices (company_id, customer_id, job_id, invoice_number, payment_terms, issue_date, due_date, notes, subtotal, tax_rate, tax_amount, total)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      `INSERT INTO invoices (company_id, customer_id, job_id, invoice_number, payment_terms, issue_date, due_date, notes, subtotal, tax_rate, tax_amount, total, allow_partial_payments)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        RETURNING *`,
-      [req.companyId, customer_id, jobId, invoiceNumber, terms, issueDate, dueDate, notes || null, subtotal, tax_rate || 0, taxAmount, total]
+      [req.companyId, customer_id, jobId, invoiceNumber, terms, issueDate, dueDate, notes || null, subtotal, tax_rate || 0, taxAmount, total, !!allow_partial_payments]
     );
     const invoice = invoiceResult.rows[0];
 
@@ -1684,7 +1704,7 @@ router.patch("/invoices/:id", async (req, res) => {
       return res.status(400).json({ error: "Only draft invoices can be edited. Void it and create a new one instead." });
     }
     const existing = owns.rows[0];
-    const { customer_id, job_id, payment_terms, issue_date, tax_rate, notes, line_items } = req.body;
+    const { customer_id, job_id, payment_terms, issue_date, tax_rate, notes, line_items, allow_partial_payments } = req.body;
 
     if (customer_id !== undefined) {
       const ownsCustomer = await client.query(`SELECT id FROM customers WHERE id = $1 AND company_id = $2`, [customer_id, req.companyId]);
@@ -1733,8 +1753,8 @@ router.patch("/invoices/:id", async (req, res) => {
     await client.query("BEGIN");
     const result = await client.query(
       `UPDATE invoices SET customer_id = $1, job_id = $2, payment_terms = $3, issue_date = $4, due_date = $5,
-              notes = $6, tax_rate = $7, subtotal = $8, tax_amount = $9, total = $10
-       WHERE id = $11
+              notes = $6, tax_rate = $7, subtotal = $8, tax_amount = $9, total = $10, allow_partial_payments = $11
+       WHERE id = $12
        RETURNING *`,
       [
         customer_id !== undefined ? customer_id : existing.customer_id,
@@ -1747,6 +1767,7 @@ router.patch("/invoices/:id", async (req, res) => {
         subtotal,
         taxAmount,
         total,
+        allow_partial_payments !== undefined ? !!allow_partial_payments : existing.allow_partial_payments,
         id,
       ]
     );
@@ -1846,11 +1867,36 @@ router.patch("/invoices/:id/mark-paid", async (req, res) => {
     if (!PAYMENT_METHODS.includes(payment_method)) {
       return res.status(400).json({ error: `payment_method must be one of: ${PAYMENT_METHODS.join(", ")}` });
     }
-    const owns = await db.query(`SELECT status FROM invoices WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    const owns = await db.query(`SELECT status, total FROM invoices WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
     if (owns.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
     if (owns.rows[0].status === "void") return res.status(400).json({ error: "Can't mark a voided invoice as paid." });
+    if (owns.rows[0].status === "paid") return res.status(400).json({ error: "This invoice has already been paid in full." });
+
+    // Settles whatever's still owed in one shot -- for a normal invoice
+    // that's the whole total, but for a partial-payments invoice that
+    // already has some money collected, it's just the remaining balance.
+    // Same MAX_INVOICE_PAYMENTS cap as POST /invoices/:id/payments applies
+    // here too, since this still adds one more row to the same ledger.
+    const paymentsSoFar = await db.query(
+      `SELECT COALESCE(SUM(amount), 0) AS paid, COUNT(*) AS cnt FROM invoice_payments WHERE invoice_id = $1`,
+      [id]
+    );
+    const alreadyPaid = Number(paymentsSoFar.rows[0].paid);
+    const paymentCount = Number(paymentsSoFar.rows[0].cnt);
+    const remaining = Math.round((Number(owns.rows[0].total) - alreadyPaid) * 100) / 100;
+    if (remaining <= 0) {
+      return res.status(400).json({ error: "This invoice has already been paid in full." });
+    }
+    if (paymentCount >= MAX_INVOICE_PAYMENTS) {
+      return res.status(400).json({ error: `This invoice has already reached the ${MAX_INVOICE_PAYMENTS}-payment limit -- void it or contact support instead of recording another payment.` });
+    }
 
     const checkNumberValue = payment_method === "check" && check_number ? String(check_number).trim().slice(0, 50) || null : null;
+
+    await db.query(
+      `INSERT INTO invoice_payments (company_id, invoice_id, amount, payment_method, check_number) VALUES ($1, $2, $3, $4, $5)`,
+      [req.companyId, id, remaining, payment_method, checkNumberValue]
+    );
 
     const result = await db.query(
       `UPDATE invoices SET status = 'paid', payment_method = $1, check_number = $2, paid_at = now() WHERE id = $3 RETURNING *`,
@@ -1870,6 +1916,81 @@ router.patch("/invoices/:id/mark-paid", async (req, res) => {
   } catch (err) {
     console.error("PATCH /admin/invoices/:id/mark-paid failed:", err);
     res.status(500).json({ error: err.message || "Couldn't mark invoice as paid." });
+  }
+});
+
+// POST /api/admin/invoices/:id/payments
+// Body: { amount, payment_method, check_number? }
+// Records one installment toward an invoice that has partial payments
+// turned on -- a normal invoice uses Mark Paid instead, which settles the
+// whole remaining balance in one go. Up to MAX_INVOICE_PAYMENTS payments
+// total, whether recorded here or paid online through Stripe (see
+// routes/payments.js). The moment a payment brings the balance to exactly
+// zero, this behaves just like Mark Paid -- status flips to 'paid' and the
+// reserved stock is actually consumed; otherwise the invoice moves to
+// 'partial' and inventory doesn't change yet.
+router.post("/invoices/:id/payments", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { amount, payment_method, check_number } = req.body;
+    if (!PAYMENT_METHODS.includes(payment_method)) {
+      return res.status(400).json({ error: `payment_method must be one of: ${PAYMENT_METHODS.join(", ")}` });
+    }
+    const amountNum = Number(amount);
+    if (!(amountNum > 0)) {
+      return res.status(400).json({ error: "Enter a payment amount greater than $0." });
+    }
+
+    const owns = await db.query(`SELECT status, total, allow_partial_payments FROM invoices WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
+    const invoiceRow = owns.rows[0];
+    if (invoiceRow.status === "void") return res.status(400).json({ error: "Can't record a payment on a voided invoice." });
+    if (invoiceRow.status === "paid") return res.status(400).json({ error: "This invoice has already been paid in full." });
+    if (!invoiceRow.allow_partial_payments) {
+      return res.status(400).json({ error: "Partial payments aren't turned on for this invoice -- use Mark Paid to settle it in full instead." });
+    }
+
+    const paymentsSoFar = await db.query(
+      `SELECT COALESCE(SUM(amount), 0) AS paid, COUNT(*) AS cnt FROM invoice_payments WHERE invoice_id = $1`,
+      [id]
+    );
+    const alreadyPaid = Number(paymentsSoFar.rows[0].paid);
+    const paymentCount = Number(paymentsSoFar.rows[0].cnt);
+    const remaining = Math.round((Number(invoiceRow.total) - alreadyPaid) * 100) / 100;
+
+    if (paymentCount >= MAX_INVOICE_PAYMENTS) {
+      return res.status(400).json({ error: `This invoice has already reached the ${MAX_INVOICE_PAYMENTS}-payment limit.` });
+    }
+    if (amountNum > remaining + 0.001) {
+      return res.status(400).json({ error: `That's more than the $${remaining.toFixed(2)} still owed on this invoice.` });
+    }
+
+    const checkNumberValue = payment_method === "check" && check_number ? String(check_number).trim().slice(0, 50) || null : null;
+
+    await db.query(
+      `INSERT INTO invoice_payments (company_id, invoice_id, amount, payment_method, check_number) VALUES ($1, $2, $3, $4, $5)`,
+      [req.companyId, id, amountNum, payment_method, checkNumberValue]
+    );
+
+    const newRemaining = Math.round((remaining - amountNum) * 100) / 100;
+    const isPaidInFull = newRemaining <= 0.001;
+
+    const result = await db.query(
+      `UPDATE invoices
+       SET status = $1, payment_method = $2, check_number = $3, paid_at = CASE WHEN $1 = 'paid' THEN now() ELSE paid_at END
+       WHERE id = $4 RETURNING *`,
+      [isPaidInFull ? "paid" : "partial", payment_method, checkNumberValue, id]
+    );
+
+    if (isPaidInFull) {
+      const paidItems = await db.query(`SELECT catalog_item_id, quantity FROM invoice_line_items WHERE invoice_id = $1`, [id]);
+      await consumeRemainingAfterPulls(paidItems.rows, "invoice", id, req.companyId);
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("POST /admin/invoices/:id/payments failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't record payment." });
   }
 });
 
@@ -1920,15 +2041,26 @@ router.post("/invoices/:id/resend-receipt", async (req, res) => {
 router.patch("/invoices/:id/void", async (req, res) => {
   try {
     const { id } = req.params;
+    const owns = await db.query(`SELECT status FROM invoices WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
+    if (owns.rows[0].status === "paid") {
+      return res.status(400).json({ error: "This invoice has already been paid in full and can't be voided. Any refund has to be handled separately." });
+    }
+    // Note for a partially-paid invoice: this only stops billing for
+    // whatever's left and releases the still-outstanding hold -- it doesn't
+    // refund what's already been collected. Any refund for money already in
+    // hand has to be issued separately (Stripe dashboard, or by hand for a
+    // manually-recorded payment).
     const result = await db.query(
       `UPDATE invoices SET status = 'void' WHERE id = $1 AND company_id = $2 RETURNING *`,
       [id, req.companyId]
     );
     if (result.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
-    // Voided before payment -- release whatever stock this invoice had
-    // reserved (a paid invoice can't reach this route -- mark-paid already
-    // consumed the hold, and mark-paid rejects already-void invoices, so
-    // there's no risk of double-releasing a consumed reservation).
+    // Voided before full payment -- release whatever stock this invoice had
+    // reserved (a fully-paid invoice is blocked above -- mark-paid/the final
+    // partial payment already consumed the hold, and rejects already-void
+    // invoices, so there's no risk of double-releasing a consumed
+    // reservation).
     const itemsForRelease = await db.query(
       `SELECT catalog_item_id, quantity FROM invoice_line_items WHERE invoice_id = $1`,
       [id]
@@ -2518,7 +2650,7 @@ router.post("/quotes/:id/convert-to-invoice", async (req, res) => {
     );
     if (itemsResult.rowCount === 0) return res.status(400).json({ error: "This quote has no line items to invoice." });
 
-    const { payment_terms, issue_date } = req.body;
+    const { payment_terms, issue_date, allow_partial_payments } = req.body;
     const terms = payment_terms || "due_on_receipt";
     if (!PAYMENT_TERMS.includes(terms)) {
       return res.status(400).json({ error: `payment_terms must be one of: ${PAYMENT_TERMS.join(", ")}` });
@@ -2536,10 +2668,10 @@ router.post("/quotes/:id/convert-to-invoice", async (req, res) => {
     const invoiceNumber = numResult.rows[0].next;
 
     const invoiceResult = await client.query(
-      `INSERT INTO invoices (company_id, customer_id, quote_id, invoice_number, payment_terms, issue_date, due_date, notes, subtotal, tax_rate, tax_amount, total)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      `INSERT INTO invoices (company_id, customer_id, quote_id, invoice_number, payment_terms, issue_date, due_date, notes, subtotal, tax_rate, tax_amount, total, allow_partial_payments)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        RETURNING *`,
-      [req.companyId, quote.customer_id, quote.id, invoiceNumber, terms, issueDate, dueDate, quote.notes, subtotal, quote.tax_rate, taxAmount, total]
+      [req.companyId, quote.customer_id, quote.id, invoiceNumber, terms, issueDate, dueDate, quote.notes, subtotal, quote.tax_rate, taxAmount, total, !!allow_partial_payments]
     );
     const invoice = invoiceResult.rows[0];
 
@@ -2624,10 +2756,18 @@ router.get("/reports/summary", async (req, res) => {
       [req.companyId, start, end]
     );
 
+    // Sums actual money collected in this range from the invoice_payments
+    // ledger, not invoices.total/status='paid' -- a partial-payments invoice
+    // can have money land in one period and not reach "paid" (or reach it in
+    // a later period), so summing whichever invoices happen to be fully
+    // settled as of paid_at would either miss that money or count all of it
+    // in the wrong period. cnt is invoices (not payments) touched in this
+    // range, since one invoice with 2 installments in the same range should
+    // still read as "1 invoice", not 2.
     const paidResult = await db.query(
-      `SELECT COALESCE(SUM(total), 0) AS sum_total, COUNT(*) AS cnt
-       FROM invoices
-       WHERE company_id = $1 AND status = 'paid'
+      `SELECT COALESCE(SUM(amount), 0) AS sum_total, COUNT(DISTINCT invoice_id) AS cnt
+       FROM invoice_payments
+       WHERE company_id = $1
          AND paid_at >= $2::date AND paid_at < ($3::date + INTERVAL '1 day')`,
       [req.companyId, start, end]
     );
@@ -2656,10 +2796,16 @@ router.get("/reports/summary", async (req, res) => {
     // What Stripe (processing) and the platform (0.5% cut) actually took out
     // of online payments collected in this range -- money that was part of
     // the invoice total but never reached this company's own bank account.
-    // Same paid_at-based range as paidResult above, so it lines up with
-    // paid_invoice_total. Only invoices paid through Stripe have anything
-    // here (the columns are NULL for cash/check/etc.), which COALESCE(...,0)
-    // on each column (not just the sum) handles correctly.
+    // Only invoices paid through Stripe have anything here (the columns are
+    // NULL for cash/check/etc.), which COALESCE(...,0) on each column (not
+    // just the sum) handles correctly.
+    // NOTE: these two columns still accumulate on the invoice itself rather
+    // than per-payment, so this stays keyed to status='paid'/paid_at (the
+    // date the invoice was fully settled) rather than the ledger. For a
+    // partial-payments invoice paid online in installments across more than
+    // one period, that can attribute an earlier installment's fee to the
+    // period the *final* installment landed in -- a minor known edge case,
+    // not worth a schema change to fix for now.
     const feeResult = await db.query(
       `SELECT COALESCE(SUM(COALESCE(stripe_processing_fee, 0)), 0) AS stripe_fee_total,
               COALESCE(SUM(COALESCE(platform_fee, 0)), 0) AS platform_fee_total
@@ -2744,10 +2890,13 @@ router.get("/reports/monthly-profit", async (req, res) => {
     const rangeStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - (months - 1), 1));
 
     const [paidResult, laborCostResult, feeResult, expenseResult] = await Promise.all([
+      // From the invoice_payments ledger (not invoices.total/status='paid')
+      // so each installment of a partial-payments invoice lands in the month
+      // it actually arrived, same reasoning as reports/summary above.
       db.query(
-        `SELECT date_trunc('month', paid_at) AS month, COALESCE(SUM(total), 0) AS paid_total
-         FROM invoices
-         WHERE company_id = $1 AND status = 'paid' AND paid_at >= $2
+        `SELECT date_trunc('month', paid_at) AS month, COALESCE(SUM(amount), 0) AS paid_total
+         FROM invoice_payments
+         WHERE company_id = $1 AND paid_at >= $2
          GROUP BY 1`,
         [req.companyId, rangeStart]
       ),
@@ -2812,6 +2961,35 @@ router.get("/reports/monthly-profit", async (req, res) => {
   } catch (err) {
     console.error("GET /admin/reports/monthly-profit failed:", err);
     res.status(500).json({ error: err.message || "Couldn't load monthly profit." });
+  }
+});
+
+// GET /api/admin/reports/payment-breakdown
+// All-time totals by payment method, for the "Sales by payment type" donut
+// on the Billing tab (that widget isn't date-ranged, so neither is this).
+// Summed from the invoice_payments ledger rather than invoices.total/
+// status='paid' -- a partial-payments invoice's installments are counted as
+// they actually arrive, by whichever method each one used, instead of the
+// whole invoice being credited to a single method only once/if it's fully
+// paid.
+router.get("/reports/payment-breakdown", async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT payment_method, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS sum_total
+       FROM invoice_payments
+       WHERE company_id = $1
+       GROUP BY payment_method`,
+      [req.companyId]
+    );
+    const methods = result.rows.map(function(r) {
+      return { payment_method: r.payment_method, count: Number(r.cnt), total: Number(r.sum_total) };
+    });
+    const total = methods.reduce(function(s, m) { return s + m.total; }, 0);
+    const count = methods.reduce(function(s, m) { return s + m.count; }, 0);
+    res.json({ methods, total, count });
+  } catch (err) {
+    console.error("GET /admin/reports/payment-breakdown failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load payment breakdown." });
   }
 });
 

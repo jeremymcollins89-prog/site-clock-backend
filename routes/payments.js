@@ -15,25 +15,83 @@ const FRONTEND_URL = process.env.FRONTEND_URL || "https://site-clock-frontend-pr
 // sees -- see routes/connect.js for how a company links its account.
 const PLATFORM_FEE_RATE = 0.005;
 
+// Same hard cap as routes/admin.js -- no shared constants module exists yet,
+// so this is duplicated here. Keep both in sync if it ever changes.
+const MAX_INVOICE_PAYMENTS = 4;
+
+// GET /api/payments/invoices/:id
+// Public -- no admin/employee auth, same trust model as checkout-session
+// below (gated only by the invoice's own unguessable UUID id). Lets
+// pay-invoice.html show the customer what they owe -- and, for an invoice
+// with partial payments turned on, an amount picker -- before it ever
+// creates a Stripe Checkout Session.
+router.get("/invoices/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await db.query(
+      `SELECT i.id, i.invoice_number, i.status, i.total, i.allow_partial_payments,
+              c.name AS customer_name, co.name AS company_name
+       FROM invoices i
+       JOIN customers c ON c.id = i.customer_id
+       JOIN companies co ON co.id = i.company_id
+       WHERE i.id = $1`,
+      [id]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Invoice not found." });
+    }
+    const invoice = result.rows[0];
+
+    const paymentsSoFar = await db.query(
+      `SELECT COALESCE(SUM(amount), 0) AS paid, COUNT(*) AS cnt FROM invoice_payments WHERE invoice_id = $1`,
+      [id]
+    );
+    const amountPaid = Number(paymentsSoFar.rows[0].paid);
+    const paymentCount = Number(paymentsSoFar.rows[0].cnt);
+    const balanceDue = Math.max(0, Math.round((Number(invoice.total) - amountPaid) * 100) / 100);
+
+    res.json({
+      invoice_number: invoice.invoice_number,
+      company_name: invoice.company_name,
+      customer_name: invoice.customer_name,
+      status: invoice.status,
+      total: Number(invoice.total),
+      amount_paid: amountPaid,
+      balance_due: balanceDue,
+      allow_partial_payments: !!invoice.allow_partial_payments,
+      payments_remaining: Math.max(0, MAX_INVOICE_PAYMENTS - paymentCount),
+    });
+  } catch (err) {
+    console.error("GET /payments/invoices/:id failed:", err);
+    res.status(500).json({ error: "Couldn't load invoice." });
+  }
+});
+
 // POST /api/payments/invoices/:id/checkout-session
 // Public -- no admin/employee auth. A customer clicking "Pay now" in their
 // invoice email has no account to log into, so this is only gated by
 // knowing the invoice's own (unguessable, UUID) id, the same trust model
 // already used by the invoice PDF link.
 //
-// Creates a Stripe Checkout Session for the invoice's full balance and hands
-// back its hosted URL. If the invoice's company has connected its own
-// Stripe account (Standard Connect), the charge is created directly on
-// that account -- via the `stripeAccount` request option -- with our
-// PLATFORM_FEE_RATE cut carved out as an application fee, so their
+// Creates a Stripe Checkout Session for the invoice's balance (or, for a
+// partial-payments-enabled invoice, whatever amount the customer picked on
+// the pay page) and hands back its hosted URL. If the invoice's company has
+// connected its own Stripe account (Standard Connect), the charge is created
+// directly on that account -- via the `stripeAccount` request option -- with
+// our PLATFORM_FEE_RATE cut carved out as an application fee, so their
 // customer's money lands in their own Stripe balance, not ours. Companies
 // that haven't connected yet (including Jeremy's own, so far) fall back to
 // the platform's own Stripe account, unchanged from before Connect existed.
+//
+// Body: { amount? } -- optional. Omit it (or a normal, non-partial invoice)
+// to pay the full remaining balance, unchanged from before partial payments
+// existed. When the invoice has allow_partial_payments on, amount can be any
+// value from $0.01 up to the remaining balance.
 router.post("/invoices/:id/checkout-session", async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
-      `SELECT i.id, i.invoice_number, i.status, i.total, i.company_id,
+      `SELECT i.id, i.invoice_number, i.status, i.total, i.company_id, i.allow_partial_payments,
               c.name AS customer_name, c.email AS customer_email,
               co.name AS company_name, co.stripe_account_id
        FROM invoices i
@@ -57,6 +115,40 @@ router.post("/invoices/:id/checkout-session", async (req, res) => {
       return res.status(400).json({ error: "This invoice doesn't have a balance due." });
     }
 
+    const paymentsSoFar = await db.query(
+      `SELECT COALESCE(SUM(amount), 0) AS paid, COUNT(*) AS cnt FROM invoice_payments WHERE invoice_id = $1`,
+      [id]
+    );
+    const alreadyPaid = Number(paymentsSoFar.rows[0].paid);
+    const paymentCount = Number(paymentsSoFar.rows[0].cnt);
+    const remaining = Math.round((Number(invoice.total) - alreadyPaid) * 100) / 100;
+
+    if (remaining <= 0) {
+      return res.status(400).json({ error: "This invoice has already been paid." });
+    }
+    if (paymentCount >= MAX_INVOICE_PAYMENTS) {
+      return res.status(400).json({ error: `This invoice has already reached the ${MAX_INVOICE_PAYMENTS}-payment limit. Contact ${invoice.company_name} directly.` });
+    }
+
+    // No amount in the request (or partial payments aren't turned on for
+    // this invoice) means "pay the whole remaining balance" -- exactly the
+    // behavior this route had before partial payments existed.
+    let amount = remaining;
+    if (req.body && req.body.amount != null) {
+      const requested = Number(req.body.amount);
+      if (!(requested > 0)) {
+        return res.status(400).json({ error: "Enter a payment amount greater than $0." });
+      }
+      if (!invoice.allow_partial_payments) {
+        if (Math.abs(requested - remaining) > 0.01) {
+          return res.status(400).json({ error: "Partial payments aren't available for this invoice -- pay the full balance instead." });
+        }
+      } else if (requested > remaining + 0.001) {
+        return res.status(400).json({ error: `That's more than the $${remaining.toFixed(2)} still owed on this invoice.` });
+      }
+      amount = Math.min(requested, remaining);
+    }
+
     const connectedAccountId = invoice.stripe_account_id || null;
 
     // Every company -- including Jeremy's own -- must connect its own
@@ -72,7 +164,8 @@ router.post("/invoices/:id/checkout-session", async (req, res) => {
       });
     }
 
-    const totalCents = Math.round(Number(invoice.total) * 100);
+    const amountCents = Math.round(amount * 100);
+    const isFullBalance = Math.abs(amount - remaining) <= 0.001;
 
     const sessionParams = {
       mode: "payment",
@@ -83,9 +176,11 @@ router.post("/invoices/:id/checkout-session", async (req, res) => {
           price_data: {
             currency: "usd",
             product_data: {
-              name: `Invoice #${invoice.invoice_number} — ${invoice.company_name}`,
+              name: isFullBalance
+                ? `Invoice #${invoice.invoice_number} — ${invoice.company_name}`
+                : `Invoice #${invoice.invoice_number} — ${invoice.company_name} (partial payment)`,
             },
-            unit_amount: totalCents,
+            unit_amount: amountCents,
           },
           quantity: 1,
         },
@@ -101,7 +196,7 @@ router.post("/invoices/:id/checkout-session", async (req, res) => {
     const requestOptions = {};
     if (connectedAccountId) {
       sessionParams.payment_intent_data = {
-        application_fee_amount: Math.round(totalCents * PLATFORM_FEE_RATE),
+        application_fee_amount: Math.round(amountCents * PLATFORM_FEE_RATE),
       };
       requestOptions.stripeAccount = connectedAccountId;
     }
@@ -180,29 +275,68 @@ async function markInvoicePaidFromStripe(session) {
   const invoiceId = session.metadata && session.metadata.invoice_id;
   if (!invoiceId) return;
 
+  // Stripe retries webhook delivery, so the same session/payment_intent can
+  // arrive more than once. For a partial-payments invoice, checking the
+  // invoice's status alone isn't enough to detect a retry (it could
+  // legitimately still be "sent" or "partial" while a *different* session's
+  // payment is being applied) -- so dedupe against the ledger instead, keyed
+  // to this exact session/payment_intent.
+  const dupe = await db.query(
+    `SELECT id FROM invoice_payments
+     WHERE invoice_id = $1
+       AND (stripe_checkout_session_id = $2 OR ($3::text IS NOT NULL AND stripe_payment_intent_id = $3))`,
+    [invoiceId, session.id, session.payment_intent || null]
+  );
+  if (dupe.rowCount > 0) return;
+
+  const invoiceLookup = await db.query(`SELECT status, total, company_id FROM invoices WHERE id = $1`, [invoiceId]);
+  if (invoiceLookup.rowCount === 0) return;
+  const invoiceBefore = invoiceLookup.rows[0];
+  if (invoiceBefore.status === "void" || invoiceBefore.status === "paid") {
+    // Checkout-session creation already blocks these, but if a stale session
+    // somehow completes anyway, there's nothing to apply it to.
+    return;
+  }
+
+  // amount_total is what Stripe actually charged for *this* session -- for a
+  // partial-payments invoice that can be less than the invoice's full total,
+  // so this (not invoice.total) is what goes in the ledger.
+  const amountPaid = Math.round(Number(session.amount_total || 0)) / 100;
+  if (!(amountPaid > 0)) return;
+
+  await db.query(
+    `INSERT INTO invoice_payments (company_id, invoice_id, amount, payment_method, stripe_checkout_session_id, stripe_payment_intent_id)
+     VALUES ($1, $2, $3, 'online', $4, $5)`,
+    [invoiceBefore.company_id, invoiceId, amountPaid, session.id, session.payment_intent || null]
+  );
+
+  const paidSoFar = await db.query(`SELECT COALESCE(SUM(amount), 0) AS paid FROM invoice_payments WHERE invoice_id = $1`, [invoiceId]);
+  const totalPaid = Number(paidSoFar.rows[0].paid);
+  const balanceRemaining = Math.max(0, Math.round((Number(invoiceBefore.total) - totalPaid) * 100) / 100);
+  const isPaidInFull = balanceRemaining <= 0.001;
+
   const result = await db.query(
     `UPDATE invoices
-     SET status = 'paid', payment_method = 'online', paid_at = now(), stripe_payment_intent_id = $1
-     WHERE id = $2 AND status != 'paid'
+     SET status = $1, payment_method = 'online', stripe_payment_intent_id = $2,
+         paid_at = CASE WHEN $1 = 'paid' THEN now() ELSE paid_at END
+     WHERE id = $3
      RETURNING *`,
-    [session.payment_intent || null, invoiceId]
+    [isPaidInFull ? "paid" : "partial", session.payment_intent || null, invoiceId]
   );
-  // rowCount is 0 if this invoice was already marked paid -- e.g. Stripe
-  // re-delivering the same webhook event, which it does retry on occasion.
-  // Nothing new happened, so there's nothing new to send a receipt for.
-  if (result.rowCount === 0) return;
   const invoice = result.rows[0];
 
   // Same "paid means the reserved stock is actually gone" consumption as the
-  // manual mark-paid route -- this is the other of the two paths that can
-  // ever set an invoice to "paid" (see admin.js PATCH /invoices/:id/mark-paid).
-  // Only whatever hasn't already been pulled via a fulfilled pull sheet gets
-  // subtracted, so material grabbed ahead of payment isn't double-consumed.
-  const paidItems = await db.query(
-    `SELECT catalog_item_id, quantity FROM invoice_line_items WHERE invoice_id = $1`,
-    [invoiceId]
-  );
-  await consumeRemainingAfterPulls(paidItems.rows, "invoice", invoiceId, invoice.company_id);
+  // manual mark-paid route -- only fires once the balance actually reaches
+  // zero, never on an intermediate partial payment. Only whatever hasn't
+  // already been pulled via a fulfilled pull sheet gets subtracted, so
+  // material grabbed ahead of payment isn't double-consumed.
+  if (isPaidInFull) {
+    const paidItems = await db.query(
+      `SELECT catalog_item_id, quantity FROM invoice_line_items WHERE invoice_id = $1`,
+      [invoiceId]
+    );
+    await consumeRemainingAfterPulls(paidItems.rows, "invoice", invoiceId, invoice.company_id);
+  }
 
   const detail = await db.query(
     `SELECT c.name AS customer_name, c.email AS customer_email, co.name AS company_name, co.stripe_account_id
@@ -217,11 +351,13 @@ async function markInvoicePaidFromStripe(session) {
   // Records what this payment actually cost to accept -- Stripe's own
   // processing fee (varies by payment method, so it can't just be
   // calculated) plus our platform cut -- so Reports can show real profit
-  // instead of pretending the full invoice total landed in the bank. Best
-  // effort: this is a nice-to-have on top of the payment itself already
-  // being recorded above, so a hiccup fetching it (or an older invoice with
-  // no connected account on file) shouldn't be treated as the payment
-  // failing.
+  // instead of pretending the full amount landed in the bank. Added onto
+  // whatever's already recorded rather than overwritten, since a
+  // partial-payments invoice can pick up fees across several separate
+  // sessions. Best effort: this is a nice-to-have on top of the payment
+  // itself already being recorded above, so a hiccup fetching it (or an
+  // older invoice with no connected account on file) shouldn't be treated
+  // as the payment failing.
   if (session.payment_intent && row && row.stripe_account_id) {
     try {
       const pi = await stripe.paymentIntents.retrieve(
@@ -235,7 +371,7 @@ async function markInvoicePaidFromStripe(session) {
         const stripeFee = balanceTxn.fee / 100;
         const platformFee = (charge.application_fee_amount || 0) / 100;
         await db.query(
-          `UPDATE invoices SET stripe_processing_fee = $1, platform_fee = $2 WHERE id = $3`,
+          `UPDATE invoices SET stripe_processing_fee = COALESCE(stripe_processing_fee, 0) + $1, platform_fee = COALESCE(platform_fee, 0) + $2 WHERE id = $3`,
           [stripeFee, platformFee, invoiceId]
         );
       }
@@ -246,7 +382,13 @@ async function markInvoicePaidFromStripe(session) {
 
   try {
     if (row && row.customer_email) {
-      await sendPaymentReceiptEmail({ to: row.customer_email, companyName: row.company_name, invoice });
+      await sendPaymentReceiptEmail({
+        to: row.customer_email,
+        companyName: row.company_name,
+        invoice,
+        amountPaid,
+        balanceRemaining,
+      });
     }
   } catch (err) {
     // A failed receipt email shouldn't undo the payment already being

@@ -57,10 +57,14 @@ function localHourIn(timezone) {
   }
 }
 
-// Scans every company's unpaid, sent invoices and sends a reminder to any
-// that are due *and* whose company is currently at TARGET_LOCAL_HOUR local
-// time. Errors on one invoice are logged and skipped rather than aborting
-// the whole batch, so one bad row can't block reminders for everyone else.
+// Scans every company's unpaid invoices -- 'sent' (nothing collected yet) or
+// 'partial' (some collected, balance still outstanding) -- and sends a
+// reminder to any that are due *and* whose company is currently at
+// TARGET_LOCAL_HOUR local time. A partial-payments invoice keeps getting
+// reminded about whatever's still owed even after its first installment;
+// only 'paid' and 'void' stop reminders. Errors on one invoice are logged
+// and skipped rather than aborting the whole batch, so one bad row can't
+// block reminders for everyone else.
 async function checkAndSendReminders() {
   const today = new Date();
   const result = await db.query(
@@ -71,7 +75,7 @@ async function checkAndSendReminders() {
      FROM invoices i
      JOIN customers c ON c.id = i.customer_id
      JOIN companies comp ON comp.id = i.company_id
-     WHERE i.status = 'sent' AND i.reminder_count < $1`,
+     WHERE i.status IN ('sent', 'partial') AND i.reminder_count < $1`,
     [MAX_REMINDERS]
   );
 

@@ -350,14 +350,22 @@ async function sendQuoteEmail({ to, cc, companyName, quote, pdfBuffer }) {
 // name via customerFacingFrom, same as every other customer-facing email,
 // so it doesn't look like it came from "Coll Timeclock" instead of the
 // business the customer actually paid.
-async function sendPaymentReceiptEmail({ to, companyName, invoice }) {
-  const paidDate = fmtDate(invoice.paid_at);
+// amountPaid/balanceRemaining let this cover both a normal full payment and
+// one installment of a partial-payments invoice -- when balanceRemaining is
+// still above zero this renders as a "partial payment received" receipt with
+// a balance line instead of claiming the invoice is settled.
+async function sendPaymentReceiptEmail({ to, companyName, invoice, amountPaid, balanceRemaining, paidAt }) {
+  const paid = amountPaid != null ? Number(amountPaid) : Number(invoice.total);
+  const remaining = balanceRemaining != null ? Number(balanceRemaining) : 0;
+  const isPartial = remaining > 0.001;
+  const paidDate = fmtDate(paidAt || invoice.paid_at || new Date());
   const html = `
     <div style="font-family: -apple-system, sans-serif;">
-      <h2>Payment received &mdash; thank you!</h2>
-      <p>${companyName} received your payment for Invoice #${invoice.invoice_number}.</p>
+      <h2>${isPartial ? "Partial payment received" : "Payment received"} &mdash; thank you!</h2>
+      <p>${companyName} received your ${isPartial ? "payment" : "payment in full"} for Invoice #${invoice.invoice_number}.</p>
       <table style="border-collapse: collapse; margin: 16px 0;">
-        <tr><td style="padding:4px 12px 4px 0; color:#8A8578;">Amount paid</td><td style="padding:4px 0; font-weight:600;">${fmtMoney(invoice.total)}</td></tr>
+        <tr><td style="padding:4px 12px 4px 0; color:#8A8578;">Amount paid</td><td style="padding:4px 0; font-weight:600;">${fmtMoney(paid)}</td></tr>
+        ${isPartial ? `<tr><td style="padding:4px 12px 4px 0; color:#8A8578;">Balance remaining</td><td style="padding:4px 0; font-weight:600;">${fmtMoney(remaining)}</td></tr>` : ""}
         <tr><td style="padding:4px 12px 4px 0; color:#8A8578;">Date</td><td style="padding:4px 0;">${paidDate}</td></tr>
         <tr><td style="padding:4px 12px 4px 0; color:#8A8578;">Invoice</td><td style="padding:4px 0;">#${invoice.invoice_number}</td></tr>
       </table>
@@ -374,7 +382,7 @@ async function sendPaymentReceiptEmail({ to, companyName, invoice }) {
     body: JSON.stringify({
       from: customerFacingFrom(companyName),
       to: [to],
-      subject: `Payment received -- Invoice #${invoice.invoice_number} (${fmtMoney(invoice.total)})`,
+      subject: `${isPartial ? "Partial payment" : "Payment"} received -- Invoice #${invoice.invoice_number} (${fmtMoney(paid)})`,
       html,
     }),
   });
