@@ -11,7 +11,20 @@ async function requireAdmin(req, res, next) {
   if (!token) return res.status(401).json({ error: "Missing token" });
   try {
     const payload = verifyAdminToken(token);
-    const result = await db.query(`SELECT id FROM companies WHERE id = $1`, [payload.company_id]);
+    // Also bumps last_active_at (throttled to once/hour) right here instead
+    // of a separate query -- this is the "did anyone at this company log in
+    // and actually do anything" signal the platform dashboard's dormant-days
+    // figure relies on, and every admin request already hits this table once
+    // for the existence check anyway.
+    const result = await db.query(
+      `UPDATE companies SET last_active_at = CASE
+         WHEN last_active_at IS NULL OR last_active_at < now() - INTERVAL '1 hour' THEN now()
+         ELSE last_active_at
+       END
+       WHERE id = $1
+       RETURNING id`,
+      [payload.company_id]
+    );
     if (result.rowCount === 0) {
       return res.status(401).json({ error: "This company no longer exists" });
     }

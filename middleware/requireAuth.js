@@ -18,11 +18,20 @@ async function requireAuth(req, res, next) {
   }
   try {
     const payload = verifyToken(token);
-    const result = await db.query(`SELECT active FROM employees WHERE id = $1`, [payload.employee_id]);
+    const result = await db.query(`SELECT active, company_id FROM employees WHERE id = $1`, [payload.employee_id]);
     if (result.rowCount === 0 || !result.rows[0].active) {
       return res.status(401).json({ error: "This account is no longer active" });
     }
     req.employee = payload;
+    // Best-effort, throttled (once/hour) activity ping for the platform
+    // dashboard's dormant-days figure -- not awaited so a slow write here
+    // never adds latency to the actual request, and failing silently is fine
+    // since nothing user-facing depends on it.
+    db.query(
+      `UPDATE companies SET last_active_at = now()
+       WHERE id = $1 AND (last_active_at IS NULL OR last_active_at < now() - INTERVAL '1 hour')`,
+      [result.rows[0].company_id]
+    ).catch(() => {});
     next();
   } catch (err) {
     return res.status(401).json({ error: "Invalid or expired token" });

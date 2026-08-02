@@ -31,12 +31,15 @@ router.use(requirePlatformAuth);
 // "who's using this, and who might need a nudge or a check-in": when they
 // signed up, whether they've connected Stripe (so their customers can pay
 // online), how many employees they have, whether they're comped
-// (billing_exempt), and the last time any employee at that company
-// actually clocked in/out -- the simplest reliable definition of "used the
-// app" available today, since there's no dedicated admin-login-timestamp
-// tracking yet. dormant_days is left as null (never used) or a number of
-// days, rather than a boolean, so the page can sort/highlight by however
-// stale an account is instead of just a single 30-day cutoff.
+// (billing_exempt), and the last time anyone at that company actually used
+// the app -- either an employee clocking in/out, or any admin/employee
+// session at all (companies.last_active_at, bumped by requireAdmin/
+// requireAuth on every authenticated request -- see those files). Taking the
+// more recent of the two means a company that's only ever used the admin
+// side (or only browses the employee app without clocking in) still counts
+// as active, not "never used". dormant_days is left as null (never used) or
+// a number of days, rather than a boolean, so the page can sort/highlight by
+// however stale an account is instead of just a single 30-day cutoff.
 router.get("/companies", async (req, res) => {
   try {
     const result = await db.query(
@@ -48,9 +51,9 @@ router.get("/companies", async (req, res) => {
          c.billing_exempt,
          (c.stripe_connect_status = 'connected') AS stripe_connected,
          COALESCE(emp.employee_count, 0) AS employee_count,
-         act.last_activity,
-         CASE WHEN act.last_activity IS NULL THEN NULL
-              ELSE EXTRACT(DAY FROM (now() - act.last_activity))::int
+         GREATEST(c.last_active_at, act.last_activity) AS last_activity,
+         CASE WHEN GREATEST(c.last_active_at, act.last_activity) IS NULL THEN NULL
+              ELSE EXTRACT(DAY FROM (now() - GREATEST(c.last_active_at, act.last_activity)))::int
          END AS dormant_days
        FROM companies c
        LEFT JOIN (
@@ -152,14 +155,24 @@ router.get("/overview", async (req, res) => {
               COALESCE(SUM(COALESCE(platform_fee, 0)), 0) AS total_platform_fees
        FROM invoices WHERE status = 'paid'`
     );
+    // Counts every company whose most recent activity -- clock-in or any
+    // admin/employee session at all (last_active_at) -- is either more than
+    // 30 days old or has never happened. The old version only looked at
+    // time_entries, so a company that had never clocked in a single time
+    // entry (even if admins/employees were actively using other parts of the
+    // app) never showed up in this count at all -- this LEFT JOIN fixes that.
     const dormantResult = await db.query(
       `SELECT COUNT(*) AS dormant_count FROM (
-         SELECT e.company_id, MAX(te.clock_in) AS last_activity
-         FROM time_entries te
-         JOIN employees e ON e.id = te.employee_id
-         GROUP BY e.company_id
-         HAVING MAX(te.clock_in) < now() - INTERVAL '30 days'
-       ) dormant`
+         SELECT c.id, GREATEST(c.last_active_at, act.last_activity) AS last_activity
+         FROM companies c
+         LEFT JOIN (
+           SELECT e.company_id, MAX(te.clock_in) AS last_activity
+           FROM time_entries te
+           JOIN employees e ON e.id = te.employee_id
+           GROUP BY e.company_id
+         ) act ON act.company_id = c.id
+       ) activity
+       WHERE last_activity IS NULL OR last_activity < now() - INTERVAL '30 days'`
     );
 
     res.json({
