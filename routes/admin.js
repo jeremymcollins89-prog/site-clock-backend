@@ -5,7 +5,7 @@ const db = require("../db");
 const { loginAdmin } = require("../utils/adminAuth");
 const { hashPin } = require("../utils/auth");
 const { generateResetToken, hashResetToken } = require("../utils/resetToken");
-const { sendAdminPasswordResetEmail, sendInvoiceEmail, sendQuoteEmail, sendPaymentReceiptEmail } = require("../utils/mailer");
+const { sendAdminPasswordResetEmail, sendInvoiceEmail, sendQuoteEmail, sendPaymentReceiptEmail, sendEmployeeWelcomeEmail } = require("../utils/mailer");
 const { renderInvoicePdf, renderQuotePdf, renderPullSheetPdf } = require("../utils/invoicePdf");
 const requireAdmin = require("../middleware/requireAdmin");
 const loginRateLimit = require("../middleware/loginRateLimit");
@@ -428,6 +428,17 @@ router.post("/employees", async (req, res) => {
       [name, email, pin_hash, req.companyId, clock_in_animation || "none", hourly_rate || null, break_minutes || 30]
     );
     res.status(201).json(result.rows[0]);
+
+    // Welcome email is a nice-to-have, not a hard requirement for the
+    // employee to actually be created -- send it after responding, and
+    // don't let a delivery failure turn a successful hire into an error the
+    // admin has to deal with.
+    try {
+      const companyResult = await db.query(`SELECT name FROM companies WHERE id = $1`, [req.companyId]);
+      await sendEmployeeWelcomeEmail({ to: email, name, companyName: companyResult.rows[0].name });
+    } catch (emailErr) {
+      console.error(`Failed to send welcome email to new employee ${result.rows[0].id}:`, emailErr.message);
+    }
   } catch (err) {
     if (err.code === "23505") {
       return res.status(409).json({ error: "An employee with that email already exists" });

@@ -171,6 +171,62 @@ async function sendEmployeePinResetEmail({ to, name, token, companyName }) {
   }
 }
 
+// Sent once, right after an admin adds a new employee (see POST
+// /api/admin/employees in routes/admin.js). Branded as the company itself
+// (customerFacingFrom), not "Coll Timeclock" -- that's what the employee
+// actually sees every day in the app (their own employer's name and logo),
+// not the SaaS vendor behind it.
+//
+// Doesn't include the PIN itself -- same reasoning as the PIN-reset flow
+// (sendEmployeePinResetEmail above) not emailing a raw PIN in cleartext.
+// The admin already set it with the employee directly; anyone who forgets
+// it can self-serve via "Forgot PIN" on the login screen rather than this
+// email being a standing copy of a live credential sitting in an inbox.
+async function sendEmployeeWelcomeEmail({ to, name, companyName }) {
+  const loginUrl = FRONTEND_URL;
+  const html = `
+    <div style="font-family: -apple-system, sans-serif;">
+      <h2>Welcome to ${companyName}!</h2>
+      <p>Hi ${name}, you've been set up with an account on ${companyName}'s time clock app. Here's what you can do with it:</p>
+      <ul style="padding-left:20px; line-height:1.7;">
+        <li>Clock in and out with one tap, right from your phone</li>
+        <li>Track your hours by job -- in town or traveling</li>
+        <li>See your schedule and upcoming jobs</li>
+        <li>Request time off</li>
+        <li>Submit your hours for payroll when your pay period ends</li>
+        <li>Message your team</li>
+      </ul>
+      <p style="margin-top:24px;">
+        <a href="${loginUrl}" style="background:#1F2421; color:#F4F2ED; padding:12px 24px; border-radius:6px; text-decoration:none; font-weight:600; display:inline-block;">Login now</a>
+      </p>
+      <p style="margin-top:24px; font-size:14px;"><strong>How to log in:</strong></p>
+      <p style="font-size:14px; color:#444;">
+        Use this email address (${to}) and the PIN your manager set up for you when they added you.
+        If you don't know your PIN, ask them, or tap "Forgot PIN?" on the login screen to set a new one yourself.
+      </p>
+    </div>
+  `;
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: customerFacingFrom(companyName),
+      to: [to],
+      subject: `Welcome to ${companyName} — here's how to log in`,
+      html,
+    }),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`Resend API error (${res.status}): ${errBody}`);
+  }
+}
+
 const PAYMENT_TERMS_LABELS = {
   due_on_receipt: "Due on receipt",
   net_15: "Net 15",
@@ -399,6 +455,7 @@ module.exports = {
   sendAdminPasswordResetEmail,
   sendInvoiceReminderEmail,
   sendEmployeePinResetEmail,
+  sendEmployeeWelcomeEmail,
   sendInvoiceEmail,
   sendQuoteEmail,
   sendPaymentReceiptEmail,
