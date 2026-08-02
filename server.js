@@ -67,25 +67,13 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
 }));
 
-// Restricts which *browser* origins can read responses from this API --
-// the known frontend domain (admin.html/platform.html/the React PWA all
-// live there) plus common local dev ports. Requests with no Origin header
-// at all (curl, server-to-server calls, and Electron's own fetch from a
-// file:// page, which Chromium sends as a "null" origin) are still let
-// through same as before -- this isn't a real session-hijack boundary
-// anyway since auth here is a Bearer token, not a cookie, so a strange
-// website can't ride an existing login; this just stops some other site's
-// JS from being able to read this API's responses cross-origin at all.
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://site-clock-frontend-production.up.railway.app";
-const ALLOWED_ORIGINS = [FRONTEND_URL, "http://localhost:5173", "http://localhost:3000"];
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin || origin === "null" || ALLOWED_ORIGINS.includes(origin)) {
-      return callback(null, true);
-    }
-    callback(new Error("Not allowed by CORS"));
-  },
-}));
+// NOTE: this was tightened to an origin allowlist during a security pass,
+// then reverted back to wide-open -- the desktop admin app's requests from
+// its file:// page got blocked by it ("Failed to fetch" on things like
+// adding an employee), and since auth here is a Bearer token rather than a
+// cookie, a strange website couldn't ride an existing login anyway even
+// with this open, so the restriction wasn't worth the breakage.
+app.use(cors());
 
 // Stripe webhook signature verification needs the raw, untouched request
 // body -- so this route is registered with its own express.raw() middleware
