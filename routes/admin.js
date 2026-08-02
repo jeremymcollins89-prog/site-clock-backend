@@ -1638,8 +1638,10 @@ router.post("/invoices", async (req, res) => {
     await client.query("COMMIT");
 
     // Reserves stock for any line item picked from a tracked catalog item --
-    // covers an invoice created directly rather than via quote conversion
-    // (that path places its own hold when the quote is first saved).
+    // this route is for an invoice created directly (not from a quote), so
+    // nothing could already be holding these items. A quote converted to an
+    // invoice goes through POST /quotes/:id/convert-to-invoice instead, which
+    // only places a hold if a pull sheet hasn't already claimed it.
     await placeHoldsForLineItems(line_items, req.companyId);
 
     let finalInvoice = invoice;
@@ -1764,7 +1766,8 @@ router.patch("/invoices/:id", async (req, res) => {
     await client.query("COMMIT");
 
     // Line items were replaced -- release the old reservation and place a
-    // fresh one for the new quantities/items (same approach as PATCH quotes).
+    // fresh one for the new quantities/items, rather than trying to diff old
+    // vs. new (simpler and correct even if items were reordered/removed).
     if (line_items !== undefined) {
       await releaseHoldsForLineItems(oldItemsForRelease, req.companyId);
       await placeHoldsForLineItems(items, req.companyId);
@@ -1948,6 +1951,21 @@ router.patch("/invoices/:id/void", async (req, res) => {
     // already a real record of inventory that was actually removed.
     // Matches both a pull sheet already reassigned to this invoice, and one
     // that was built against the quote and never got that far.
+    //
+    // An invoice-sourced sheet doesn't hold its own separate reservation
+    // (the invoice's own hold, just released above, already covers it), but
+    // a quote-sourced one that never got relabeled -- e.g. built against the
+    // quote and this invoice went straight to void before ever converting
+    // cleanly -- does hold its own, so that one needs releasing here too.
+    const staleSheets = await db.query(
+      `SELECT id FROM pull_sheets
+       WHERE company_id = $1 AND status != 'fulfilled' AND source_type = 'quote' AND source_id = $2`,
+      [req.companyId, invoice.quote_id]
+    );
+    for (const sheet of staleSheets.rows) {
+      const sheetItems = await db.query(`SELECT catalog_item_id, quantity FROM pull_sheet_items WHERE pull_sheet_id = $1`, [sheet.id]);
+      await releaseHoldsForLineItems(sheetItems.rows, req.companyId);
+    }
     await db.query(
       `DELETE FROM pull_sheets
        WHERE company_id = $1 AND status != 'fulfilled'
@@ -2194,11 +2212,10 @@ router.post("/quotes", async (req, res) => {
 
     await client.query("COMMIT");
 
-    // Reserves stock for any line item picked from a tracked catalog item --
-    // per Jeremy's call, this happens as soon as the quote is saved (even as
-    // a draft), not just once it's sent, so two quotes being built at once
-    // can't both promise the same last unit.
-    await placeHoldsForLineItems(line_items, req.companyId);
+    // A quote never reserves stock on its own -- it's just a proposal.
+    // Inventory only actually gets held once a pull sheet is built for this
+    // job or it's converted to an invoice (see POST /pull-sheets and POST
+    // /quotes/:id/convert-to-invoice).
 
     let finalQuote = quote;
     let sendWarning = null;
@@ -2244,14 +2261,6 @@ router.patch("/quotes/:id", async (req, res) => {
       const ownsCustomer = await client.query(`SELECT id FROM customers WHERE id = $1 AND company_id = $2`, [customer_id, req.companyId]);
       if (ownsCustomer.rowCount === 0) return res.status(400).json({ error: "Customer not found" });
     }
-
-    // Fetched before any replacement so the old holds can be released after
-    // commit, regardless of whether line_items is being replaced this call.
-    const oldItemsResult = await client.query(
-      `SELECT catalog_item_id, quantity FROM quote_line_items WHERE quote_id = $1`,
-      [id]
-    );
-    const oldItemsForRelease = oldItemsResult.rows;
 
     let items = line_items;
     if (items !== undefined) {
@@ -2307,13 +2316,8 @@ router.patch("/quotes/:id", async (req, res) => {
 
     await client.query("COMMIT");
 
-    // Line items were replaced -- release the old reservation and place a
-    // fresh one for the new quantities/items, rather than trying to diff
-    // old vs. new (simpler and correct even if items were reordered/removed).
-    if (line_items !== undefined) {
-      await releaseHoldsForLineItems(oldItemsForRelease, req.companyId);
-      await placeHoldsForLineItems(items, req.companyId);
-    }
+    // A quote never holds stock on its own, so editing its line items has no
+    // inventory hold to update -- see the model comment atop utils/inventory.js.
 
     res.json(result.rows[0]);
   } catch (err) {
@@ -2335,12 +2339,23 @@ router.delete("/quotes/:id", async (req, res) => {
     if (owns.rows[0].status !== "draft") {
       return res.status(400).json({ error: "Only draft quotes can be deleted." });
     }
-    const itemsForRelease = await db.query(
-      `SELECT catalog_item_id, quantity FROM quote_line_items WHERE quote_id = $1`,
-      [id]
+
+    // The quote itself never holds stock (see the model comment atop
+    // utils/inventory.js) -- but a pull sheet could already have been built
+    // against it even while still a draft, and that pull sheet does hold its
+    // own reservation. Release that before it's cleaned up along with the
+    // quote, same as the mark-declined path.
+    const openSheets = await db.query(
+      `SELECT id FROM pull_sheets WHERE company_id = $1 AND source_type = 'quote' AND source_id = $2 AND status != 'fulfilled'`,
+      [req.companyId, id]
     );
+    for (const sheet of openSheets.rows) {
+      const sheetItems = await db.query(`SELECT catalog_item_id, quantity FROM pull_sheet_items WHERE pull_sheet_id = $1`, [sheet.id]);
+      await releaseHoldsForLineItems(sheetItems.rows, req.companyId);
+    }
+    await db.query(`DELETE FROM pull_sheets WHERE company_id = $1 AND source_type = 'quote' AND source_id = $2 AND status != 'fulfilled'`, [req.companyId, id]);
+
     await db.query(`DELETE FROM quotes WHERE id = $1`, [id]);
-    await releaseHoldsForLineItems(itemsForRelease.rows, req.companyId);
     res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /admin/quotes/:id failed:", err);
@@ -2390,17 +2405,21 @@ router.patch("/quotes/:id/mark-declined", async (req, res) => {
       [req.params.id, req.companyId]
     );
     if (result.rowCount === 0) return res.status(404).json({ error: "Quote not found" });
-    // Customer said no -- release whatever stock this quote had reserved.
-    const itemsForRelease = await db.query(
-      `SELECT catalog_item_id, quantity FROM quote_line_items WHERE quote_id = $1`,
-      [req.params.id]
-    );
-    await releaseHoldsForLineItems(itemsForRelease.rows, req.companyId);
 
-    // A declined quote isn't happening -- any pull sheet still open (or
-    // reported-pulled but not yet fulfilled) for it is no longer relevant.
-    // A fulfilled one is left alone since it's already a real record of
-    // inventory that was actually removed.
+    // The quote itself never held any stock (see the model comment atop
+    // utils/inventory.js) -- but any pull sheet still open (or
+    // reported-pulled but not yet fulfilled) for it does, so release that
+    // reservation before clearing the sheet out. A fulfilled one is left
+    // alone since it's already a real record of inventory that was actually
+    // removed.
+    const openSheets = await db.query(
+      `SELECT id FROM pull_sheets WHERE company_id = $1 AND source_type = 'quote' AND source_id = $2 AND status != 'fulfilled'`,
+      [req.companyId, req.params.id]
+    );
+    for (const sheet of openSheets.rows) {
+      const sheetItems = await db.query(`SELECT catalog_item_id, quantity FROM pull_sheet_items WHERE pull_sheet_id = $1`, [sheet.id]);
+      await releaseHoldsForLineItems(sheetItems.rows, req.companyId);
+    }
     await db.query(
       `DELETE FROM pull_sheets WHERE company_id = $1 AND source_type = 'quote' AND source_id = $2 AND status != 'fulfilled'`,
       [req.companyId, req.params.id]
@@ -2532,16 +2551,15 @@ router.post("/quotes/:id/convert-to-invoice", async (req, res) => {
         [invoice.id, item.description, item.quantity, item.unit_price, i, item.catalog_item_id]
       );
     }
-    // No inventory hold change here on purpose -- the reservation placed
-    // when the quote was saved simply carries forward to the new invoice
-    // (same catalog items, same quantities). It gets released if this
-    // invoice is later voided/deleted, or consumed once it's paid.
-
     // Any pull sheet already built (and possibly fulfilled) against the
     // quote needs to follow the job to its new invoice id -- otherwise the
     // "how much has already been pulled for this job" lookup used by both
     // pull-sheet building and mark-paid would stop finding it, and the same
     // material could get consumed a second time once this invoice is paid.
+    const priorSheets = await client.query(
+      `SELECT id FROM pull_sheets WHERE source_type = 'quote' AND source_id = $1 AND company_id = $2`,
+      [id, req.companyId]
+    );
     await client.query(
       `UPDATE pull_sheets SET source_type = 'invoice', source_id = $1 WHERE source_type = 'quote' AND source_id = $2 AND company_id = $3`,
       [invoice.id, id, req.companyId]
@@ -2554,6 +2572,18 @@ router.post("/quotes/:id/convert-to-invoice", async (req, res) => {
     );
 
     await client.query("COMMIT");
+
+    // The quote itself never held any stock (see the model comment atop
+    // utils/inventory.js). If a pull sheet was already built against it --
+    // whether still open or already fulfilled -- that pull sheet is (or
+    // was) the thing holding this job's reservation, and it just followed
+    // along to the invoice above, so there's nothing new to hold. Only when
+    // there's never been a pull sheet for this job does converting to an
+    // invoice need to place a fresh hold itself.
+    if (priorSheets.rowCount === 0) {
+      await placeHoldsForLineItems(itemsResult.rows, req.companyId);
+    }
+
     res.status(201).json({ invoice: { ...invoice, line_items: itemsResult.rows }, quote: updatedQuote.rows[0] });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -3009,19 +3039,20 @@ router.get("/inventory", async (req, res) => {
 });
 
 // GET /api/admin/catalog-items/:id/holds
-// Lists every quote/invoice currently responsible for this item's
+// Lists every invoice or pull sheet currently responsible for this item's
 // quantity_on_hold, so clicking an "on hold" number can answer "held by
-// what, exactly". Only counts sources that still actually hold a
-// reservation right now, matching the same rules placeHoldsForLineItems/
-// releaseHoldsForLineItems apply everywhere else:
+// what, exactly". Quotes are never listed here -- a quote never holds stock
+// on its own (see the model comment atop utils/inventory.js); only a pull
+// sheet built against one, or converting it to an invoice, actually reserves
+// anything. Only counts sources that still actually hold a reservation right
+// now, matching the same rules placeHoldsForLineItems/releaseHoldsForLineItems
+// apply everywhere else:
 //   - Invoices: 'draft' or 'sent' only -- 'paid' already consumed the hold
 //     (not still "on hold"), 'void' already released it.
-//   - Quotes: 'draft', 'sent', or 'accepted' AND not yet converted to an
-//     invoice -- 'declined' already released it, and once a quote is
-//     converted the same reservation carries forward to the new invoice
-//     (see convert-to-invoice) rather than being held twice, so a
-//     converted quote is deliberately excluded here to avoid double-listing
-//     the same hold under both the quote and its invoice.
+//   - Pull sheets: not yet 'fulfilled', and only ones built from a quote or
+//     standalone/manual -- one built from an invoice doesn't hold anything
+//     of its own (the invoice's own hold, listed separately above, already
+//     covers it), so listing it here too would double-count the same hold.
 router.get("/catalog-items/:id/holds", async (req, res) => {
   try {
     const { id } = req.params;
@@ -3029,18 +3060,17 @@ router.get("/catalog-items/:id/holds", async (req, res) => {
     if (owns.rowCount === 0) return res.status(404).json({ error: "Item not found" });
 
     const result = await db.query(
-      `SELECT 'invoice' AS source_type, i.id, i.invoice_number AS number, i.status, c.name AS customer_name, ili.quantity
+      `SELECT 'invoice' AS source_type, i.id, ('Invoice #' || i.invoice_number) AS label, i.status, c.name AS customer_name, ili.quantity
        FROM invoice_line_items ili
        JOIN invoices i ON i.id = ili.invoice_id
        JOIN customers c ON c.id = i.customer_id
        WHERE ili.catalog_item_id = $1 AND i.company_id = $2 AND i.status IN ('draft', 'sent')
        UNION ALL
-       SELECT 'quote' AS source_type, q.id, q.quote_number AS number, q.status, c.name AS customer_name, qli.quantity
-       FROM quote_line_items qli
-       JOIN quotes q ON q.id = qli.quote_id
-       JOIN customers c ON c.id = q.customer_id
-       WHERE qli.catalog_item_id = $1 AND q.company_id = $2 AND q.status IN ('draft', 'sent', 'accepted') AND q.converted_invoice_id IS NULL
-       ORDER BY source_type, number`,
+       SELECT 'pull_sheet' AS source_type, ps.id, ps.source_label AS label, ps.status, ps.customer_name, psi.quantity
+       FROM pull_sheet_items psi
+       JOIN pull_sheets ps ON ps.id = psi.pull_sheet_id
+       WHERE psi.catalog_item_id = $1 AND ps.company_id = $2 AND ps.status != 'fulfilled' AND ps.source_type IN ('quote', 'manual')
+       ORDER BY source_type, label`,
       [id, req.companyId]
     );
     res.json(result.rows);
@@ -3212,6 +3242,10 @@ router.post("/pull-sheets", async (req, res) => {
         );
       }
 
+      // A manual sheet isn't tied to any quote or invoice, so nothing else
+      // could already be holding these items -- it places its own hold.
+      await placeHoldsForLineItems(toPull, req.companyId);
+
       return res.status(201).json({ ...sheet, items: toPull });
     }
 
@@ -3291,6 +3325,16 @@ router.post("/pull-sheets", async (req, res) => {
       );
     }
 
+    // A quote never holds any stock on its own (see the model comment atop
+    // utils/inventory.js), so building a pull sheet against one is the first
+    // thing that actually reserves it. An invoice, on the other hand, always
+    // already holds its own line items from the moment it was created (or
+    // converted from a quote) -- building a pull sheet from it doesn't place
+    // a second hold on top of that one.
+    if (source_type === "quote") {
+      await placeHoldsForLineItems(toPull, req.companyId);
+    }
+
     notifyPullSheetBuilt(sheet, source_type, source_id, req.companyId).catch((err) =>
       console.error("notifyPullSheetBuilt failed:", err.message)
     );
@@ -3346,11 +3390,23 @@ router.patch("/pull-sheets/:id/fulfill", async (req, res) => {
 router.delete("/pull-sheets/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const sheetResult = await db.query(`SELECT status FROM pull_sheets WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    const sheetResult = await db.query(`SELECT status, source_type FROM pull_sheets WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
     if (sheetResult.rowCount === 0) return res.status(404).json({ error: "Pull sheet not found" });
-    if (sheetResult.rows[0].status === "fulfilled") {
+    const sheet = sheetResult.rows[0];
+    if (sheet.status === "fulfilled") {
       return res.status(400).json({ error: "A fulfilled pull sheet can't be deleted." });
     }
+
+    // A quote-sourced or manual/standalone sheet holds its own reservation
+    // (placed when it was built -- see POST /pull-sheets), so cancelling it
+    // needs to release that. An invoice-sourced one never held anything of
+    // its own -- the invoice's hold covers it regardless of whether a pull
+    // sheet exists -- so there's nothing to release for that case.
+    if (sheet.source_type !== "invoice") {
+      const items = await db.query(`SELECT catalog_item_id, quantity FROM pull_sheet_items WHERE pull_sheet_id = $1`, [id]);
+      await releaseHoldsForLineItems(items.rows, req.companyId);
+    }
+
     await db.query(`DELETE FROM pull_sheets WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
     res.json({ success: true });
   } catch (err) {

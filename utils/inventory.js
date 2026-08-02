@@ -6,12 +6,20 @@ const { sendPushToAdmin } = require("./webPush");
 // ever touched -- everything here is a no-op for line items that don't
 // reference a catalog_item_id, or reference one that isn't being tracked.
 //
-// Model: quantity_on_hold is a running reservation counter, bumped up when
-// a quote/invoice line item referencing the item is saved, and brought back
-// down when that quote/invoice is deleted, declined, or voided (the
-// reservation falls through) or when the invoice is paid (the reservation
-// is fulfilled and the stock is actually gone). "Available" for display is
-// always quantity_on_hand - quantity_on_hold, computed at read time.
+// Model: quantity_on_hold is a running reservation counter. A quote on its
+// own never holds anything -- it's just a proposal. The reservation gets
+// placed the moment either (a) a pull sheet is built for the job (from a
+// quote, from an invoice, or a standalone/manual sheet), or (b) a quote
+// converts to an invoice with no pull sheet already covering it. Whichever
+// of those happens first is "the" hold for that job; the other doesn't
+// double it (see the callers in routes/admin.js -- convert-to-invoice only
+// places a hold if no pull sheet already exists, and building a pull sheet
+// from an already-holding invoice doesn't place a second one). It comes back
+// down when that pull sheet/invoice is deleted, declined, voided, or
+// cancelled (the reservation falls through), or when the pull sheet is
+// fulfilled / the invoice is paid (the reservation is fulfilled and the
+// stock is actually gone). "Available" for display is always
+// quantity_on_hand - quantity_on_hold, computed at read time.
 
 // Call after inserting a quote/invoice's line items. `lineItems` is the
 // plain array of { catalog_item_id, quantity, ... } rows already written to
