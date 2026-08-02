@@ -92,6 +92,49 @@ router.patch("/companies/:id", async (req, res) => {
   res.json(result.rows[0]);
 });
 
+// DELETE /api/platform/companies/:id
+// Wipes a company and everything under it -- customers, employees, jobs,
+// invoices/quotes and their payments, time entries, the works. Irreversible,
+// which is why the frontend makes Jeremy confirm three separate times before
+// this ever gets called.
+//
+// Invoices and quotes are deleted explicitly, first, before the company row
+// itself is deleted. That's not just cleanup -- customers.company_id cascades
+// from companies, but invoices.customer_id / quotes.customer_id are
+// ON DELETE RESTRICT (so a customer with invoice history can't normally be
+// deleted out from under them). If those invoice/quote rows were still
+// around when the customers cascade fired, Postgres could throw a foreign
+// key violation depending on cascade order. Clearing invoices/quotes first
+// removes that risk entirely, and everything else (customers, employees,
+// catalog items, jobs, crews, pull sheets, attachments, and so on) cascades
+// cleanly once schema-cascade-delete-company.sql has been run.
+router.delete("/companies/:id", async (req, res) => {
+  const { id } = req.params;
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const companyResult = await client.query(`SELECT id, name FROM companies WHERE id = $1`, [id]);
+    if (companyResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Company not found" });
+    }
+
+    await client.query(`DELETE FROM invoices WHERE company_id = $1`, [id]);
+    await client.query(`DELETE FROM quotes WHERE company_id = $1`, [id]);
+    await client.query(`DELETE FROM companies WHERE id = $1`, [id]);
+
+    await client.query("COMMIT");
+    res.json({ deleted: true, id, name: companyResult.rows[0].name });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("DELETE /platform/companies/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't delete company." });
+  } finally {
+    client.release();
+  }
+});
+
 // GET /api/platform/overview
 // Platform-wide totals across every company -- how much money has actually
 // moved through the app (paid invoices), and your own cut of it (the 0.5%
