@@ -109,6 +109,17 @@ router.post("/reset-password", loginRateLimit, async (req, res) => {
 
 router.use(requireAdmin);
 
+// POST /api/admin/activity-ping
+// Body: none. Fired by the frontend on any click while logged in (see the
+// global click listener in each app), purely so requireAdmin's throttled
+// last_active_at bump (see middleware/requireAdmin.js) runs even during a
+// long session that never happens to load new data -- there's nothing else
+// to do here, requireAdmin already did the actual work before this handler
+// even runs.
+router.post("/activity-ping", (req, res) => {
+  res.json({ ok: true });
+});
+
 // POST /api/admin/change-password
 // Body: { current_password, new_password }
 // Authenticated — for an admin who's already logged in and knows their

@@ -5,6 +5,7 @@ const { signToken, hashPin, comparePin } = require("../utils/auth");
 const { generateResetToken, hashResetToken } = require("../utils/resetToken");
 const { sendEmployeePinResetEmail } = require("../utils/mailer");
 const loginRateLimit = require("../middleware/loginRateLimit");
+const requireAuth = require("../middleware/requireAuth"); // also used below by GET /me
 
 // POST /api/auth/login
 // Body: { name, pin }
@@ -64,6 +65,17 @@ router.post("/login", loginRateLimit, async (req, res) => {
     console.error("POST /auth/login failed:", err);
     res.status(500).json({ error: "Couldn't log in. Please try again." });
   }
+});
+
+// POST /api/auth/activity-ping
+// Authenticated. Fired by the employee app on any click while logged in
+// (see the global click listener in App.jsx), purely so requireAuth's
+// throttled last_active_at bump (see middleware/requireAuth.js) runs even
+// during a long session that never happens to call another endpoint --
+// there's nothing else to do here, requireAuth already did the actual work
+// before this handler even runs.
+router.post("/activity-ping", requireAuth, (req, res) => {
+  res.json({ ok: true });
 });
 
 // POST /api/auth/forgot-pin
@@ -145,7 +157,6 @@ router.post("/reset-pin", loginRateLimit, async (req, res) => {
 
 // GET /api/auth/me  — lets the app verify a stored token is still valid
 // on launch, and get fresh employee info, without re-prompting for a PIN.
-const requireAuth = require("../middleware/requireAuth");
 router.get("/me", requireAuth, async (req, res) => {
   try {
     const result = await db.query(
