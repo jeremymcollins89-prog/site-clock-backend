@@ -235,4 +235,27 @@ router.get("/me", requireAuth, async (req, res) => {
   }
 });
 
+// PATCH /api/auth/clock-in-animation
+// Body: { clock_in_animation }
+// Authenticated. Lets an employee pick their own clock-in celebration --
+// previously this was admin-only (set from the employee's row in the admin
+// app's Employees section), but an employee can now override it for
+// themselves. Whitelist duplicated from routes/admin.js's
+// CLOCK_IN_ANIMATIONS -- no shared constants module exists yet, so keep
+// both lists in sync if it ever changes.
+const CLOCK_IN_ANIMATIONS = ["none", "fireworks", "birthday", "rocket", "fall", "easter", "christmas"];
+router.patch("/clock-in-animation", requireAuth, async (req, res) => {
+  try {
+    const { clock_in_animation } = req.body;
+    if (!CLOCK_IN_ANIMATIONS.includes(clock_in_animation)) {
+      return res.status(400).json({ error: "Invalid clock_in_animation" });
+    }
+    await db.query(`UPDATE employees SET clock_in_animation = $1 WHERE id = $2`, [clock_in_animation, req.employee.employee_id]);
+    res.json({ clock_in_animation });
+  } catch (err) {
+    console.error("PATCH /auth/clock-in-animation failed:", err);
+    res.status(500).json({ error: "Couldn't save your choice." });
+  }
+});
+
 module.exports = router;
