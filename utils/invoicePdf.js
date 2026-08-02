@@ -55,6 +55,7 @@ function renderInvoicePdf({ companyName, invoice, customer, lineItems, logoBuffe
     doc.font("Helvetica-Bold").text(customer.name, 50, topY + 14);
     doc.font("Helvetica");
     let billY = topY + 28;
+    if (customer.company_name) { doc.text(customer.company_name, 50, billY); billY += 14; }
     if (customer.email) { doc.text(customer.email, 50, billY); billY += 14; }
     if (customer.phone) { doc.text(customer.phone, 50, billY); billY += 14; }
     const addressParts = [customer.street, [customer.city, customer.state].filter(Boolean).join(", "), customer.zip]
@@ -152,6 +153,7 @@ function renderQuotePdf({ companyName, quote, customer, lineItems, logoBuffer })
     doc.font("Helvetica-Bold").text(customer.name, 50, topY + 14);
     doc.font("Helvetica");
     let billY = topY + 28;
+    if (customer.company_name) { doc.text(customer.company_name, 50, billY); billY += 14; }
     if (customer.email) { doc.text(customer.email, 50, billY); billY += 14; }
     if (customer.phone) { doc.text(customer.phone, 50, billY); billY += 14; }
     const addressParts = [customer.street, [customer.city, customer.state].filter(Boolean).join(", "), customer.zip]

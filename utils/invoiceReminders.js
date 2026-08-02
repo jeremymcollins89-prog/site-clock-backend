@@ -68,7 +68,7 @@ function localHourIn(timezone) {
 async function checkAndSendReminders() {
   const today = new Date();
   const result = await db.query(
-    `SELECT i.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+    `SELECT i.*, c.name AS customer_name, c.company_name AS customer_company_name, c.email AS customer_email, c.phone AS customer_phone,
             c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip,
             comp.name AS company_name, comp.admin_email AS company_admin_email, comp.logo_data AS company_logo_data,
             comp.timezone AS company_timezone, comp.stripe_connect_status AS company_stripe_connect_status
@@ -101,6 +101,7 @@ async function checkAndSendReminders() {
         invoice,
         customer: {
           name: invoice.customer_name,
+          company_name: invoice.customer_company_name,
           email: invoice.customer_email,
           phone: invoice.customer_phone,
           street: invoice.customer_street,

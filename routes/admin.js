@@ -604,7 +604,7 @@ router.post("/employees/:id/request-ping", async (req, res) => {
 router.get("/customers", async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT id, name, phone, email, street, city, state, zip, notes, created_at
+      `SELECT id, name, company_name, phone, email, street, city, state, zip, notes, created_at
        FROM customers
        WHERE company_id = $1
        ORDER BY name`,
@@ -660,10 +660,10 @@ router.get("/geocode/suggest", async (req, res) => {
 });
 
 // POST /api/admin/customers
-// Body: { name, phone?, email?, street?, city?, state?, zip?, notes?, lat?, lng? }
+// Body: { name, company_name?, phone?, email?, street?, city?, state?, zip?, notes?, lat?, lng? }
 router.post("/customers", async (req, res) => {
   try {
-    const { name, phone, email, street, city, state, zip, notes, lat, lng } = req.body;
+    const { name, company_name, phone, email, street, city, state, zip, notes, lat, lng } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
 
     // If the admin picked a suggestion from the predictive-text dropdown,
@@ -690,11 +690,11 @@ router.post("/customers", async (req, res) => {
     }
 
     const result = await db.query(
-      `INSERT INTO customers (company_id, name, phone, email, street, city, state, zip, notes, lat, lng, geocoded_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-       RETURNING id, name, phone, email, street, city, state, zip, notes, lat, lng, created_at`,
+      `INSERT INTO customers (company_id, name, company_name, phone, email, street, city, state, zip, notes, lat, lng, geocoded_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       RETURNING id, name, company_name, phone, email, street, city, state, zip, notes, lat, lng, created_at`,
       [
-        req.companyId, name, phone || null, email || null, street || null, city || null, state || null, zip || null, notes || null,
+        req.companyId, name, company_name || null, phone || null, email || null, street || null, city || null, state || null, zip || null, notes || null,
         resolvedLat, resolvedLng, geocodedAt,
       ]
     );
@@ -706,7 +706,7 @@ router.post("/customers", async (req, res) => {
 });
 
 // POST /api/admin/customers/import
-// Body: { customers: [{ name, phone?, email?, street?, city?, state?, zip?, notes? }, ...] }
+// Body: { customers: [{ name, company_name?, phone?, email?, street?, city?, state?, zip?, notes? }, ...] }
 // Bulk-imports customers from a CSV exported by other software (parsed
 // client-side, sent here as plain objects). Rows missing a name are
 // skipped, and rows whose name case-insensitively matches an existing
@@ -742,10 +742,11 @@ router.post("/customers/import", async (req, res) => {
       }
       seenNames.add(key);
       await db.query(
-        `INSERT INTO customers (company_id, name, phone, email, street, city, state, zip, notes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        `INSERT INTO customers (company_id, name, company_name, phone, email, street, city, state, zip, notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
         [
           req.companyId, name,
+          (row.company_name || "").trim() || null,
           (row.phone || "").trim() || null,
           (row.email || "").trim() || null,
           (row.street || "").trim() || null,
@@ -766,11 +767,11 @@ router.post("/customers/import", async (req, res) => {
 });
 
 // PATCH /api/admin/customers/:id
-// Body: { name?, phone?, email?, street?, city?, state?, zip?, notes?, lat?, lng? }
+// Body: { name?, company_name?, phone?, email?, street?, city?, state?, zip?, notes?, lat?, lng? }
 router.patch("/customers/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, phone, email, street, city, state, zip, notes, lat, lng } = req.body;
+    const { name, company_name, phone, email, street, city, state, zip, notes, lat, lng } = req.body;
 
     const owns = await db.query(
       `SELECT id, street, city, state, zip FROM customers WHERE id = $1 AND company_id = $2`,
@@ -782,6 +783,7 @@ router.patch("/customers/:id", async (req, res) => {
     const fields = [];
     const values = [];
     if (name !== undefined) { values.push(name); fields.push(`name = $${values.length}`); }
+    if (company_name !== undefined) { values.push(company_name); fields.push(`company_name = $${values.length}`); }
     if (phone !== undefined) { values.push(phone); fields.push(`phone = $${values.length}`); }
     if (email !== undefined) { values.push(email); fields.push(`email = $${values.length}`); }
     if (street !== undefined) { values.push(street); fields.push(`street = $${values.length}`); }
@@ -829,7 +831,7 @@ router.patch("/customers/:id", async (req, res) => {
       values.push(id);
       const result = await db.query(
         `UPDATE customers SET ${fields.join(", ")} WHERE id = $${values.length}
-         RETURNING id, name, phone, email, street, city, state, zip, notes, lat, lng, created_at`,
+         RETURNING id, name, company_name, phone, email, street, city, state, zip, notes, lat, lng, created_at`,
         values
       );
       customer = result.rows[0];
@@ -1386,7 +1388,7 @@ function computeDueDate(issueDate, paymentTerms) {
 // invoice voided) rather than a real bug.
 async function sendInvoiceNow(invoiceId, companyId) {
   const result = await db.query(
-    `SELECT i.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+    `SELECT i.*, c.name AS customer_name, c.company_name AS customer_company_name, c.email AS customer_email, c.phone AS customer_phone,
             c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip
      FROM invoices i JOIN customers c ON c.id = i.customer_id
      WHERE i.id = $1 AND i.company_id = $2`,
@@ -1432,6 +1434,7 @@ async function sendInvoiceNow(invoiceId, companyId) {
     invoice,
     customer: {
       name: invoice.customer_name,
+      company_name: invoice.customer_company_name,
       email: invoice.customer_email,
       phone: invoice.customer_phone,
       street: invoice.customer_street,
@@ -1541,7 +1544,7 @@ router.get("/invoices/:id/pdf", async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
-      `SELECT i.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+      `SELECT i.*, c.name AS customer_name, c.company_name AS customer_company_name, c.email AS customer_email, c.phone AS customer_phone,
               c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip
        FROM invoices i
        JOIN customers c ON c.id = i.customer_id
@@ -1566,6 +1569,7 @@ router.get("/invoices/:id/pdf", async (req, res) => {
       invoice,
       customer: {
         name: invoice.customer_name,
+        company_name: invoice.customer_company_name,
         email: invoice.customer_email,
         phone: invoice.customer_phone,
         street: invoice.customer_street,
@@ -2180,7 +2184,7 @@ router.get("/quotes/:id/pdf", async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
-      `SELECT q.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+      `SELECT q.*, c.name AS customer_name, c.company_name AS customer_company_name, c.email AS customer_email, c.phone AS customer_phone,
               c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip
        FROM quotes q
        JOIN customers c ON c.id = q.customer_id
@@ -2202,6 +2206,7 @@ router.get("/quotes/:id/pdf", async (req, res) => {
       quote,
       customer: {
         name: quote.customer_name,
+        company_name: quote.customer_company_name,
         email: quote.customer_email,
         phone: quote.customer_phone,
         street: quote.customer_street,
@@ -2230,7 +2235,7 @@ router.get("/quotes/:id/pdf", async (req, res) => {
 // or a plain error response on an explicit send).
 async function sendQuoteNow(quoteId, companyId) {
   const result = await db.query(
-    `SELECT q.*, c.name AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+    `SELECT q.*, c.name AS customer_name, c.company_name AS customer_company_name, c.email AS customer_email, c.phone AS customer_phone,
             c.street AS customer_street, c.city AS customer_city, c.state AS customer_state, c.zip AS customer_zip
      FROM quotes q JOIN customers c ON c.id = q.customer_id
      WHERE q.id = $1 AND q.company_id = $2`,
@@ -2267,6 +2272,7 @@ async function sendQuoteNow(quoteId, companyId) {
     quote,
     customer: {
       name: quote.customer_name,
+      company_name: quote.customer_company_name,
       email: quote.customer_email,
       phone: quote.customer_phone,
       street: quote.customer_street,
