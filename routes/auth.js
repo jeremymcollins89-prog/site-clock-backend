@@ -162,25 +162,4 @@ router.get("/me", requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/auth/admin/create-employee
-// Body: { name, email, pin, admin_key }
-// You (the owner) run this once per new hire, e.g. from a simple admin
-// screen or curl command, to issue their initial PIN.
-router.post("/admin/create-employee", async (req, res) => {
-  const { name, email, pin, admin_key } = req.body;
-  if (admin_key !== process.env.ADMIN_KEY) {
-    return res.status(403).json({ error: "Invalid admin key" });
-  }
-  if (!name || !email || !pin) {
-    return res.status(400).json({ error: "name, email, and pin are required" });
-  }
-
-  const pin_hash = await hashPin(pin);
-  const result = await db.query(
-    `INSERT INTO employees (name, email, pin_hash) VALUES ($1, $2, $3) RETURNING id, name, email`,
-    [name, email, pin_hash]
-  );
-  res.status(201).json(result.rows[0]);
-});
-
 module.exports = router;

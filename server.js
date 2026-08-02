@@ -67,7 +67,25 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
 }));
 
-app.use(cors());
+// Restricts which *browser* origins can read responses from this API --
+// the known frontend domain (admin.html/platform.html/the React PWA all
+// live there) plus common local dev ports. Requests with no Origin header
+// at all (curl, server-to-server calls, and Electron's own fetch from a
+// file:// page, which Chromium sends as a "null" origin) are still let
+// through same as before -- this isn't a real session-hijack boundary
+// anyway since auth here is a Bearer token, not a cookie, so a strange
+// website can't ride an existing login; this just stops some other site's
+// JS from being able to read this API's responses cross-origin at all.
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://site-clock-frontend-production.up.railway.app";
+const ALLOWED_ORIGINS = [FRONTEND_URL, "http://localhost:5173", "http://localhost:3000"];
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || origin === "null" || ALLOWED_ORIGINS.includes(origin)) {
+      return callback(null, true);
+    }
+    callback(new Error("Not allowed by CORS"));
+  },
+}));
 
 // Stripe webhook signature verification needs the raw, untouched request
 // body -- so this route is registered with its own express.raw() middleware
@@ -92,13 +110,6 @@ app.post("/api/payments/connect-webhook", express.raw({ type: "application/json"
 app.use(express.json({ limit: "15mb" }));
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
-
-// Temporary route to confirm Sentry is wired up correctly. Visiting this
-// throws an error on purpose so it shows up in the Sentry dashboard. Safe
-// to delete once you've confirmed it works.
-app.get("/api/debug-sentry", () => {
-  throw new Error("Test error - confirming Sentry is receiving errors");
-});
 
 app.use("/api/auth", authRoutes);
 app.use("/api/time-entries", timeEntryRoutes);

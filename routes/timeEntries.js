@@ -41,6 +41,20 @@ router.post("/clock-in", async (req, res) => {
 router.post("/:id/break-start", async (req, res) => {
   try {
     const { id } = req.params;
+    const employee_id = req.employee.employee_id;
+
+    // Confirms this shift is actually the caller's own before touching it --
+    // :id is just a UUID off the URL, so without this check any authenticated
+    // employee (any company) who somehow got hold of another employee's
+    // time_entries.id could start/end their breaks or clock them out.
+    const ownEntry = await db.query(
+      `SELECT id FROM time_entries WHERE id = $1 AND employee_id = $2 AND clock_out IS NULL`,
+      [id, employee_id]
+    );
+    if (ownEntry.rowCount === 0) {
+      return res.status(404).json({ error: "No open shift with that id" });
+    }
+
     const openBreak = await db.query(
       `SELECT id FROM time_entry_breaks WHERE time_entry_id = $1 AND break_end IS NULL`,
       [id]
@@ -64,11 +78,13 @@ router.post("/:id/break-start", async (req, res) => {
 router.post("/:id/break-end", async (req, res) => {
   try {
     const { id } = req.params;
+    const employee_id = req.employee.employee_id;
     const result = await db.query(
       `UPDATE time_entry_breaks SET break_end = now()
        WHERE time_entry_id = $1 AND break_end IS NULL
+         AND EXISTS (SELECT 1 FROM time_entries te WHERE te.id = $1 AND te.employee_id = $2)
        RETURNING *`,
-      [id]
+      [id, employee_id]
     );
     if (result.rowCount === 0) {
       return res.status(404).json({ error: "No break in progress for this shift" });
@@ -84,19 +100,21 @@ router.post("/:id/break-end", async (req, res) => {
 router.post("/:id/clock-out", async (req, res) => {
   try {
     const { id } = req.params;
+    const employee_id = req.employee.employee_id;
 
-    // close any dangling open break first
+    // close any dangling open break first (only if this shift is actually the caller's own)
     await db.query(
       `UPDATE time_entry_breaks SET break_end = now()
-       WHERE time_entry_id = $1 AND break_end IS NULL`,
-      [id]
+       WHERE time_entry_id = $1 AND break_end IS NULL
+         AND EXISTS (SELECT 1 FROM time_entries te WHERE te.id = $1 AND te.employee_id = $2)`,
+      [id, employee_id]
     );
 
     const result = await db.query(
       `UPDATE time_entries SET clock_out = now()
-       WHERE id = $1 AND clock_out IS NULL
+       WHERE id = $1 AND employee_id = $2 AND clock_out IS NULL
        RETURNING *`,
-      [id]
+      [id, employee_id]
     );
     if (result.rowCount === 0) {
       return res.status(404).json({ error: "No open shift with that id" });

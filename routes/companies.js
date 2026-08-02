@@ -3,8 +3,12 @@ const router = express.Router();
 const db = require("../db");
 const bcrypt = require("bcrypt");
 const { signAdminToken } = require("../utils/adminAuth");
+const loginRateLimit = require("../middleware/loginRateLimit");
 
-router.post("/signup", async (req, res) => {
+// Rate-limited like every other password-checking endpoint -- signup runs a
+// real bcrypt hash (~250ms of CPU) and reveals via its 409 whether an email
+// is already registered, so it shouldn't be free to hammer.
+router.post("/signup", loginRateLimit, async (req, res) => {
   try {
     const { company_name, admin_email, admin_password } = req.body;
     if (!company_name || !admin_email || !admin_password) {
