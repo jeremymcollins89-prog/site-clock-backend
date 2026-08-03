@@ -153,6 +153,64 @@ async function consumeRemainingAfterPulls(lineItems, sourceType, sourceId, compa
   await consumeInventoryForLineItems(remaining, companyId);
 }
 
+// Recomputes quantity_on_hold for every tracked catalog item from scratch,
+// based on what's actually still open right now, rather than trusting the
+// running counter -- a one-time hard reset for any item whose counter
+// drifted from reality (e.g. stuck at a positive number from earlier testing
+// or from a bug that's since been fixed, with nothing real left to release
+// it). Matches the exact same "what actually holds this item" rules as
+// GET /api/admin/catalog-items/:id/holds:
+//   - Invoices: 'draft' or 'sent' only ('paid' already consumed the hold,
+//     'void' already released it).
+//   - Pull sheets: not yet 'fulfilled', and only ones built from a quote or
+//     standalone/manual (one built from an invoice doesn't hold anything of
+//     its own -- the invoice's own hold already covers it, so counting it
+//     too would double-count). A quote on its own is never counted here --
+//     see the model comment at the top of this file.
+// Safe to run any number of times; it's a SET, not an increment. Runs once
+// automatically at server startup (see server.js) so a stuck counter
+// self-heals on the next deploy without needing direct database access.
+async function recalculateInventoryHolds() {
+  const result = await db.query(`
+    UPDATE catalog_items ci
+    SET quantity_on_hold = COALESCE((
+      SELECT ROUND(SUM(qty))::integer
+      FROM (
+        SELECT ili.quantity AS qty
+        FROM invoice_line_items ili
+        JOIN invoices i ON i.id = ili.invoice_id
+        WHERE i.status IN ('draft', 'sent') AND ili.catalog_item_id = ci.id
+
+        UNION ALL
+
+        SELECT psi.quantity AS qty
+        FROM pull_sheet_items psi
+        JOIN pull_sheets ps ON ps.id = psi.pull_sheet_id
+        WHERE ps.status != 'fulfilled' AND ps.source_type IN ('quote', 'manual') AND psi.catalog_item_id = ci.id
+      ) sub
+    ), 0)
+    WHERE ci.track_inventory = true
+      AND ci.quantity_on_hold IS DISTINCT FROM COALESCE((
+        SELECT ROUND(SUM(qty))::integer
+        FROM (
+          SELECT ili.quantity AS qty
+          FROM invoice_line_items ili
+          JOIN invoices i ON i.id = ili.invoice_id
+          WHERE i.status IN ('draft', 'sent') AND ili.catalog_item_id = ci.id
+
+          UNION ALL
+
+          SELECT psi.quantity AS qty
+          FROM pull_sheet_items psi
+          JOIN pull_sheets ps ON ps.id = psi.pull_sheet_id
+          WHERE ps.status != 'fulfilled' AND ps.source_type IN ('quote', 'manual') AND psi.catalog_item_id = ci.id
+        ) sub
+      ), 0)
+    RETURNING ci.id, ci.name, ci.quantity_on_hold
+  `);
+  return result.rows;
+}
+
 module.exports = {
   placeHoldsForLineItems,
   releaseHoldsForLineItems,
@@ -160,4 +218,5 @@ module.exports = {
   checkLowStock,
   getPulledQuantities,
   consumeRemainingAfterPulls,
+  recalculateInventoryHolds,
 };

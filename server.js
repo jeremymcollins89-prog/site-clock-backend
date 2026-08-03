@@ -47,6 +47,7 @@ const attachmentsRoutes = require("./routes/attachments");
 const { checkAndSendReminders } = require("./utils/invoiceReminders");
 const { checkAndSendLongShiftAlerts } = require("./utils/longShiftAlerts");
 const { checkAndAutoSubmitTimesheets } = require("./utils/autoSubmitTimesheets");
+const { recalculateInventoryHolds } = require("./utils/inventory");
 
 const app = express();
 
@@ -167,6 +168,24 @@ cron.schedule("0 * * * *", () => {
       Sentry.captureException(err);
     });
 });
+
+// One-time self-heal on every boot: recomputes every tracked item's
+// quantity_on_hold from what's actually still open right now, rather than
+// trusting the running counter. Fixes any item stuck holding stock with
+// nothing real left to release it (leftover test data, or a hold placed by
+// a bug that's since been fixed) without needing direct database access.
+// See recalculateInventoryHolds in utils/inventory.js for exactly what
+// counts as "actually still open". Cheap and safe to run on every restart.
+recalculateInventoryHolds()
+  .then((changed) => {
+    if (changed.length > 0) {
+      console.log(`Inventory hold recalculation corrected ${changed.length} item(s):`, changed.map((c) => `${c.name}=${c.quantity_on_hold}`).join(", "));
+    }
+  })
+  .catch((err) => {
+    console.error("Inventory hold recalculation failed:", err);
+    Sentry.captureException(err);
+  });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Site Clock API listening on port ${PORT}`));
