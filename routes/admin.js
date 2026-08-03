@@ -2741,60 +2741,15 @@ router.post("/quotes/:id/convert-to-invoice", async (req, res) => {
     // along to the invoice above, so there's nothing new to hold. Only when
     // there's never been a pull sheet for this job does converting to an
     // invoice need to place a fresh hold itself.
-    // TEMPORARY DIAGNOSTIC (2026-08-02): converting a quote to an invoice is
-    // not placing holds even for a correctly-configured tracked item, while
-    // creating an invoice directly (no quote involved) does place the hold
-    // fine with the same item. The only structural difference between the
-    // two code paths is this priorSheets gate, so surface exactly what it
-    // sees instead of silently skipping. Safe to remove once the cause is
-    // confirmed.
-    if (priorSheets.rowCount > 0) {
-      throw new Error(
-        `DIAGNOSTIC: convert-to-invoice found ${priorSheets.rowCount} existing pull sheet(s) for quote ${id} ` +
-        `(ids: ${priorSheets.rows.map((r) => r.id).join(", ")}) -- this is why no new hold was placed. ` +
-        `If you never built a pull sheet for this job, this row is unexpected/stale.`
-      );
-    }
-    const trackableItems = itemsResult.rows.filter((it) => it.catalog_item_id);
-    if (trackableItems.length === 0) {
-      throw new Error(
-        `DIAGNOSTIC: none of this quote's ${itemsResult.rows.length} line item(s) have a catalog_item_id set ` +
-        `(items: ${JSON.stringify(itemsResult.rows.map((it) => ({ description: it.description, catalog_item_id: it.catalog_item_id, quantity: it.quantity })))}) -- ` +
-        `so there is nothing here for placeHoldsForLineItems to hold, even though no pull sheet blocked it.`
-      );
-    }
-    // TEMPORARY DIAGNOSTIC (2026-08-02), round 2: the two checks above are
-    // passing clean (no stale pull sheet, catalog_item_id is present), so
-    // snapshot each trackable item's quantity_on_hold immediately before and
-    // after placeHoldsForLineItems runs and report the raw before/after
-    // numbers plus the exact quantity value being applied -- this will show
-    // whether the UPDATE is actually running and, if so, by how much.
-    const beforeSnapshot = await client.query(
-      `SELECT id, quantity_on_hold, track_inventory FROM catalog_items WHERE id = ANY($1::uuid[])`,
-      [trackableItems.map((it) => it.catalog_item_id)]
-    );
-    await placeHoldsForLineItems(itemsResult.rows, req.companyId);
-    const afterSnapshot = await client.query(
-      `SELECT id, quantity_on_hold, track_inventory FROM catalog_items WHERE id = ANY($1::uuid[])`,
-      [trackableItems.map((it) => it.catalog_item_id)]
-    );
-    const beforeMap = new Map(beforeSnapshot.rows.map((r) => [r.id, r]));
-    const afterMap = new Map(afterSnapshot.rows.map((r) => [r.id, r]));
-    const changed = trackableItems.every((it) => {
-      const b = beforeMap.get(it.catalog_item_id);
-      const a = afterMap.get(it.catalog_item_id);
-      return b && a && Number(a.quantity_on_hold) === Number(b.quantity_on_hold) + Math.round(Number(it.quantity));
-    });
-    if (!changed) {
-      throw new Error(
-        `DIAGNOSTIC: quantity_on_hold before/after placeHoldsForLineItems -- ` +
-        trackableItems.map((it) => {
-          const b = beforeMap.get(it.catalog_item_id);
-          const a = afterMap.get(it.catalog_item_id);
-          return `item ${it.catalog_item_id} (raw quantity="${it.quantity}", rounded=${Math.round(Number(it.quantity))}): ` +
-            `before=${b ? b.quantity_on_hold : "NOT FOUND"} track_inventory=${b ? b.track_inventory : "?"} -> after=${a ? a.quantity_on_hold : "NOT FOUND"}`;
-        }).join(" | ")
-      );
+    // Diagnostics run in a prior round confirmed: no stale pull sheet blocks
+    // this, the line item's catalog_item_id is present, and the UPDATE
+    // inside placeHoldsForLineItems increments quantity_on_hold by exactly
+    // the expected amount, in this same request. So the write itself is
+    // correct -- the remaining mismatch is on the read/display side, not
+    // here. See utils/inventory.js for the (still in place) per-item
+    // diagnostic that would catch a 0-row UPDATE.
+    if (priorSheets.rowCount === 0) {
+      await placeHoldsForLineItems(itemsResult.rows, req.companyId);
     }
 
     res.status(201).json({ invoice: { ...invoice, line_items: itemsResult.rows }, quote: updatedQuote.rows[0] });
