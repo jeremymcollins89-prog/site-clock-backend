@@ -2741,39 +2741,9 @@ router.post("/quotes/:id/convert-to-invoice", async (req, res) => {
     // along to the invoice above, so there's nothing new to hold. Only when
     // there's never been a pull sheet for this job does converting to an
     // invoice need to place a fresh hold itself.
-    // TEMPORARY DIAGNOSTIC (2026-08-02), round 4: the previous round's clean
-    // before/after confirmation may not have been against this "Softwares"
-    // item specifically. This one always throws (even on success) with a
-    // plain-English before/after report, since a thrown error is the only
-    // channel that actually surfaces on screen for a non-technical user to
-    // screenshot -- a silent JSON field would be invisible. Safe to remove
-    // once confirmed either way.
-    const trackableItems = itemsResult.rows.filter((it) => it.catalog_item_id);
-    if (trackableItems.length === 0) {
-      throw new Error(`DIAGNOSTIC: this quote's line item(s) have no catalog_item_id linked -- nothing to hold.`);
+    if (priorSheets.rowCount === 0) {
+      await placeHoldsForLineItems(itemsResult.rows, req.companyId);
     }
-    const beforeSnapshot = await client.query(
-      `SELECT id, name, quantity_on_hold, track_inventory FROM catalog_items WHERE id = ANY($1::uuid[])`,
-      [trackableItems.map((it) => it.catalog_item_id)]
-    );
-    if (priorSheets.rowCount > 0) {
-      throw new Error(`DIAGNOSTIC: skipped placing a hold because ${priorSheets.rowCount} pull sheet(s) already exist for this quote (ids: ${priorSheets.rows.map((r) => r.id).join(", ")}).`);
-    }
-    await placeHoldsForLineItems(itemsResult.rows, req.companyId);
-    const afterSnapshot = await client.query(
-      `SELECT id, name, quantity_on_hold, track_inventory FROM catalog_items WHERE id = ANY($1::uuid[])`,
-      [trackableItems.map((it) => it.catalog_item_id)]
-    );
-    const beforeMap = new Map(beforeSnapshot.rows.map((r) => [r.id, r]));
-    const afterMap = new Map(afterSnapshot.rows.map((r) => [r.id, r]));
-    throw new Error(
-      "DIAGNOSTIC (invoice was created successfully -- this message is only reporting on the hold): " +
-      trackableItems.map((it) => {
-        const b = beforeMap.get(it.catalog_item_id);
-        const a = afterMap.get(it.catalog_item_id);
-        return `"${b ? b.name : "?"}" qty=${it.quantity} track_inventory=${b ? b.track_inventory : "?"}: hold went from ${b ? b.quantity_on_hold : "?"} to ${a ? a.quantity_on_hold : "?"}`;
-      }).join(" | ")
-    );
 
     res.status(201).json({ invoice: { ...invoice, line_items: itemsResult.rows }, quote: updatedQuote.rows[0] });
   } catch (err) {

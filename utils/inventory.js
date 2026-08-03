@@ -34,34 +34,11 @@ async function placeHoldsForLineItems(lineItems, companyId) {
     // (e.g. a 0.4-quantity line) reserves nothing.
     const qty = Math.round(Number(item.quantity));
     if (!item.catalog_item_id || !qty) continue;
-    const updateResult = await db.query(
+    await db.query(
       `UPDATE catalog_items SET quantity_on_hold = quantity_on_hold + $1
        WHERE id = $2 AND company_id = $3 AND track_inventory = true`,
       [qty, item.catalog_item_id, companyId]
     );
-    // TEMPORARY DIAGNOSTIC (2026-08-02): a hold is being reported as silently
-    // not applied even though the item looks correctly configured in the UI.
-    // If the UPDATE above matches 0 rows, find out why (wrong company_id,
-    // track_inventory actually false, or the row doesn't exist at all) and
-    // surface it as a real error instead of silently doing nothing, so the
-    // cause shows up in the "Convert to invoice" error banner. Safe to
-    // remove once the real cause is found.
-    if (updateResult.rowCount === 0) {
-      const diag = await db.query(
-        `SELECT company_id, track_inventory FROM catalog_items WHERE id = $1`,
-        [item.catalog_item_id]
-      );
-      const row = diag.rows[0];
-      if (!row) {
-        throw new Error(`DIAGNOSTIC: catalog item ${item.catalog_item_id} does not exist at all.`);
-      } else if (String(row.company_id) !== String(companyId)) {
-        throw new Error(`DIAGNOSTIC: catalog item ${item.catalog_item_id} belongs to company ${row.company_id}, not ${companyId}.`);
-      } else if (row.track_inventory !== true) {
-        throw new Error(`DIAGNOSTIC: catalog item ${item.catalog_item_id} has track_inventory=${row.track_inventory}, not true.`);
-      } else {
-        throw new Error(`DIAGNOSTIC: catalog item ${item.catalog_item_id} looked correct (company matched, track_inventory=true) but the UPDATE still matched 0 rows -- unknown cause.`);
-      }
-    }
     await checkLowStock(item.catalog_item_id, companyId);
   }
 }
