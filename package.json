@@ -4,7 +4,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test": "node --test test/inventory.test.js test/lineItems.test.js"
   },
   "dependencies": {
     "@sentry/node": "^8.45.0",

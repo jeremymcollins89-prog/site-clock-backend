@@ -15,6 +15,7 @@ const { sendPushToEmployee } = require("../utils/webPush");
 const { geocodeAddress, suggestAddresses } = require("../utils/geocode");
 const { optimizeStopOrder, buildGoogleMapsUrl } = require("../utils/routeOptimize");
 const { placeHoldsForLineItems, releaseHoldsForLineItems, consumeInventoryForLineItems, checkLowStock, consumeRemainingAfterPulls, getPulledQuantities } = require("../utils/inventory");
+const { getInvoiceLineItemsForEdit, getQuoteLineItemsForEdit } = require("../utils/lineItems");
 
 const EVENT_TYPES = ["job", "personal", "other", "time_off"];
 const TIME_OFF_STATUSES = ["approved", "denied"];
@@ -1532,11 +1533,7 @@ router.get("/invoices/:id", async (req, res) => {
     );
     if (result.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
 
-    const items = await db.query(
-      `SELECT id, description, quantity, unit_price, catalog_item_id, (quantity * unit_price) AS amount
-       FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
-      [id]
-    );
+    const invoiceLineItems = await getInvoiceLineItemsForEdit(id);
     const payments = await db.query(
       `SELECT id, amount, payment_method, check_number, paid_at FROM invoice_payments WHERE invoice_id = $1 ORDER BY paid_at`,
       [id]
@@ -1545,7 +1542,7 @@ router.get("/invoices/:id", async (req, res) => {
     const invoice = result.rows[0];
     res.json({
       ...invoice,
-      line_items: items.rows,
+      line_items: invoiceLineItems,
       payments: payments.rows,
       amount_paid: amountPaid,
       balance_due: Math.max(0, Number(invoice.total) - amountPaid),
@@ -1765,11 +1762,7 @@ router.patch("/invoices/:id", async (req, res) => {
         }
       }
     } else {
-      const currentItems = await client.query(
-        `SELECT description, quantity, unit_price, catalog_item_id FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
-        [id]
-      );
-      items = currentItems.rows;
+      items = await getInvoiceLineItemsForEdit(id);
     }
 
     const issueDate = issue_date !== undefined ? issue_date : existing.issue_date.toISOString().slice(0, 10);
@@ -2188,12 +2181,8 @@ router.get("/quotes/:id", async (req, res) => {
     );
     if (result.rowCount === 0) return res.status(404).json({ error: "Quote not found" });
 
-    const items = await db.query(
-      `SELECT id, description, quantity, unit_price, catalog_item_id, (quantity * unit_price) AS amount
-       FROM quote_line_items WHERE quote_id = $1 ORDER BY sort_order`,
-      [id]
-    );
-    res.json({ ...result.rows[0], line_items: items.rows });
+    const quoteLineItems = await getQuoteLineItemsForEdit(id);
+    res.json({ ...result.rows[0], line_items: quoteLineItems });
   } catch (err) {
     console.error("GET /admin/quotes/:id failed:", err);
     res.status(500).json({ error: err.message || "Couldn't load quote." });
@@ -2434,11 +2423,7 @@ router.patch("/quotes/:id", async (req, res) => {
         }
       }
     } else {
-      const currentItems = await client.query(
-        `SELECT description, quantity, unit_price, catalog_item_id FROM quote_line_items WHERE quote_id = $1 ORDER BY sort_order`,
-        [id]
-      );
-      items = currentItems.rows;
+      items = await getQuoteLineItemsForEdit(id);
     }
 
     const taxRate = tax_rate !== undefined ? tax_rate : existing.tax_rate;
