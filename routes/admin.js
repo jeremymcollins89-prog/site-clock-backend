@@ -2763,7 +2763,39 @@ router.post("/quotes/:id/convert-to-invoice", async (req, res) => {
         `so there is nothing here for placeHoldsForLineItems to hold, even though no pull sheet blocked it.`
       );
     }
+    // TEMPORARY DIAGNOSTIC (2026-08-02), round 2: the two checks above are
+    // passing clean (no stale pull sheet, catalog_item_id is present), so
+    // snapshot each trackable item's quantity_on_hold immediately before and
+    // after placeHoldsForLineItems runs and report the raw before/after
+    // numbers plus the exact quantity value being applied -- this will show
+    // whether the UPDATE is actually running and, if so, by how much.
+    const beforeSnapshot = await client.query(
+      `SELECT id, quantity_on_hold, track_inventory FROM catalog_items WHERE id = ANY($1::uuid[])`,
+      [trackableItems.map((it) => it.catalog_item_id)]
+    );
     await placeHoldsForLineItems(itemsResult.rows, req.companyId);
+    const afterSnapshot = await client.query(
+      `SELECT id, quantity_on_hold, track_inventory FROM catalog_items WHERE id = ANY($1::uuid[])`,
+      [trackableItems.map((it) => it.catalog_item_id)]
+    );
+    const beforeMap = new Map(beforeSnapshot.rows.map((r) => [r.id, r]));
+    const afterMap = new Map(afterSnapshot.rows.map((r) => [r.id, r]));
+    const changed = trackableItems.every((it) => {
+      const b = beforeMap.get(it.catalog_item_id);
+      const a = afterMap.get(it.catalog_item_id);
+      return b && a && Number(a.quantity_on_hold) === Number(b.quantity_on_hold) + Math.round(Number(it.quantity));
+    });
+    if (!changed) {
+      throw new Error(
+        `DIAGNOSTIC: quantity_on_hold before/after placeHoldsForLineItems -- ` +
+        trackableItems.map((it) => {
+          const b = beforeMap.get(it.catalog_item_id);
+          const a = afterMap.get(it.catalog_item_id);
+          return `item ${it.catalog_item_id} (raw quantity="${it.quantity}", rounded=${Math.round(Number(it.quantity))}): ` +
+            `before=${b ? b.quantity_on_hold : "NOT FOUND"} track_inventory=${b ? b.track_inventory : "?"} -> after=${a ? a.quantity_on_hold : "NOT FOUND"}`;
+        }).join(" | ")
+      );
+    }
 
     res.status(201).json({ invoice: { ...invoice, line_items: itemsResult.rows }, quote: updatedQuote.rows[0] });
   } catch (err) {
