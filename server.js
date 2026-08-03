@@ -47,7 +47,7 @@ const attachmentsRoutes = require("./routes/attachments");
 const { checkAndSendReminders } = require("./utils/invoiceReminders");
 const { checkAndSendLongShiftAlerts } = require("./utils/longShiftAlerts");
 const { checkAndAutoSubmitTimesheets } = require("./utils/autoSubmitTimesheets");
-const { recalculateInventoryHolds } = require("./utils/inventory");
+const { relinkOrphanedLineItems, recalculateInventoryHolds } = require("./utils/inventory");
 
 const app = express();
 
@@ -169,21 +169,32 @@ cron.schedule("0 * * * *", () => {
     });
 });
 
-// One-time self-heal on every boot: recomputes every tracked item's
-// quantity_on_hold from what's actually still open right now, rather than
-// trusting the running counter. Fixes any item stuck holding stock with
-// nothing real left to release it (leftover test data, or a hold placed by
-// a bug that's since been fixed) without needing direct database access.
-// See recalculateInventoryHolds in utils/inventory.js for exactly what
-// counts as "actually still open". Cheap and safe to run on every restart.
-recalculateInventoryHolds()
+// One-time self-heal on every boot, in two steps:
+// 1. Reconnect any invoice/quote line item that lost its catalog_item_id
+//    link to a bug (now fixed) in GET /invoices/:id, GET /quotes/:id, and
+//    the PATCH routes' no-line_items-provided fallback -- see
+//    relinkOrphanedLineItems in utils/inventory.js.
+// 2. Recompute every tracked item's quantity_on_hold from what's actually
+//    still open right now, rather than trusting the running counter --
+//    fixes any item stuck holding stock (or stuck at 0 despite a real open
+//    invoice) with nothing real left to reconcile it, now that step 1 has
+//    restored the links that counter depends on.
+// Neither needs direct database access to run, and both are safe to run on
+// every restart (fixed-point: a second run changes nothing).
+relinkOrphanedLineItems()
+  .then((relinked) => {
+    if (relinked.invoiceLineItems > 0 || relinked.quoteLineItems > 0) {
+      console.log(`Relinked ${relinked.invoiceLineItems} invoice line item(s) and ${relinked.quoteLineItems} quote line item(s) back to their catalog items.`);
+    }
+    return recalculateInventoryHolds();
+  })
   .then((changed) => {
     if (changed.length > 0) {
       console.log(`Inventory hold recalculation corrected ${changed.length} item(s):`, changed.map((c) => `${c.name}=${c.quantity_on_hold}`).join(", "));
     }
   })
   .catch((err) => {
-    console.error("Inventory hold recalculation failed:", err);
+    console.error("Inventory hold self-heal failed:", err);
     Sentry.captureException(err);
   });
 

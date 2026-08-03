@@ -153,6 +153,48 @@ async function consumeRemainingAfterPulls(lineItems, sourceType, sourceId, compa
   await consumeInventoryForLineItems(remaining, companyId);
 }
 
+// One-time repair for a bug (now fixed) where GET /invoices/:id and
+// GET /quotes/:id, and the PATCH routes' no-line_items-provided fallback,
+// all read invoice_line_items/quote_line_items without their
+// catalog_item_id column. Any invoice/quote opened for editing and saved
+// while that bug was live would silently lose the link between its line
+// item and the catalog item it was picked from -- which meant no hold could
+// ever be placed or released for it again, since every hold function bails
+// out on a missing catalog_item_id. Reconnects any such orphaned row back to
+// the catalog item whose name matches its (originally-copied-from-the-
+// catalog) description, for the same company. Only ever touches rows where
+// catalog_item_id is currently NULL, so it can't disturb a row that's
+// already correctly linked (or one that was always a freeform, non-catalog
+// line item -- those just won't have a matching name and are left alone).
+// Safe to run any number of times. Runs once at startup, right before
+// recalculateInventoryHolds, so the recalculation below has the restored
+// links to work from.
+async function relinkOrphanedLineItems() {
+  const invoiceResult = await db.query(`
+    UPDATE invoice_line_items ili
+    SET catalog_item_id = ci.id
+    FROM invoices i, catalog_items ci
+    WHERE ili.invoice_id = i.id
+      AND ili.catalog_item_id IS NULL
+      AND ci.company_id = i.company_id
+      AND ci.name = ili.description
+      AND ci.track_inventory = true
+    RETURNING ili.id
+  `);
+  const quoteResult = await db.query(`
+    UPDATE quote_line_items qli
+    SET catalog_item_id = ci.id
+    FROM quotes q, catalog_items ci
+    WHERE qli.quote_id = q.id
+      AND qli.catalog_item_id IS NULL
+      AND ci.company_id = q.company_id
+      AND ci.name = qli.description
+      AND ci.track_inventory = true
+    RETURNING qli.id
+  `);
+  return { invoiceLineItems: invoiceResult.rowCount, quoteLineItems: quoteResult.rowCount };
+}
+
 // Recomputes quantity_on_hold for every tracked catalog item from scratch,
 // based on what's actually still open right now, rather than trusting the
 // running counter -- a one-time hard reset for any item whose counter
@@ -218,5 +260,6 @@ module.exports = {
   checkLowStock,
   getPulledQuantities,
   consumeRemainingAfterPulls,
+  relinkOrphanedLineItems,
   recalculateInventoryHolds,
 };

@@ -1533,7 +1533,7 @@ router.get("/invoices/:id", async (req, res) => {
     if (result.rowCount === 0) return res.status(404).json({ error: "Invoice not found" });
 
     const items = await db.query(
-      `SELECT id, description, quantity, unit_price, (quantity * unit_price) AS amount
+      `SELECT id, description, quantity, unit_price, catalog_item_id, (quantity * unit_price) AS amount
        FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
       [id]
     );
@@ -1766,7 +1766,7 @@ router.patch("/invoices/:id", async (req, res) => {
       }
     } else {
       const currentItems = await client.query(
-        `SELECT description, quantity, unit_price FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
+        `SELECT description, quantity, unit_price, catalog_item_id FROM invoice_line_items WHERE invoice_id = $1 ORDER BY sort_order`,
         [id]
       );
       items = currentItems.rows;
@@ -2189,7 +2189,7 @@ router.get("/quotes/:id", async (req, res) => {
     if (result.rowCount === 0) return res.status(404).json({ error: "Quote not found" });
 
     const items = await db.query(
-      `SELECT id, description, quantity, unit_price, (quantity * unit_price) AS amount
+      `SELECT id, description, quantity, unit_price, catalog_item_id, (quantity * unit_price) AS amount
        FROM quote_line_items WHERE quote_id = $1 ORDER BY sort_order`,
       [id]
     );
@@ -2435,7 +2435,7 @@ router.patch("/quotes/:id", async (req, res) => {
       }
     } else {
       const currentItems = await client.query(
-        `SELECT description, quantity, unit_price FROM quote_line_items WHERE quote_id = $1 ORDER BY sort_order`,
+        `SELECT description, quantity, unit_price, catalog_item_id FROM quote_line_items WHERE quote_id = $1 ORDER BY sort_order`,
         [id]
       );
       items = currentItems.rows;
