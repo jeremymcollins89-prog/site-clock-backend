@@ -26,11 +26,18 @@ const { sendPushToAdmin } = require("./webPush");
 // quote_line_items/invoice_line_items.
 async function placeHoldsForLineItems(lineItems, companyId) {
   for (const item of lineItems || []) {
-    if (!item.catalog_item_id || !item.quantity) continue;
+    // quote_line_items/invoice_line_items.quantity is NUMERIC(10,2) (a line
+    // item can bill a fractional amount, e.g. 2.5 hours), but
+    // catalog_items.quantity_on_hold/quantity_on_hand are whole-unit INTEGER
+    // columns -- you can't physically hold half a widget. Round to the
+    // nearest whole unit before touching stock; a value that rounds to 0
+    // (e.g. a 0.4-quantity line) reserves nothing.
+    const qty = Math.round(Number(item.quantity));
+    if (!item.catalog_item_id || !qty) continue;
     await db.query(
       `UPDATE catalog_items SET quantity_on_hold = quantity_on_hold + $1
        WHERE id = $2 AND company_id = $3 AND track_inventory = true`,
-      [item.quantity, item.catalog_item_id, companyId]
+      [qty, item.catalog_item_id, companyId]
     );
     await checkLowStock(item.catalog_item_id, companyId);
   }
@@ -42,11 +49,12 @@ async function placeHoldsForLineItems(lineItems, companyId) {
 // negative.
 async function releaseHoldsForLineItems(lineItems, companyId) {
   for (const item of lineItems || []) {
-    if (!item.catalog_item_id || !item.quantity) continue;
+    const qty = Math.round(Number(item.quantity));
+    if (!item.catalog_item_id || !qty) continue;
     await db.query(
       `UPDATE catalog_items SET quantity_on_hold = GREATEST(0, quantity_on_hold - $1)
        WHERE id = $2 AND company_id = $3 AND track_inventory = true`,
-      [item.quantity, item.catalog_item_id, companyId]
+      [qty, item.catalog_item_id, companyId]
     );
     await checkLowStock(item.catalog_item_id, companyId);
   }
@@ -58,13 +66,14 @@ async function releaseHoldsForLineItems(lineItems, companyId) {
 // are now gone for good rather than just reserved.
 async function consumeInventoryForLineItems(lineItems, companyId) {
   for (const item of lineItems || []) {
-    if (!item.catalog_item_id || !item.quantity) continue;
+    const qty = Math.round(Number(item.quantity));
+    if (!item.catalog_item_id || !qty) continue;
     await db.query(
       `UPDATE catalog_items
        SET quantity_on_hand = GREATEST(0, quantity_on_hand - $1),
            quantity_on_hold = GREATEST(0, quantity_on_hold - $1)
        WHERE id = $2 AND company_id = $3 AND track_inventory = true`,
-      [item.quantity, item.catalog_item_id, companyId]
+      [qty, item.catalog_item_id, companyId]
     );
     await checkLowStock(item.catalog_item_id, companyId);
   }
