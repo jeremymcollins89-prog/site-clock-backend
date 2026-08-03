@@ -2741,9 +2741,29 @@ router.post("/quotes/:id/convert-to-invoice", async (req, res) => {
     // along to the invoice above, so there's nothing new to hold. Only when
     // there's never been a pull sheet for this job does converting to an
     // invoice need to place a fresh hold itself.
-    if (priorSheets.rowCount === 0) {
-      await placeHoldsForLineItems(itemsResult.rows, req.companyId);
+    // TEMPORARY DIAGNOSTIC (2026-08-02): converting a quote to an invoice is
+    // not placing holds even for a correctly-configured tracked item, while
+    // creating an invoice directly (no quote involved) does place the hold
+    // fine with the same item. The only structural difference between the
+    // two code paths is this priorSheets gate, so surface exactly what it
+    // sees instead of silently skipping. Safe to remove once the cause is
+    // confirmed.
+    if (priorSheets.rowCount > 0) {
+      throw new Error(
+        `DIAGNOSTIC: convert-to-invoice found ${priorSheets.rowCount} existing pull sheet(s) for quote ${id} ` +
+        `(ids: ${priorSheets.rows.map((r) => r.id).join(", ")}) -- this is why no new hold was placed. ` +
+        `If you never built a pull sheet for this job, this row is unexpected/stale.`
+      );
     }
+    const trackableItems = itemsResult.rows.filter((it) => it.catalog_item_id);
+    if (trackableItems.length === 0) {
+      throw new Error(
+        `DIAGNOSTIC: none of this quote's ${itemsResult.rows.length} line item(s) have a catalog_item_id set ` +
+        `(items: ${JSON.stringify(itemsResult.rows.map((it) => ({ description: it.description, catalog_item_id: it.catalog_item_id, quantity: it.quantity })))}) -- ` +
+        `so there is nothing here for placeHoldsForLineItems to hold, even though no pull sheet blocked it.`
+      );
+    }
+    await placeHoldsForLineItems(itemsResult.rows, req.companyId);
 
     res.status(201).json({ invoice: { ...invoice, line_items: itemsResult.rows }, quote: updatedQuote.rows[0] });
   } catch (err) {
