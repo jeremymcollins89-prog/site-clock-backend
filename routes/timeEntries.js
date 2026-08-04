@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db"); // your existing pg Pool, adjust path to match your project
 const requireAuth = require("../middleware/requireAuth");
+const { setAutoClockinSuppressed, clearAutoClockinSuppressed } = require("../utils/autoClockinSuppression");
 
 router.use(requireAuth); // every route below requires a valid employee token
 
@@ -30,6 +31,15 @@ router.post("/clock-in", async (req, res) => {
        VALUES ($1, $2, $3, now()) RETURNING *`,
       [employee_id, job_name, location_type]
     );
+
+    // Any successful clock-in -- manual or auto -- makes a leftover
+    // "don't auto clock-in" flag from a previous manual clock-out stale.
+    // Not awaited-and-checked beyond logging: this is bookkeeping for the
+    // *next* clock-out decision, never something this response depends on.
+    clearAutoClockinSuppressed(employee_id).catch((err) =>
+      console.error("Failed to clear auto_clockin_suppressed on clock-in:", err)
+    );
+
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error("POST /time-entries/clock-in failed:", err);
@@ -101,6 +111,12 @@ router.post("/:id/clock-out", async (req, res) => {
   try {
     const { id } = req.params;
     const employee_id = req.employee.employee_id;
+    // Only a genuinely manual clock-out (the employee tapping the button
+    // themselves) should suppress auto clock-in afterward -- the automatic,
+    // geofence-driven clock-out never sends this, since there's nothing to
+    // suppress: they've already left, so auto clock-in won't fire again
+    // until a fresh arrival anyway.
+    const manual = req.body.manual === true;
 
     // close any dangling open break first (only if this shift is actually the caller's own)
     await db.query(
@@ -119,10 +135,34 @@ router.post("/:id/clock-out", async (req, res) => {
     if (result.rowCount === 0) {
       return res.status(404).json({ error: "No open shift with that id" });
     }
+
+    if (manual) {
+      setAutoClockinSuppressed(employee_id).catch((err) =>
+        console.error("Failed to set auto_clockin_suppressed on manual clock-out:", err)
+      );
+    }
+
     res.json(result.rows[0]);
   } catch (err) {
     console.error("POST /time-entries/:id/clock-out failed:", err);
     res.status(500).json({ error: "Couldn't clock out. Please try again." });
+  }
+});
+
+// POST /api/time-entries/clear-auto-clockin-suppression
+// Called once a client (web app today, a native background client in the
+// future) detects the employee has actually left the shop radius after a
+// manual clock-out -- from that point on, a fresh arrival is a genuine new
+// one, so the "don't auto clock-in" flag no longer applies. Safe to call
+// even if the flag was never set (idempotent no-op).
+router.post("/clear-auto-clockin-suppression", async (req, res) => {
+  try {
+    const employee_id = req.employee.employee_id;
+    await clearAutoClockinSuppressed(employee_id);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /time-entries/clear-auto-clockin-suppression failed:", err);
+    res.status(500).json({ error: "Couldn't update suppression state." });
   }
 });
 

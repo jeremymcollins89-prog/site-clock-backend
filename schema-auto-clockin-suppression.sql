@@ -1,0 +1,16 @@
+-- Moves the "don't auto clock-in right after a manual clock-out" flag from
+-- browser-only localStorage (see frontend/src/geoAutoClock.js) to the
+-- server, so it's shared by every surface reading/writing it for the same
+-- employee -- not just whichever browser tab happened to set it. This is
+-- what lets a future native/background client (which has no localStorage of
+-- its own) honor the same "they just clocked out, don't immediately clock
+-- them back in while they're still standing at the shop" rule that the web
+-- app already enforces today.
+--
+-- Semantics match the existing local-storage flag exactly:
+--   - set true on a *manual* clock-out (POST /time-entries/:id/clock-out
+--     with { manual: true } in the body)
+--   - cleared to false on any successful clock-in (manual or automatic)
+--   - cleared to false once a client detects the employee has actually left
+--     the shop radius (POST /time-entries/clear-auto-clockin-suppression)
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS auto_clockin_suppressed BOOLEAN NOT NULL DEFAULT false;
