@@ -527,7 +527,12 @@ router.get("/time-entries", async (req, res) => {
   if (employee_id) { params.push(employee_id); conditions.push(`d.employee_id = $${params.length}`); }
 
   const result = await db.query(
-    `SELECT d.*, e.name AS employee_name
+    `SELECT d.*, e.name AS employee_name,
+       COALESCE(
+         (SELECT json_agg(json_build_object('id', b.id, 'break_start', b.break_start, 'break_end', b.break_end) ORDER BY b.break_start)
+          FROM time_entry_breaks b WHERE b.time_entry_id = d.time_entry_id),
+         '[]'
+       ) AS breaks
      FROM time_entry_durations d
      JOIN employees e ON e.id = d.employee_id
      WHERE ${conditions.join(" AND ")}
@@ -557,9 +562,56 @@ router.patch("/time-entries/:id", async (req, res) => {
 
   if (fields.length === 0) return res.status(400).json({ error: "Nothing to update" });
 
+  // An admin setting clock_out here (whether editing it directly or via
+  // "Force clock out now") is exactly like an employee clocking themselves
+  // out -- any break left dangling open (break_end still NULL) needs to be
+  // closed too, or time_entry_durations keeps inflating break_seconds with
+  // real elapsed time forever (it falls back to now() for an open break).
+  // Closing it at the new clock_out time keeps worked/break seconds correct
+  // even if clock_out is being backdated.
+  if (clock_out !== undefined) {
+    await db.query(
+      `UPDATE time_entry_breaks SET break_end = $1
+       WHERE time_entry_id = $2 AND break_end IS NULL`,
+      [clock_out, id]
+    );
+  }
+
   values.push(id);
   const result = await db.query(
     `UPDATE time_entries SET ${fields.join(", ")} WHERE id = $${values.length} RETURNING *`,
+    values
+  );
+  res.json(result.rows[0]);
+});
+
+// A break an employee forgot to end (break_start set, break_end still NULL)
+// used to be uneditable entirely -- there was no admin route that touched
+// time_entry_breaks at all, only the parent time_entries row. This lets an
+// admin correct either side of a specific break.
+router.patch("/time-entries/:id/breaks/:breakId", async (req, res) => {
+  const { id, breakId } = req.params;
+  const { break_start, break_end } = req.body;
+
+  const owns = await db.query(
+    `SELECT b.id FROM time_entry_breaks b
+     JOIN time_entries te ON te.id = b.time_entry_id
+     JOIN employees e ON e.id = te.employee_id
+     WHERE b.id = $1 AND b.time_entry_id = $2 AND e.company_id = $3`,
+    [breakId, id, req.companyId]
+  );
+  if (owns.rowCount === 0) return res.status(404).json({ error: "Break not found" });
+
+  const fields = [];
+  const values = [];
+  if (break_start !== undefined) { values.push(break_start); fields.push(`break_start = $${values.length}`); }
+  if (break_end !== undefined) { values.push(break_end || null); fields.push(`break_end = $${values.length}`); }
+
+  if (fields.length === 0) return res.status(400).json({ error: "Nothing to update" });
+
+  values.push(breakId);
+  const result = await db.query(
+    `UPDATE time_entry_breaks SET ${fields.join(", ")} WHERE id = $${values.length} RETURNING *`,
     values
   );
   res.json(result.rows[0]);
