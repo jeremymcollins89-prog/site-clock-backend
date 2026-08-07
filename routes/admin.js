@@ -13,6 +13,7 @@ const { getPayPeriod, PAY_FREQUENCIES } = require("../utils/payPeriod");
 const { JOB_COLORS } = require("../utils/jobColors");
 const { sendPushToEmployee } = require("../utils/webPush");
 const { geocodeAddress, suggestAddresses } = require("../utils/geocode");
+const { lookupExternalProductSuggestion } = require("../utils/barcodeLookup");
 const { optimizeStopOrder, buildGoogleMapsUrl } = require("../utils/routeOptimize");
 const { placeHoldsForLineItems, releaseHoldsForLineItems, consumeInventoryForLineItems, checkLowStock, consumeRemainingAfterPulls, getPulledQuantities } = require("../utils/inventory");
 const { getInvoiceLineItemsForEdit, getQuoteLineItemsForEdit } = require("../utils/lineItems");
@@ -3234,21 +3235,7 @@ router.get("/catalog-items/lookup-barcode/:barcode", async (req, res) => {
       return res.json({ found_in_catalog: true, item: existing.rows[0] });
     }
 
-    let suggestion = null;
-    try {
-      const upcResp = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(barcode)}`, {
-        headers: { Accept: "application/json" },
-      });
-      if (upcResp.ok) {
-        const upcData = await upcResp.json();
-        const found = upcData.items && upcData.items[0];
-        if (found) {
-          suggestion = { name: found.title || found.brand || null, brand: found.brand || null };
-        }
-      }
-    } catch (lookupErr) {
-      console.error("UPC lookup failed (non-fatal):", lookupErr.message);
-    }
+    const suggestion = await lookupExternalProductSuggestion(barcode);
 
     res.json({ found_in_catalog: false, suggestion });
   } catch (err) {
@@ -3788,8 +3775,12 @@ router.post("/catalog-items/import", async (req, res) => {
       return res.status(400).json({ error: "That's more than 2000 rows at once -- please split the file up." });
     }
 
-    const existing = await db.query(`SELECT id, name FROM catalog_items WHERE company_id = $1`, [req.companyId]);
+    const existing = await db.query(`SELECT id, name, barcode FROM catalog_items WHERE company_id = $1`, [req.companyId]);
     const existingByName = new Map(existing.rows.map((r) => [r.name.trim().toLowerCase(), r.id]));
+    // A barcode is a more precise match than a name -- two rows can share a
+    // generic name ("Bolt") but never the same real-world barcode -- so a
+    // barcode match below takes priority over a name match.
+    const existingByBarcode = new Map(existing.rows.filter((r) => r.barcode).map((r) => [r.barcode.trim(), r.id]));
 
     let imported = 0;
     let updated = 0;
@@ -3803,6 +3794,7 @@ router.post("/catalog-items/import", async (req, res) => {
         continue;
       }
       const key = name.toLowerCase();
+      const barcode = (row.barcode || "").trim() || null;
 
       const hasQuantity = row.quantity_on_hand !== undefined && row.quantity_on_hand !== null && row.quantity_on_hand !== "";
       const hasCost = row.unit_cost !== undefined && row.unit_cost !== null && row.unit_cost !== "";
@@ -3810,30 +3802,37 @@ router.post("/catalog-items/import", async (req, res) => {
       const unitCost = hasCost ? Number(row.unit_cost) || 0 : null;
       const trackInventory = hasQuantity || hasCost;
 
-      const existingId = existingByName.get(key);
+      const existingId = (barcode && existingByBarcode.get(barcode)) || existingByName.get(key);
       if (existingId) {
-        if (!trackInventory) {
+        // A row that brings nothing new (no quantity/cost, no barcode to add)
+        // is a genuine no-op duplicate -- skip it. But a row that only adds a
+        // barcode to an already-known item is worth applying even without
+        // quantity/cost, so it doesn't get lumped in as skipped.
+        if (!trackInventory && !barcode) {
           skipped.push({ row: i + 1, reason: "duplicate", name });
           continue;
         }
         await db.query(
           `UPDATE catalog_items
-           SET track_inventory = true,
+           SET track_inventory = track_inventory OR $1,
                quantity_on_hand = CASE WHEN $1 THEN $2 ELSE quantity_on_hand END,
-               unit_cost = CASE WHEN $3 THEN $4 ELSE unit_cost END
+               unit_cost = CASE WHEN $3 THEN $4 ELSE unit_cost END,
+               barcode = CASE WHEN $7 THEN $8 ELSE barcode END
            WHERE id = $5 AND company_id = $6`,
-          [hasQuantity, quantityOnHand, hasCost, unitCost, existingId, req.companyId]
+          [hasQuantity, quantityOnHand, hasCost, unitCost, existingId, req.companyId, !!barcode, barcode]
         );
+        if (barcode) existingByBarcode.set(barcode, existingId);
         updated++;
         continue;
       }
 
       const inserted = await db.query(
-        `INSERT INTO catalog_items (company_id, name, unit_price, track_inventory, quantity_on_hand, unit_cost)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-        [req.companyId, name, Number(row.unit_price) || 0, trackInventory, quantityOnHand, unitCost]
+        `INSERT INTO catalog_items (company_id, name, unit_price, track_inventory, quantity_on_hand, unit_cost, barcode)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+        [req.companyId, name, Number(row.unit_price) || 0, trackInventory, quantityOnHand, unitCost, barcode]
       );
       existingByName.set(key, inserted.rows[0].id);
+      if (barcode) existingByBarcode.set(barcode, inserted.rows[0].id);
       imported++;
     }
 

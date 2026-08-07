@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require("../db");
 const requireAuth = require("../middleware/requireAuth");
 const { checkLowStock } = require("../utils/inventory");
+const { lookupExternalProductSuggestion } = require("../utils/barcodeLookup");
 
 // Employee-facing inventory management -- gated on employees.can_manage_inventory
 // (see schema-employee-inventory-permission.sql), toggled per employee from the
@@ -78,21 +79,7 @@ router.get("/lookup-barcode/:barcode", async (req, res) => {
       return res.json({ found_in_catalog: true, item: existing.rows[0] });
     }
 
-    let suggestion = null;
-    try {
-      const upcResp = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(barcode)}`, {
-        headers: { Accept: "application/json" },
-      });
-      if (upcResp.ok) {
-        const upcData = await upcResp.json();
-        const found = upcData.items && upcData.items[0];
-        if (found) {
-          suggestion = { name: found.title || found.brand || null, brand: found.brand || null };
-        }
-      }
-    } catch (lookupErr) {
-      console.error("UPC lookup failed (non-fatal):", lookupErr.message);
-    }
+    const suggestion = await lookupExternalProductSuggestion(barcode);
 
     res.json({ found_in_catalog: false, suggestion });
   } catch (err) {
