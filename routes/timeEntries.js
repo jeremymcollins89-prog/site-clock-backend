@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require("../db"); // your existing pg Pool, adjust path to match your project
 const requireAuth = require("../middleware/requireAuth");
 const { setAutoClockinSuppressed, clearAutoClockinSuppressed } = require("../utils/autoClockinSuppression");
+const { reverseGeocodeState } = require("../utils/geocode");
 
 router.use(requireAuth); // every route below requires a valid employee token
 
@@ -266,6 +267,55 @@ router.get("/ping-status", async (req, res) => {
   } catch (err) {
     console.error("GET /time-entries/ping-status failed:", err);
     res.status(500).json({ error: "Couldn't check ping status." });
+  }
+});
+
+// GET /api/time-entries/travel-check?lat=&lng=
+// Powers the employee app's auto-default of the manual "In Town" / "Traveling"
+// toggle shown before clocking in (see location_type on POST /clock-in): the
+// app calls this with the employee's current GPS position, we reverse-geocode
+// it to a state and compare against this company's cached shop_state (set
+// whenever the admin saves a shop location -- see PATCH /admin/shop-location
+// and utils/geocode.js's reverseGeocodeState), and tell the client which way
+// to default. The client still lets the employee tap the other option
+// manually -- this only decides which one is pre-selected.
+//
+// Returns `traveling: null` (rather than guessing) whenever we can't make a
+// confident comparison: no shop location configured yet, or the employee's
+// own position couldn't be resolved to a state (e.g. offline, GPS still
+// warming up, or just outside OSM's coverage). The client treats null as
+// "leave the default alone."
+router.get("/travel-check", async (req, res) => {
+  try {
+    const employee_id = req.employee.employee_id;
+    const lat = Number(req.query.lat);
+    const lng = Number(req.query.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ error: "lat and lng are required numbers" });
+    }
+
+    const companyResult = await db.query(
+      `SELECT c.shop_state FROM employees e JOIN companies c ON c.id = e.company_id WHERE e.id = $1`,
+      [employee_id]
+    );
+    if (companyResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    const shopState = companyResult.rows[0].shop_state;
+    if (!shopState) return res.json({ traveling: null, reason: "shop location not configured" });
+
+    const employeeState = await reverseGeocodeState(lat, lng);
+    if (!employeeState) return res.json({ traveling: null, reason: "couldn't resolve current location" });
+
+    res.json({
+      traveling: employeeState.toUpperCase() !== shopState.toUpperCase(),
+      employee_state: employeeState,
+      shop_state: shopState,
+    });
+  } catch (err) {
+    console.error("GET /time-entries/travel-check failed:", err);
+    // Non-fatal by design -- a broken auto-detect should never block the
+    // clock-in screen from rendering, so this still returns 200/null rather
+    // than an error the client would have to specifically ignore.
+    res.json({ traveling: null, reason: "lookup failed" });
   }
 });
 

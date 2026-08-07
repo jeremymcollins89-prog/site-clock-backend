@@ -209,4 +209,53 @@ async function suggestAddresses(query, bias) {
   });
 }
 
-module.exports = { geocodeAddress, buildAddressQuery, suggestAddresses };
+// Turns { lat, lng } into a two-letter US state code (e.g. "AZ") using
+// Nominatim's free /reverse endpoint -- the inverse of geocodeAddress above,
+// same rate-limit queue and User-Agent. Used two places: once per company,
+// whenever an admin saves a new shop location (routes/admin.js PATCH
+// /shop-location), to cache shop_state on the companies row; and once per
+// employee app session, to check the employee's own current position
+// against that cached shop_state (routes/timeEntries.js GET /travel-check)
+// -- so this never runs more than once per shop-location change plus once
+// per employee per clock-in session, well within the 1 req/sec policy.
+//
+// Returns null (not a thrown error) on any failure -- an unresolvable point
+// (rural area with thin OSM coverage, request timeout, etc.) should just
+// mean "can't tell", not break the shop-location save or crash the
+// employee's clock-in screen.
+async function reverseGeocodeState(lat, lng) {
+  const parsedLat = Number(lat);
+  const parsedLng = Number(lng);
+  if (!Number.isFinite(parsedLat) || !Number.isFinite(parsedLng)) return null;
+
+  return enqueue(async () => {
+    try {
+      const params = new URLSearchParams({
+        format: "json",
+        lat: String(parsedLat),
+        lon: String(parsedLng),
+        zoom: "5", // state-level detail is plenty; keeps the lookup fast
+      });
+      const res = await fetch(`https://nominatim.openstreetmap.org/reverse?${params.toString()}`, {
+        headers: { "User-Agent": USER_AGENT, "Accept-Language": "en" },
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      const addr = data && data.address;
+      if (!addr) return null;
+      // "ISO3166-2-lvl4" looks like "US-AZ" when present -- more reliable
+      // than the free-text state name, which sometimes comes back
+      // abbreviated and sometimes doesn't depending on the area. Fall back
+      // to state_code/state (and uppercase/trim) when that field is absent.
+      const iso = addr["ISO3166-2-lvl4"];
+      if (iso && iso.startsWith("US-")) return iso.slice(3);
+      const fallback = addr.state_code || addr.state;
+      return fallback ? String(fallback).trim().slice(0, 32) : null;
+    } catch (err) {
+      console.error("reverseGeocodeState request failed:", err.message);
+      return null;
+    }
+  });
+}
+
+module.exports = { geocodeAddress, buildAddressQuery, suggestAddresses, reverseGeocodeState };

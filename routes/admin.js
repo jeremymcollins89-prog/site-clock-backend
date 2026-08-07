@@ -12,7 +12,7 @@ const loginRateLimit = require("../middleware/loginRateLimit");
 const { getPayPeriod, PAY_FREQUENCIES } = require("../utils/payPeriod");
 const { JOB_COLORS } = require("../utils/jobColors");
 const { sendPushToEmployee } = require("../utils/webPush");
-const { geocodeAddress, suggestAddresses } = require("../utils/geocode");
+const { geocodeAddress, suggestAddresses, reverseGeocodeState } = require("../utils/geocode");
 const { lookupExternalProductSuggestion } = require("../utils/barcodeLookup");
 const { optimizeStopOrder, buildGoogleMapsUrl } = require("../utils/routeOptimize");
 const { placeHoldsForLineItems, releaseHoldsForLineItems, consumeInventoryForLineItems, checkLowStock, consumeRemainingAfterPulls, getPulledQuantities } = require("../utils/inventory");
@@ -276,7 +276,7 @@ router.patch("/company-name", async (req, res) => {
 // midnight (i.e. no earliest-time restriction) until changed.
 router.get("/shop-location", async (req, res) => {
   const result = await db.query(
-    `SELECT shop_lat, shop_lng, shop_radius_m, auto_clockout_time, auto_clockin_time FROM companies WHERE id = $1`,
+    `SELECT shop_lat, shop_lng, shop_radius_m, shop_state, auto_clockout_time, auto_clockin_time FROM companies WHERE id = $1`,
     [req.companyId]
   );
   if (result.rowCount === 0) return res.status(404).json({ error: "Company not found" });
@@ -308,6 +308,15 @@ router.patch("/shop-location", async (req, res) => {
     return res.status(400).json({ error: "auto_clockin_time must be in HH:MM format" });
   }
 
+  // Only worth re-resolving shop_state (a slow, rate-limited external call)
+  // when the coordinates actually moved -- an admin nudging the radius or
+  // auto clock-out time shouldn't re-trigger a geocode lookup.
+  const existing = await db.query(`SELECT shop_lat, shop_lng, shop_state FROM companies WHERE id = $1`, [req.companyId]);
+  const coordsChanged =
+    existing.rowCount === 0 ||
+    Number(existing.rows[0].shop_lat) !== lat ||
+    Number(existing.rows[0].shop_lng) !== lng;
+
   const fields = ["shop_lat = $1", "shop_lng = $2", "shop_radius_m = $3"];
   const values = [lat, lng, radius];
   if (auto_clockout_time) {
@@ -318,11 +327,20 @@ router.patch("/shop-location", async (req, res) => {
     values.push(auto_clockin_time);
     fields.push(`auto_clockin_time = $${values.length}`);
   }
+  if (coordsChanged) {
+    // Best-effort: a failed/slow lookup should never block saving the shop
+    // location itself, so this is awaited but its failure just leaves
+    // shop_state null (the employee app's travel-check treats that as
+    // "can't tell, don't auto-switch" rather than erroring).
+    const state = await reverseGeocodeState(lat, lng).catch(() => null);
+    values.push(state);
+    fields.push(`shop_state = $${values.length}`);
+  }
   values.push(req.companyId);
 
   const result = await db.query(
     `UPDATE companies SET ${fields.join(", ")} WHERE id = $${values.length}
-     RETURNING shop_lat, shop_lng, shop_radius_m, auto_clockout_time, auto_clockin_time`,
+     RETURNING shop_lat, shop_lng, shop_radius_m, shop_state, auto_clockout_time, auto_clockin_time`,
     values
   );
   res.json(result.rows[0]);

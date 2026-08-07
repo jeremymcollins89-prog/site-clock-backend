@@ -1,0 +1,11 @@
+-- Stores the two-letter US state code for the company's shop location
+-- (computed once via reverse-geocoding whenever shop_lat/shop_lng are set
+-- or changed -- see PATCH /api/admin/shop-location in routes/admin.js).
+-- Nullable: unset until an admin saves a shop location, and left null if
+-- reverse-geocoding fails (best-effort, never blocks the save).
+--
+-- Used by GET /api/time-entries/travel-check to compare against the
+-- employee's own current-position state, powering the employee app's
+-- auto-default of the "Traveling" toggle when they're clocking in from
+-- outside the shop's state.
+ALTER TABLE companies ADD COLUMN IF NOT EXISTS shop_state TEXT;

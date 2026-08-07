@@ -20,7 +20,7 @@ router.post("/login", loginRateLimit, async (req, res) => {
     }
 
     const result = await db.query(
-      `SELECT e.*, c.shop_lat, c.shop_lng, c.shop_radius_m, c.auto_clockout_time, c.auto_clockin_time
+      `SELECT e.*, c.shop_lat, c.shop_lng, c.shop_radius_m, c.shop_state, c.auto_clockout_time, c.auto_clockin_time
        FROM employees e
        LEFT JOIN companies c ON c.id = e.company_id
        WHERE e.email = $1 AND e.active = true`,
@@ -54,6 +54,7 @@ router.post("/login", loginRateLimit, async (req, res) => {
         shop_lat: employee.shop_lat,
         shop_lng: employee.shop_lng,
         shop_radius_m: employee.shop_radius_m,
+        shop_state: employee.shop_state,
         auto_clockout_time: employee.auto_clockout_time,
         auto_clockin_time: employee.auto_clockin_time,
         clock_in_animation: employee.clock_in_animation,
@@ -222,7 +223,7 @@ router.post("/reset-pin", loginRateLimit, async (req, res) => {
 router.get("/me", requireAuth, async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT e.id, e.name, e.email, e.clock_in_animation, e.break_minutes, e.can_manage_inventory, e.auto_clockin_suppressed, c.shop_lat, c.shop_lng, c.shop_radius_m, c.auto_clockout_time, c.auto_clockin_time
+      `SELECT e.id, e.name, e.email, e.clock_in_animation, e.break_minutes, e.can_manage_inventory, e.auto_clockin_suppressed, c.shop_lat, c.shop_lng, c.shop_radius_m, c.shop_state, c.auto_clockout_time, c.auto_clockin_time
        FROM employees e
        LEFT JOIN companies c ON c.id = e.company_id
        WHERE e.id = $1`,
