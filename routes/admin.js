@@ -308,14 +308,21 @@ router.patch("/shop-location", async (req, res) => {
     return res.status(400).json({ error: "auto_clockin_time must be in HH:MM format" });
   }
 
-  // Only worth re-resolving shop_state (a slow, rate-limited external call)
-  // when the coordinates actually moved -- an admin nudging the radius or
-  // auto clock-out time shouldn't re-trigger a geocode lookup.
+  // Re-resolve shop_state (a slow, rate-limited external call) when the
+  // coordinates actually moved, OR when it's never been resolved at all --
+  // that second case covers every company that saved its shop location
+  // before shop_state existed, where the lat/lng in the save request will
+  // often be byte-for-byte identical to what's already stored (the admin is
+  // just re-saving the same spot, not moving it), so a coords-only check
+  // would leave shop_state null forever. A plain radius/time nudge with
+  // shop_state already set is the only case that skips the lookup.
   const existing = await db.query(`SELECT shop_lat, shop_lng, shop_state FROM companies WHERE id = $1`, [req.companyId]);
   const coordsChanged =
     existing.rowCount === 0 ||
     Number(existing.rows[0].shop_lat) !== lat ||
     Number(existing.rows[0].shop_lng) !== lng;
+  const needsBackfill = existing.rowCount > 0 && !existing.rows[0].shop_state;
+  const shouldResolveState = coordsChanged || needsBackfill;
 
   const fields = ["shop_lat = $1", "shop_lng = $2", "shop_radius_m = $3"];
   const values = [lat, lng, radius];
@@ -327,7 +334,7 @@ router.patch("/shop-location", async (req, res) => {
     values.push(auto_clockin_time);
     fields.push(`auto_clockin_time = $${values.length}`);
   }
-  if (coordsChanged) {
+  if (shouldResolveState) {
     // Best-effort: a failed/slow lookup should never block saving the shop
     // location itself, so this is awaited but its failure just leaves
     // shop_state null (the employee app's travel-check treats that as
