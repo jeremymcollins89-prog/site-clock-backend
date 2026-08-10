@@ -45,19 +45,12 @@ router.get("/messages", async (req, res) => {
 });
 
 // POST /api/chat/messages
-// Body: { body }. Only allowed while clocked in.
+// Body: { body }. No clock-in requirement -- messaging the office should
+// work any time, not just mid-shift.
 router.post("/messages", async (req, res) => {
   try {
     const { body } = req.body;
     if (!body || !body.trim()) return res.status(400).json({ error: "Message can't be empty." });
-
-    const openShift = await db.query(
-      `SELECT id FROM time_entries WHERE employee_id = $1 AND clock_out IS NULL`,
-      [req.employee.employee_id]
-    );
-    if (openShift.rowCount === 0) {
-      return res.status(400).json({ error: "You need to be clocked in to send a message." });
-    }
 
     const employee = await db.query(`SELECT company_id, name FROM employees WHERE id = $1`, [req.employee.employee_id]);
     if (employee.rowCount === 0) return res.status(404).json({ error: "Employee not found" });

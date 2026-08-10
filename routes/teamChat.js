@@ -188,10 +188,8 @@ router.get("/threads/:id/messages", async (req, res) => {
 });
 
 // POST /api/team-chat/threads/:id/messages
-// Body: { body }. Only allowed while the sender is clocked in -- mirrors the
-// same gate used for the admin<->employee chat. (The admin side of team
-// chat, in routes/admin.js, has no such gate -- that rule is specifically
-// about employees messaging each other while off the clock.)
+// Body: { body }. No clock-in requirement -- team chat works any time, same
+// as the admin side of this same route in routes/admin.js.
 router.post("/threads/:id/messages", async (req, res) => {
   try {
     const { id } = req.params;
@@ -203,14 +201,6 @@ router.post("/threads/:id/messages", async (req, res) => {
       [id, req.employee.employee_id]
     );
     if (participant.rowCount === 0) return res.status(404).json({ error: "Chat not found" });
-
-    const openShift = await db.query(
-      `SELECT id FROM time_entries WHERE employee_id = $1 AND clock_out IS NULL`,
-      [req.employee.employee_id]
-    );
-    if (openShift.rowCount === 0) {
-      return res.status(400).json({ error: "You need to be clocked in to message your team." });
-    }
 
     const me = await db.query(`SELECT name, company_id FROM employees WHERE id = $1`, [req.employee.employee_id]);
     const senderName = me.rows[0]?.name || "A coworker";

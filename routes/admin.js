@@ -3978,10 +3978,9 @@ router.post("/push/unsubscribe", async (req, res) => {
 });
 
 // ---------- Chat ----------
-// One thread per employee (there's only one admin per company). Employees
-// only show up here if they're currently clocked in (so a brand-new
-// conversation can be started) or already have message history (so past
-// conversations stay visible after someone clocks out).
+// One thread per employee (there's only one admin per company). Every active
+// employee shows up here regardless of clock status or message history, so
+// the admin can start a brand-new conversation with anyone at any time.
 router.get("/chat/threads", async (req, res) => {
   try {
     const result = await db.query(
@@ -3998,7 +3997,7 @@ router.get("/chat/threads", async (req, res) => {
          SELECT employee_id, COUNT(*) AS unread_count FROM chat_messages
          WHERE sender = 'employee' AND read_by_admin = false GROUP BY employee_id
        ) uc ON uc.employee_id = e.id
-       WHERE e.company_id = $1 AND e.active = true AND (open_te.id IS NOT NULL OR lm.created_at IS NOT NULL)
+       WHERE e.company_id = $1 AND e.active = true
        ORDER BY (lm.created_at IS NULL), lm.created_at DESC, e.name`,
       [req.companyId]
     );
@@ -4033,7 +4032,8 @@ router.get("/chat/:employeeId/messages", async (req, res) => {
 });
 
 // POST /api/admin/chat/:employeeId/messages
-// Body: { body }. Only allowed while the employee is currently clocked in.
+// Body: { body }. No clock-in requirement -- the admin can message any
+// active employee at any time.
 router.post("/chat/:employeeId/messages", async (req, res) => {
   try {
     const { employeeId } = req.params;
@@ -4042,11 +4042,6 @@ router.post("/chat/:employeeId/messages", async (req, res) => {
 
     const employee = await db.query(`SELECT id, name FROM employees WHERE id = $1 AND company_id = $2`, [employeeId, req.companyId]);
     if (employee.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
-
-    const openShift = await db.query(`SELECT id FROM time_entries WHERE employee_id = $1 AND clock_out IS NULL`, [employeeId]);
-    if (openShift.rowCount === 0) {
-      return res.status(400).json({ error: "This employee isn't clocked in right now, so they can't be messaged." });
-    }
 
     const result = await db.query(
       `INSERT INTO chat_messages (company_id, employee_id, sender, body, read_by_admin, read_by_employee)
