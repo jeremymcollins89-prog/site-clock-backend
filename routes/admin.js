@@ -489,6 +489,9 @@ router.patch("/employees/:id", async (req, res) => {
   const { id } = req.params;
   const { name, email, active, pin, clock_in_animation, hourly_rate, phone, street, city, state, zip, break_minutes, can_manage_inventory } = req.body;
 
+  if (name !== undefined && !name.trim()) {
+    return res.status(400).json({ error: "Name is required" });
+  }
   if (clock_in_animation !== undefined && !CLOCK_IN_ANIMATIONS.includes(clock_in_animation)) {
     return res.status(400).json({ error: "Invalid clock_in_animation" });
   }
