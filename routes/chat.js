@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require("../db");
 const requireAuth = require("../middleware/requireAuth");
 const { sendPushToAdmin } = require("../utils/webPush");
+const { setTyping, isTyping } = require("../utils/typingStore");
 
 router.use(requireAuth);
 
@@ -74,6 +75,25 @@ router.post("/messages", async (req, res) => {
     console.error("POST /chat/messages failed:", err);
     res.status(500).json({ error: err.message || "Couldn't send message." });
   }
+});
+
+// POST /api/chat/typing
+// Fire-and-forget "I'm typing right now" ping -- the client calls this
+// (throttled) while the employee has text in the composer. No body needed;
+// it's just a heartbeat keyed to whoever's making the request.
+router.post("/typing", (req, res) => {
+  setTyping(`direct:${req.employee.employee_id}:employee`, null);
+  // A tiny JSON body rather than a bare 204 -- apiFetch always calls
+  // res.json() on the response, which throws on a truly empty body.
+  res.json({ ok: true });
+});
+
+// GET /api/chat/typing
+// Is the admin currently typing in this employee's thread? Meant to be
+// polled at a much faster interval than /unread-count, but only while the
+// Chat tab is actually open -- see the ~2.5s poll in App.jsx's ChatView.
+router.get("/typing", (req, res) => {
+  res.json({ typing: isTyping(`direct:${req.employee.employee_id}:admin`) });
 });
 
 module.exports = router;

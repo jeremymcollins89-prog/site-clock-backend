@@ -12,6 +12,7 @@ const loginRateLimit = require("../middleware/loginRateLimit");
 const { getPayPeriod, PAY_FREQUENCIES } = require("../utils/payPeriod");
 const { JOB_COLORS } = require("../utils/jobColors");
 const { sendPushToEmployee } = require("../utils/webPush");
+const { setTyping, isTyping, typingLabelsWithPrefix } = require("../utils/typingStore");
 const { geocodeAddress, suggestAddresses, reverseGeocodeState } = require("../utils/geocode");
 const { lookupExternalProductSuggestion } = require("../utils/barcodeLookup");
 const { optimizeStopOrder, buildGoogleMapsUrl } = require("../utils/routeOptimize");
@@ -4068,6 +4069,35 @@ router.post("/chat/:employeeId/messages", async (req, res) => {
   }
 });
 
+// POST /api/admin/chat/:employeeId/typing
+router.post("/chat/:employeeId/typing", async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    const owns = await db.query(`SELECT id FROM employees WHERE id = $1 AND company_id = $2`, [employeeId, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    setTyping(`direct:${employeeId}:admin`, null);
+    // A tiny JSON body rather than a bare 204 -- apiFetch always calls
+    // res.json() on the response, which throws on a truly empty body.
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /admin/chat/:employeeId/typing failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't update typing status." });
+  }
+});
+
+// GET /api/admin/chat/:employeeId/typing
+router.get("/chat/:employeeId/typing", async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    const owns = await db.query(`SELECT id FROM employees WHERE id = $1 AND company_id = $2`, [employeeId, req.companyId]);
+    if (owns.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    res.json({ typing: isTyping(`direct:${employeeId}:employee`) });
+  } catch (err) {
+    console.error("GET /admin/chat/:employeeId/typing failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load typing status." });
+  }
+});
+
 // ---------- Team Chat (admin as a participant) ----------
 // The admin can start/join direct and group chats with employees, using the
 // same employee_chat_* tables employees use to message each other -- the
@@ -4257,6 +4287,46 @@ router.post("/team-chat/threads/:id/messages", async (req, res) => {
   } catch (err) {
     console.error("POST /admin/team-chat/threads/:id/messages failed:", err);
     res.status(500).json({ error: err.message || "Couldn't send message." });
+  }
+});
+
+// POST /api/admin/team-chat/threads/:id/typing
+router.post("/team-chat/threads/:id/typing", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const participant = await db.query(
+      `SELECT p.id FROM employee_chat_participants p
+       JOIN employee_chat_threads t ON t.id = p.thread_id
+       WHERE p.thread_id = $1 AND p.is_admin = true AND t.company_id = $2`,
+      [id, req.companyId]
+    );
+    if (participant.rowCount === 0) return res.status(404).json({ error: "Chat not found" });
+    setTyping(`team:${id}:admin`, "Admin");
+    // A tiny JSON body rather than a bare 204 -- apiFetch always calls
+    // res.json() on the response, which throws on a truly empty body.
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /admin/team-chat/threads/:id/typing failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't update typing status." });
+  }
+});
+
+// GET /api/admin/team-chat/threads/:id/typing
+router.get("/team-chat/threads/:id/typing", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const participant = await db.query(
+      `SELECT p.id FROM employee_chat_participants p
+       JOIN employee_chat_threads t ON t.id = p.thread_id
+       WHERE p.thread_id = $1 AND p.is_admin = true AND t.company_id = $2`,
+      [id, req.companyId]
+    );
+    if (participant.rowCount === 0) return res.status(404).json({ error: "Chat not found" });
+    const typingNames = typingLabelsWithPrefix(`team:${id}:`, `team:${id}:admin`);
+    res.json({ typingNames });
+  } catch (err) {
+    console.error("GET /admin/team-chat/threads/:id/typing failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load typing status." });
   }
 });
 

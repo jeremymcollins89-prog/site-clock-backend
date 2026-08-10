@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require("../db");
 const requireAuth = require("../middleware/requireAuth");
 const { sendPushToEmployee, sendPushToAdmin } = require("../utils/webPush");
+const { setTyping, typingLabelsWithPrefix } = require("../utils/typingStore");
 
 router.use(requireAuth);
 
@@ -251,6 +252,49 @@ router.post("/threads/:id/messages", async (req, res) => {
   } catch (err) {
     console.error("POST /team-chat/threads/:id/messages failed:", err);
     res.status(500).json({ error: err.message || "Couldn't send message." });
+  }
+});
+
+// POST /api/team-chat/threads/:id/typing
+// Fire-and-forget "I'm typing right now" ping, throttled client-side.
+router.post("/threads/:id/typing", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const participant = await db.query(
+      `SELECT 1 FROM employee_chat_participants WHERE thread_id = $1 AND employee_id = $2`,
+      [id, req.employee.employee_id]
+    );
+    if (participant.rowCount === 0) return res.status(404).json({ error: "Chat not found" });
+
+    const me = await db.query(`SELECT name FROM employees WHERE id = $1`, [req.employee.employee_id]);
+    setTyping(`team:${id}:emp:${req.employee.employee_id}`, me.rows[0]?.name || "Someone");
+    // A tiny JSON body rather than a bare 204 -- apiFetch always calls
+    // res.json() on the response, which throws on a truly empty body.
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /team-chat/threads/:id/typing failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't update typing status." });
+  }
+});
+
+// GET /api/team-chat/threads/:id/typing
+// Names of everyone else currently typing in this thread (empty array if
+// nobody is). A group thread can have more than one person typing at once,
+// unlike the Direct channel's simple boolean.
+router.get("/threads/:id/typing", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const participant = await db.query(
+      `SELECT 1 FROM employee_chat_participants WHERE thread_id = $1 AND employee_id = $2`,
+      [id, req.employee.employee_id]
+    );
+    if (participant.rowCount === 0) return res.status(404).json({ error: "Chat not found" });
+
+    const typingNames = typingLabelsWithPrefix(`team:${id}:`, `team:${id}:emp:${req.employee.employee_id}`);
+    res.json({ typingNames });
+  } catch (err) {
+    console.error("GET /team-chat/threads/:id/typing failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load typing status." });
   }
 });
 
