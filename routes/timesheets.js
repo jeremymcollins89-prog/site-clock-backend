@@ -30,11 +30,13 @@ router.post("/submit", requireAuth, async (req, res) => {
     });
   }
 
+  // Period boundaries are computed in the company's own timezone (not the
+  // server's) -- see utils/payPeriod.js for why that matters.
   const period = getPayPeriod(new Date(), {
     pay_frequency: employee.pay_frequency,
     pay_period_anchor: employee.pay_period_anchor,
     pay_period_custom_days: employee.pay_period_custom_days,
-  });
+  }, employee.timezone);
 
   let result;
   try {

@@ -4,6 +4,7 @@ const db = require("../db"); // your existing pg Pool, adjust path to match your
 const requireAuth = require("../middleware/requireAuth");
 const { setAutoClockinSuppressed, clearAutoClockinSuppressed } = require("../utils/autoClockinSuppression");
 const { reverseGeocodeState } = require("../utils/geocode");
+const { getPayPeriod } = require("../utils/payPeriod");
 
 router.use(requireAuth); // every route below requires a valid employee token
 
@@ -164,6 +165,42 @@ router.post("/clear-auto-clockin-suppression", async (req, res) => {
   } catch (err) {
     console.error("POST /time-entries/clear-auto-clockin-suppression failed:", err);
     res.status(500).json({ error: "Couldn't update suppression state." });
+  }
+});
+
+// GET /api/time-entries/pay-period
+// Returns the start/end (ISO strings) of whichever pay period "now" falls
+// into for this employee's company -- computed using the company's actual
+// pay_frequency/anchor settings AND its own timezone (not the server's, and
+// not the requesting device's clock), so this always matches what the
+// backend will actually use when the employee taps "Submit Hours for
+// Payroll" (routes/timesheets.js) or what the admin's Overview dashboard
+// shows (routes/admin.js). The employee app should call this instead of
+// computing period boundaries itself -- a client-side reimplementation of
+// this logic (which is exactly what used to happen here) is very easy to
+// get subtly wrong or out of sync with the real backend logic, and a wrong
+// pay-frequency guess or the device's own local time can each shift the
+// boundary a full period out of alignment near the edges.
+router.get("/pay-period", async (req, res) => {
+  try {
+    const employee_id = req.employee.employee_id;
+    const companyResult = await db.query(
+      `SELECT c.pay_frequency, c.pay_period_anchor, c.pay_period_custom_days, c.timezone
+       FROM employees e JOIN companies c ON c.id = e.company_id
+       WHERE e.id = $1`,
+      [employee_id]
+    );
+    if (companyResult.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    const company = companyResult.rows[0];
+    const period = getPayPeriod(new Date(), {
+      pay_frequency: company.pay_frequency,
+      pay_period_anchor: company.pay_period_anchor,
+      pay_period_custom_days: company.pay_period_custom_days,
+    }, company.timezone);
+    res.json({ start: period.start.toISOString(), end: period.end.toISOString() });
+  } catch (err) {
+    console.error("GET /time-entries/pay-period failed:", err);
+    res.status(500).json({ error: "Couldn't determine the current pay period." });
   }
 });
 

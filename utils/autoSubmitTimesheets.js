@@ -74,10 +74,12 @@ async function checkAndAutoSubmitTimesheets() {
         const now = new Date();
 
         for (let i = 0; i < MAX_PERIODS_PER_RUN; i++) {
-          const period = getPayPeriod(cursor, settings);
+          // Both computed in the company's own timezone (not the server's)
+          // -- see utils/payPeriod.js for why that matters.
+          const period = getPayPeriod(cursor, settings, company.timezone);
           if (period.end >= now) break; // still the current, still-open period -- leave it for the employee
 
-          const payDate = getPayDate(period.end, settings);
+          const payDate = getPayDate(period.end, settings, company.timezone);
           if (payDate > now) break; // period's over, but payday hasn't arrived yet
 
           const result = await submitTimesheetForEmployee({

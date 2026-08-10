@@ -649,10 +649,12 @@ router.patch("/time-entries/:id/breaks/:breakId", async (req, res) => {
 
 router.get("/overview", async (req, res) => {
   const companyResult = await db.query(
-    `SELECT pay_frequency, pay_period_anchor, pay_period_custom_days, long_shift_alert_hours, show_profit_bubbles FROM companies WHERE id = $1`,
+    `SELECT pay_frequency, pay_period_anchor, pay_period_custom_days, timezone, long_shift_alert_hours, show_profit_bubbles FROM companies WHERE id = $1`,
     [req.companyId]
   );
-  const period = getPayPeriod(new Date(), companyResult.rows[0] || {});
+  // Period boundaries are computed in the company's own timezone (not the
+  // server's) -- see utils/payPeriod.js for why that matters.
+  const period = getPayPeriod(new Date(), companyResult.rows[0] || {}, companyResult.rows[0] && companyResult.rows[0].timezone);
   const result = await db.query(
     `SELECT
        e.id, e.name, e.active,
