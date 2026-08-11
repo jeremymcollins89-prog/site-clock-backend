@@ -1159,6 +1159,23 @@ async function notifyPullSheetBuilt(sheet, sourceType, sourceId, companyId) {
   }
 }
 
+// Notifies a specific employee that a solo/manual pull sheet was assigned to
+// them. This is purely a heads-up notification + display badge -- it does
+// NOT restrict who can see or pull the sheet; every employee can still see
+// every open pull sheet per the existing company-wide-visibility design.
+// Best-effort, like notifyPullSheetBuilt above.
+async function notifyPullSheetAssigned(sheet, employeeId) {
+  try {
+    await sendPushToEmployee(employeeId, {
+      title: "Pull sheet assigned to you",
+      body: `You've been assigned to pull: ${sheet.source_label}${sheet.customer_name ? ` — ${sheet.customer_name}` : ""}`,
+      url: "/schedule",
+    });
+  } catch (err) {
+    console.error("notifyPullSheetAssigned failed:", err.message);
+  }
+}
+
 // GET /api/admin/jobs?start=YYYY-MM-DD&end=YYYY-MM-DD
 // Returns jobs overlapping the given range (both optional -- omit both to
 // get every job) along with their assigned employees.
@@ -3572,12 +3589,13 @@ router.get("/pull-sheets", async (req, res) => {
   try {
     const result = await db.query(
       `SELECT ps.id, ps.source_type, ps.source_id, ps.source_label, ps.customer_name, ps.customer_company_name, ps.status,
-              ps.created_at, ps.fulfilled_at,
+              ps.created_at, ps.fulfilled_at, ps.assigned_employee_id, e.name AS assigned_employee_name,
               COALESCE(SUM(psi.quantity), 0) AS item_count
        FROM pull_sheets ps
        LEFT JOIN pull_sheet_items psi ON psi.pull_sheet_id = ps.id
+       LEFT JOIN employees e ON e.id = ps.assigned_employee_id
        WHERE ps.company_id = $1
-       GROUP BY ps.id
+       GROUP BY ps.id, e.name
        ORDER BY ps.created_at DESC
        LIMIT 200`,
       [req.companyId]
@@ -3593,7 +3611,13 @@ router.get("/pull-sheets", async (req, res) => {
 router.get("/pull-sheets/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await db.query(`SELECT * FROM pull_sheets WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    const result = await db.query(
+      `SELECT ps.*, e.name AS assigned_employee_name
+       FROM pull_sheets ps
+       LEFT JOIN employees e ON e.id = ps.assigned_employee_id
+       WHERE ps.id = $1 AND ps.company_id = $2`,
+      [id, req.companyId]
+    );
     if (result.rowCount === 0) return res.status(404).json({ error: "Pull sheet not found" });
     const items = await db.query(
       `SELECT id, catalog_item_id, name, quantity, quantity_pulled, section_name
@@ -3646,7 +3670,7 @@ router.get("/pull-sheets/:id/pdf", async (req, res) => {
 // left, and the same units can never be pulled (and later consumed) twice.
 router.post("/pull-sheets", async (req, res) => {
   try {
-    const { source_type, source_id, items, label } = req.body;
+    const { source_type, source_id, items, label, assigned_employee_id } = req.body;
 
     // Solo/standalone sheet: items picked by hand, not tied to any job. No
     // "already pulled" bookkeeping applies here (nothing to double-count
@@ -3655,6 +3679,23 @@ router.post("/pull-sheets", async (req, res) => {
       if (!Array.isArray(items) || items.length === 0) {
         return res.status(400).json({ error: "Add at least one item to build a pull sheet." });
       }
+
+      // Optional: attach a specific employee so they get a targeted
+      // notification and a "assigned to you" badge. This never restricts
+      // visibility -- every employee can still see and pull every open
+      // sheet, per the existing company-wide-visibility design.
+      let assignedEmployeeId = null;
+      if (assigned_employee_id) {
+        const employeeResult = await db.query(
+          `SELECT id FROM employees WHERE id = $1 AND company_id = $2`,
+          [assigned_employee_id, req.companyId]
+        );
+        if (employeeResult.rowCount === 0) {
+          return res.status(400).json({ error: "That employee wasn't found." });
+        }
+        assignedEmployeeId = employeeResult.rows[0].id;
+      }
+
       const catalogIds = items.map((i) => i.catalog_item_id).filter(Boolean);
       const catalogResult = await db.query(
         `SELECT id, name FROM catalog_items WHERE company_id = $1 AND track_inventory = true AND id = ANY($2::uuid[])`,
@@ -3681,9 +3722,9 @@ router.post("/pull-sheets", async (req, res) => {
       }
 
       const sheetResult = await db.query(
-        `INSERT INTO pull_sheets (company_id, source_type, source_label)
-         VALUES ($1, 'manual', $2) RETURNING *`,
-        [req.companyId, (label && String(label).trim().slice(0, 200)) || "Solo pull sheet"]
+        `INSERT INTO pull_sheets (company_id, source_type, source_label, assigned_employee_id)
+         VALUES ($1, 'manual', $2, $3) RETURNING *`,
+        [req.companyId, (label && String(label).trim().slice(0, 200)) || "Solo pull sheet", assignedEmployeeId]
       );
       const sheet = sheetResult.rows[0];
 
@@ -3697,6 +3738,12 @@ router.post("/pull-sheets", async (req, res) => {
       // A manual sheet isn't tied to any quote or invoice, so nothing else
       // could already be holding these items -- it places its own hold.
       await placeHoldsForLineItems(toPull, req.companyId);
+
+      if (assignedEmployeeId) {
+        notifyPullSheetAssigned(sheet, assignedEmployeeId).catch((err) =>
+          console.error("notifyPullSheetAssigned failed:", err.message)
+        );
+      }
 
       return res.status(201).json({ ...sheet, items: toPull });
     }

@@ -327,7 +327,7 @@ router.get("/pull-sheets", requireAuth, async (req, res) => {
     const companyId = employeeResult.rows[0].company_id;
 
     const result = await db.query(
-      `SELECT ps.id, ps.source_type, ps.source_label, ps.customer_name, ps.status, ps.created_at, ps.fulfilled_at, ps.pulled_at,
+      `SELECT ps.id, ps.source_type, ps.source_label, ps.customer_name, ps.status, ps.created_at, ps.fulfilled_at, ps.pulled_at, ps.assigned_employee_id,
               COALESCE(
                 (SELECT json_agg(json_build_object('id', psi.id, 'name', psi.name, 'quantity', psi.quantity, 'quantity_pulled', psi.quantity_pulled, 'section_name', psi.section_name) ORDER BY psi.sort_order, psi.name)
                  FROM pull_sheet_items psi WHERE psi.pull_sheet_id = ps.id),
@@ -375,7 +375,7 @@ router.get("/pull-sheets/:id", requireAuth, async (req, res) => {
     const companyId = employeeResult.rows[0].company_id;
 
     const sheetResult = await db.query(
-      `SELECT id, source_type, source_label, customer_name, status, created_at, fulfilled_at, pulled_at
+      `SELECT id, source_type, source_label, customer_name, status, created_at, fulfilled_at, pulled_at, assigned_employee_id
        FROM pull_sheets WHERE id = $1 AND company_id = $2`,
       [req.params.id, companyId]
     );
