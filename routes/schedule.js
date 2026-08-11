@@ -329,7 +329,7 @@ router.get("/pull-sheets", requireAuth, async (req, res) => {
     const result = await db.query(
       `SELECT ps.id, ps.source_type, ps.source_label, ps.customer_name, ps.status, ps.created_at, ps.fulfilled_at, ps.pulled_at,
               COALESCE(
-                (SELECT json_agg(json_build_object('id', psi.id, 'name', psi.name, 'quantity', psi.quantity, 'quantity_pulled', psi.quantity_pulled) ORDER BY psi.name)
+                (SELECT json_agg(json_build_object('id', psi.id, 'name', psi.name, 'quantity', psi.quantity, 'quantity_pulled', psi.quantity_pulled, 'section_name', psi.section_name) ORDER BY psi.sort_order, psi.name)
                  FROM pull_sheet_items psi WHERE psi.pull_sheet_id = ps.id),
                 '[]'::json
               ) AS items
@@ -382,7 +382,7 @@ router.get("/pull-sheets/:id", requireAuth, async (req, res) => {
     if (sheetResult.rowCount === 0) return res.status(404).json({ error: "Pull sheet not found" });
 
     const itemsResult = await db.query(
-      `SELECT id, name, quantity, quantity_pulled FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY name`,
+      `SELECT id, name, quantity, quantity_pulled, section_name FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY sort_order, name`,
       [req.params.id]
     );
 
@@ -435,7 +435,7 @@ router.patch("/pull-sheets/:id/pulled", requireAuth, async (req, res) => {
     );
 
     const itemsResult = await db.query(
-      `SELECT id, name, quantity, quantity_pulled FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY name`,
+      `SELECT id, name, quantity, quantity_pulled, section_name FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY sort_order, name`,
       [req.params.id]
     );
 

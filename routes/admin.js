@@ -3440,6 +3440,90 @@ router.get("/catalog-items/:id/holds", async (req, res) => {
   }
 });
 
+// ---------- Pull sheet format (saved default layout) ----------
+// A company's reusable pull sheet structure -- item list, section
+// groupings, and order -- separate from any actual pull sheet's
+// quantities. "Start from my format" (below, POST /pull-sheets with
+// source_type 'format') copies this into a real pull sheet with blank
+// quantities to fill in; the format editor in the admin app reads and
+// rewrites it wholesale via these two routes.
+
+// GET /api/admin/pull-sheet-format
+// Returns { items: [] } if nothing has been saved yet -- not a 404, since
+// "no format saved" is an expected, normal state, not an error.
+router.get("/pull-sheet-format", async (req, res) => {
+  try {
+    const formatResult = await db.query(`SELECT id FROM pull_sheet_formats WHERE company_id = $1`, [req.companyId]);
+    if (formatResult.rowCount === 0) return res.json({ items: [] });
+    const items = await db.query(
+      `SELECT id, catalog_item_id, name, section_name, sort_order
+       FROM pull_sheet_format_items WHERE format_id = $1 ORDER BY sort_order`,
+      [formatResult.rows[0].id]
+    );
+    res.json({ items: items.rows });
+  } catch (err) {
+    console.error("GET /admin/pull-sheet-format failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load your pull sheet format." });
+  }
+});
+
+// PUT /api/admin/pull-sheet-format
+// Body: { items: [{ catalog_item_id, name, section_name? }, ...] }
+// Replaces the company's entire saved format in one shot (delete + reinsert
+// inside a transaction) -- simplest correct way to handle reordering,
+// renaming sections, and removing items all at once from a single "Save"
+// action, without reconciling a diff against what was there before.
+router.put("/pull-sheet-format", async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const { items } = req.body;
+    if (!Array.isArray(items)) {
+      return res.status(400).json({ error: "items must be an array." });
+    }
+    const cleaned = items
+      .map((item) => ({
+        catalog_item_id: item.catalog_item_id || null,
+        name: (item.name || "").trim(),
+        section_name: (item.section_name || "").trim() || null,
+      }))
+      .filter((item) => item.name);
+    if (cleaned.length === 0) {
+      return res.status(400).json({ error: "Add at least one item before saving a format." });
+    }
+
+    await client.query("BEGIN");
+    let formatId;
+    const existing = await client.query(`SELECT id FROM pull_sheet_formats WHERE company_id = $1`, [req.companyId]);
+    if (existing.rowCount > 0) {
+      formatId = existing.rows[0].id;
+      await client.query(`UPDATE pull_sheet_formats SET updated_at = now() WHERE id = $1`, [formatId]);
+      await client.query(`DELETE FROM pull_sheet_format_items WHERE format_id = $1`, [formatId]);
+    } else {
+      const created = await client.query(
+        `INSERT INTO pull_sheet_formats (company_id) VALUES ($1) RETURNING id`,
+        [req.companyId]
+      );
+      formatId = created.rows[0].id;
+    }
+    for (let i = 0; i < cleaned.length; i++) {
+      const item = cleaned[i];
+      await client.query(
+        `INSERT INTO pull_sheet_format_items (format_id, catalog_item_id, name, section_name, sort_order)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [formatId, item.catalog_item_id, item.name, item.section_name, i]
+      );
+    }
+    await client.query("COMMIT");
+    res.json({ ok: true, itemCount: cleaned.length });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("PUT /admin/pull-sheet-format failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't save your pull sheet format." });
+  } finally {
+    client.release();
+  }
+});
+
 // GET /api/admin/pull-sheets/sources
 // Lists the open quotes/invoices a pull sheet could be built from -- only
 // ones that actually have at least one inventory-tracked catalog-linked line
@@ -3512,7 +3596,8 @@ router.get("/pull-sheets/:id", async (req, res) => {
     const result = await db.query(`SELECT * FROM pull_sheets WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
     if (result.rowCount === 0) return res.status(404).json({ error: "Pull sheet not found" });
     const items = await db.query(
-      `SELECT id, catalog_item_id, name, quantity, quantity_pulled FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY name`,
+      `SELECT id, catalog_item_id, name, quantity, quantity_pulled, section_name
+       FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY sort_order, name`,
       [id]
     );
     res.json({ ...result.rows[0], items: items.rows });
@@ -3532,7 +3617,7 @@ router.get("/pull-sheets/:id/pdf", async (req, res) => {
     if (sheetResult.rowCount === 0) return res.status(404).json({ error: "Pull sheet not found" });
     const sheet = sheetResult.rows[0];
     const items = await db.query(
-      `SELECT name, quantity FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY name`,
+      `SELECT name, quantity, section_name FROM pull_sheet_items WHERE pull_sheet_id = $1 ORDER BY sort_order, name`,
       [id]
     );
     const companyResult = await db.query(`SELECT name FROM companies WHERE id = $1`, [req.companyId]);
@@ -3576,11 +3661,18 @@ router.post("/pull-sheets", async (req, res) => {
         [req.companyId, catalogIds]
       );
       const catalogById = new Map(catalogResult.rows.map((r) => [r.id, r.name]));
+      // sort_order is just this array's own position -- preserves whatever
+      // order (and section grouping, via section_name) the admin built the
+      // list in, whether that came from the manual picker, an imported
+      // file, or "Start from my format", instead of always re-sorting
+      // alphabetically once it's saved.
       const toPull = items
-        .map((item) => ({
+        .map((item, i) => ({
           catalog_item_id: item.catalog_item_id,
           name: catalogById.get(item.catalog_item_id),
           quantity: Math.max(0, Math.round(Number(item.quantity)) || 0),
+          section_name: (item.section_name || "").trim() || null,
+          sort_order: i,
         }))
         .filter((item) => item.catalog_item_id && item.name && item.quantity > 0);
 
@@ -3597,8 +3689,8 @@ router.post("/pull-sheets", async (req, res) => {
 
       for (const item of toPull) {
         await db.query(
-          `INSERT INTO pull_sheet_items (pull_sheet_id, catalog_item_id, name, quantity) VALUES ($1, $2, $3, $4)`,
-          [sheet.id, item.catalog_item_id, item.name, item.quantity]
+          `INSERT INTO pull_sheet_items (pull_sheet_id, catalog_item_id, name, quantity, section_name, sort_order) VALUES ($1, $2, $3, $4, $5, $6)`,
+          [sheet.id, item.catalog_item_id, item.name, item.quantity, item.section_name, item.sort_order]
         );
       }
 

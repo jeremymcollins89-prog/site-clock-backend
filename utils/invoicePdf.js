@@ -271,7 +271,18 @@ function renderPullSheetPdf({ companyName, sheet, items }) {
 
     doc.font("Helvetica").fontSize(10);
     let rowY = tableTop + 24;
+    // Items already arrive pre-sorted by sort_order (see the route) so a
+    // section header only needs to print when this item's section differs
+    // from the previous one -- consecutive same-section items are already
+    // grouped together by that order.
+    let lastSection;
     items.forEach((item) => {
+      if (item.section_name && item.section_name !== lastSection) {
+        doc.font("Helvetica-Bold").fontSize(10).fillColor("#333").text(item.section_name, 50, rowY, { width: 500 });
+        rowY += 20;
+        doc.font("Helvetica").fillColor("#000");
+      }
+      lastSection = item.section_name;
       doc.rect(50, rowY - 2, 14, 14).strokeColor("#666").stroke();
       doc.text(item.name, 84, rowY, { width: 370 });
       doc.text(String(item.quantity), 470, rowY, { width: 80, align: "right" });
