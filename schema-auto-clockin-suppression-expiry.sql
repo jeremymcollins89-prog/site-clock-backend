@@ -1,0 +1,17 @@
+-- Adds a timestamp alongside the existing auto_clockin_suppressed boolean,
+-- so the flag can self-expire instead of staying stuck forever if the
+-- "employee left the shop radius" signal that's supposed to clear it never
+-- arrives (background geofence EXIT events can be delayed or dropped by
+-- Android's battery optimization -- confirmed as the likely cause of a real
+-- missed auto clock-in: an employee manually clocked out, the EXIT event
+-- that should have cleared the suppression flag apparently never fired or
+-- never reached the server, and the flag was still true the next morning,
+-- silently blocking that day's auto clock-in even though clock-out logic
+-- -- which never checks this flag -- worked fine).
+--
+-- See routes/auth.js's login and /me responses, which now only report
+-- auto_clockin_suppressed as true if it was also set within the last 12
+-- hours -- long enough to cover "clocked out in the evening, geofence exit
+-- confirms it before bed", short enough that a missed exit event can't
+-- block auto clock-in more than one morning.
+ALTER TABLE employees ADD COLUMN IF NOT EXISTS auto_clockin_suppressed_at TIMESTAMPTZ;

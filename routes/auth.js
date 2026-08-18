@@ -6,6 +6,7 @@ const { generateResetToken, hashResetToken } = require("../utils/resetToken");
 const { sendEmployeePinResetEmail } = require("../utils/mailer");
 const loginRateLimit = require("../middleware/loginRateLimit");
 const requireAuth = require("../middleware/requireAuth"); // also used below by GET /me
+const { isSuppressionEffective } = require("../utils/autoClockinSuppression");
 
 // POST /api/auth/login
 // Body: { name, pin }
@@ -60,7 +61,7 @@ router.post("/login", loginRateLimit, async (req, res) => {
         clock_in_animation: employee.clock_in_animation,
         break_minutes: employee.break_minutes,
         can_manage_inventory: employee.can_manage_inventory,
-        auto_clockin_suppressed: employee.auto_clockin_suppressed,
+        auto_clockin_suppressed: isSuppressionEffective(employee),
       },
     });
   } catch (err) {
@@ -223,14 +224,22 @@ router.post("/reset-pin", loginRateLimit, async (req, res) => {
 router.get("/me", requireAuth, async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT e.id, e.name, e.email, e.clock_in_animation, e.break_minutes, e.can_manage_inventory, e.auto_clockin_suppressed, c.shop_lat, c.shop_lng, c.shop_radius_m, c.shop_state, c.auto_clockout_time, c.auto_clockin_time
+      `SELECT e.id, e.name, e.email, e.clock_in_animation, e.break_minutes, e.can_manage_inventory, e.auto_clockin_suppressed, e.auto_clockin_suppressed_at, c.shop_lat, c.shop_lng, c.shop_radius_m, c.shop_state, c.auto_clockout_time, c.auto_clockin_time
        FROM employees e
        LEFT JOIN companies c ON c.id = e.company_id
        WHERE e.id = $1`,
       [req.employee.employee_id]
     );
     if (result.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
-    res.json(result.rows[0]);
+    const row = result.rows[0];
+    // See utils/autoClockinSuppression.js -- this is what
+    // GeofenceBroadcastReceiver.kt's handleArrival() checks before an auto
+    // clock-in. Reporting the raw column here (rather than the time-boxed
+    // effective value) is exactly what let a stale flag block a whole
+    // morning's auto clock-in after a missed geofence-exit event.
+    row.auto_clockin_suppressed = isSuppressionEffective(row);
+    delete row.auto_clockin_suppressed_at;
+    res.json(row);
   } catch (err) {
     console.error("GET /auth/me failed:", err);
     res.status(500).json({ error: "Couldn't load employee info." });

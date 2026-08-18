@@ -15,19 +15,43 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { installMockDb } = require("./support/mockDb");
-const { setAutoClockinSuppressed, clearAutoClockinSuppressed } = require("../utils/autoClockinSuppression");
+const { setAutoClockinSuppressed, clearAutoClockinSuppressed, isSuppressionEffective } = require("../utils/autoClockinSuppression");
 
-test("setAutoClockinSuppressed sets the flag true for the given employee", async () => {
+test("setAutoClockinSuppressed sets the flag true and stamps a timestamp for the given employee", async () => {
   const mock = installMockDb();
   try {
     mock.queueRows([]);
     await setAutoClockinSuppressed("emp-1");
     assert.equal(mock.calls.length, 1);
-    assert.match(mock.calls[0].text, /UPDATE employees SET auto_clockin_suppressed = true/);
+    assert.match(mock.calls[0].text, /UPDATE employees SET auto_clockin_suppressed = true, auto_clockin_suppressed_at = now\(\)/);
     assert.deepEqual(mock.calls[0].params, ["emp-1"]);
   } finally {
     mock.restore();
   }
+});
+
+// See schema-auto-clockin-suppression-expiry.sql -- added after a real
+// missed auto clock-in where the flag stayed stuck true overnight because
+// the geofence-exit event that should have cleared it apparently never
+// arrived. isSuppressionEffective() is what lets a stale flag stop
+// blocking auto clock-in after enough time has passed regardless.
+test("isSuppressionEffective is false when the flag isn't set", () => {
+  assert.equal(isSuppressionEffective({ auto_clockin_suppressed: false, auto_clockin_suppressed_at: new Date() }), false);
+  assert.equal(isSuppressionEffective(null), false);
+});
+
+test("isSuppressionEffective is true when the flag was set recently", () => {
+  const recent = new Date(Date.now() - 60 * 60 * 1000); // 1 hour ago
+  assert.equal(isSuppressionEffective({ auto_clockin_suppressed: true, auto_clockin_suppressed_at: recent }), true);
+});
+
+test("isSuppressionEffective is false once the flag is more than 12 hours old", () => {
+  const stale = new Date(Date.now() - 13 * 60 * 60 * 1000); // 13 hours ago
+  assert.equal(isSuppressionEffective({ auto_clockin_suppressed: true, auto_clockin_suppressed_at: stale }), false);
+});
+
+test("isSuppressionEffective fails open (true) for a pre-migration row with no timestamp", () => {
+  assert.equal(isSuppressionEffective({ auto_clockin_suppressed: true, auto_clockin_suppressed_at: null }), true);
 });
 
 test("clearAutoClockinSuppressed sets the flag false for the given employee", async () => {
