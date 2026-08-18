@@ -2987,6 +2987,66 @@ router.get("/reports/labor-breakdown", async (req, res) => {
   }
 });
 
+// GET /api/admin/reports/labor-breakdown/weekly?employee_id=...&start=YYYY-MM-DD&end=YYYY-MM-DD
+// Same idea as /reports/labor-breakdown above, but for one employee, split
+// into Sunday-through-Saturday weeks -- powers tapping an employee inside
+// the Labor hours breakdown sheet to see week-by-week cost. Postgres's
+// EXTRACT(DOW ...) returns 0 for Sunday through 6 for Saturday, so
+// subtracting that many days from any date always lands on that date's
+// Sunday, regardless of what day `start` itself falls on or where a shift
+// falls within the week.
+router.get("/reports/labor-breakdown/weekly", async (req, res) => {
+  try {
+    const { employee_id, start, end } = req.query;
+    if (!employee_id || !start || !end) {
+      return res.status(400).json({ error: "employee_id, start, and end are required" });
+    }
+
+    const emp = await db.query(
+      `SELECT hourly_rate FROM employees WHERE id = $1 AND company_id = $2`,
+      [employee_id, req.companyId]
+    );
+    if (emp.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+    const rate = emp.rows[0].hourly_rate === null ? null : Number(emp.rows[0].hourly_rate);
+
+    const result = await db.query(
+      `SELECT (d.clock_in::date - (EXTRACT(DOW FROM d.clock_in::date))::int * INTERVAL '1 day')::date AS week_start,
+              SUM(d.worked_seconds) AS total_seconds
+       FROM time_entry_durations d
+       WHERE d.employee_id = $1 AND d.clock_in >= $2::date AND d.clock_in < ($3::date + INTERVAL '1 day')
+       GROUP BY week_start
+       ORDER BY week_start`,
+      [employee_id, start, end]
+    );
+
+    // Formatted with local Date getters (not toISOString/UTC methods) on
+    // purpose -- pg parses a DATE column into a Date built from local-time
+    // components, so reading it back with local getters is the only way to
+    // reliably get the same YYYY-MM-DD out regardless of server timezone.
+    function ymd(d) {
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      return `${y}-${m}-${day}`;
+    }
+
+    res.json(result.rows.map(function(r) {
+      const hours = Number(r.total_seconds) / 3600;
+      const weekEnd = new Date(r.week_start.getFullYear(), r.week_start.getMonth(), r.week_start.getDate() + 6);
+      return {
+        week_start: ymd(r.week_start),
+        week_end: ymd(weekEnd),
+        hours: hours,
+        hourly_rate: rate,
+        cost: rate === null ? 0 : hours * rate,
+      };
+    }));
+  } catch (err) {
+    console.error("GET /admin/reports/labor-breakdown/weekly failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't load weekly labor breakdown." });
+  }
+});
+
 // GET /api/admin/reports/payments?start=YYYY-MM-DD&end=YYYY-MM-DD
 // One row per payment recorded against an invoice in this date range --
 // pulled from the invoice_payments ledger, not invoices.total/status='paid'
@@ -4210,6 +4270,26 @@ router.post("/chat/:employeeId/messages", async (req, res) => {
   }
 });
 
+// DELETE /api/admin/chat/:employeeId
+// Clears the whole direct conversation with this employee -- deletes every
+// chat_messages row for them. The thread itself isn't a separate row (see
+// GET /chat/threads above -- it's derived per-employee), so this just wipes
+// the messages; the employee still shows up to start a fresh conversation
+// with any time.
+router.delete("/chat/:employeeId", async (req, res) => {
+  try {
+    const { employeeId } = req.params;
+    const employee = await db.query(`SELECT id FROM employees WHERE id = $1 AND company_id = $2`, [employeeId, req.companyId]);
+    if (employee.rowCount === 0) return res.status(404).json({ error: "Employee not found" });
+
+    await db.query(`DELETE FROM chat_messages WHERE employee_id = $1`, [employeeId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /admin/chat/:employeeId failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't delete conversation." });
+  }
+});
+
 // POST /api/admin/chat/:employeeId/typing
 router.post("/chat/:employeeId/typing", async (req, res) => {
   try {
@@ -4428,6 +4508,29 @@ router.post("/team-chat/threads/:id/messages", async (req, res) => {
   } catch (err) {
     console.error("POST /admin/team-chat/threads/:id/messages failed:", err);
     res.status(500).json({ error: err.message || "Couldn't send message." });
+  }
+});
+
+// DELETE /api/admin/team-chat/threads/:id
+// Deletes the whole thread for everyone in it -- messages and participant
+// rows cascade-delete along with it. Only works if the admin is actually a
+// participant of this thread.
+router.delete("/team-chat/threads/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const participant = await db.query(
+      `SELECT p.id FROM employee_chat_participants p
+       JOIN employee_chat_threads t ON t.id = p.thread_id
+       WHERE p.thread_id = $1 AND p.is_admin = true AND t.company_id = $2`,
+      [id, req.companyId]
+    );
+    if (participant.rowCount === 0) return res.status(404).json({ error: "Chat not found" });
+
+    await db.query(`DELETE FROM employee_chat_threads WHERE id = $1`, [id]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /admin/team-chat/threads/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't delete chat." });
   }
 });
 

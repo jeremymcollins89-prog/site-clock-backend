@@ -255,6 +255,28 @@ router.post("/threads/:id/messages", async (req, res) => {
   }
 });
 
+// DELETE /api/team-chat/threads/:id
+// Deletes the whole thread (DM or group) for everyone in it, not just this
+// employee -- messages and participant rows cascade-delete along with it
+// (ON DELETE CASCADE on employee_chat_participants/employee_chat_messages,
+// see schema-employee-chat-v2.sql). Only a participant can delete it.
+router.delete("/threads/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const participant = await db.query(
+      `SELECT 1 FROM employee_chat_participants WHERE thread_id = $1 AND employee_id = $2`,
+      [id, req.employee.employee_id]
+    );
+    if (participant.rowCount === 0) return res.status(404).json({ error: "Chat not found" });
+
+    await db.query(`DELETE FROM employee_chat_threads WHERE id = $1`, [id]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /team-chat/threads/:id failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't delete chat." });
+  }
+});
+
 // POST /api/team-chat/threads/:id/typing
 // Fire-and-forget "I'm typing right now" ping, throttled client-side.
 router.post("/threads/:id/typing", async (req, res) => {

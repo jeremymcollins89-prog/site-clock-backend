@@ -77,6 +77,21 @@ router.post("/messages", async (req, res) => {
   }
 });
 
+// DELETE /api/chat/messages
+// Clears the employee's own direct conversation with the office -- deletes
+// every chat_messages row for this employee, not just their own messages
+// (a "delete this conversation" action, not "delete my messages"). There's
+// only ever one thread per employee here, so no thread id is needed.
+router.delete("/messages", async (req, res) => {
+  try {
+    await db.query(`DELETE FROM chat_messages WHERE employee_id = $1`, [req.employee.employee_id]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /chat/messages failed:", err);
+    res.status(500).json({ error: err.message || "Couldn't delete conversation." });
+  }
+});
+
 // POST /api/chat/typing
 // Fire-and-forget "I'm typing right now" ping -- the client calls this
 // (throttled) while the employee has text in the composer. No body needed;
