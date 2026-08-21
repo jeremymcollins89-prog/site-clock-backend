@@ -56,6 +56,12 @@ function fmtTime(d, timezone) {
 // the employee actually saw when they clocked in/out.
 async function sendTimesheetEmail({ employee, period, entries, payrollEmail, autoSubmitted = false, timezone }) {
   const totalSeconds = entries.reduce((s, e) => s + Number(e.worked_seconds || 0), 0);
+  const travelSeconds = entries
+    .filter((e) => e.location_type === "traveling")
+    .reduce((s, e) => s + Number(e.worked_seconds || 0), 0);
+  const inTownSeconds = entries
+    .filter((e) => e.location_type === "in_town")
+    .reduce((s, e) => s + Number(e.worked_seconds || 0), 0);
 
   const rows = entries
     .map(
@@ -87,6 +93,20 @@ async function sendTimesheetEmail({ employee, period, entries, payrollEmail, aut
           </tr>
         </thead>
         <tbody>${rows}</tbody>
+        <tfoot>
+          <tr style="border-top: 1px solid #ccc;">
+            <td colspan="4" style="padding:6px 8px; text-align:right;">In town total</td>
+            <td style="padding:6px 8px;">${fmtDuration(inTownSeconds)}</td>
+          </tr>
+          <tr>
+            <td colspan="4" style="padding:6px 8px; text-align:right;">Traveling total</td>
+            <td style="padding:6px 8px;">${fmtDuration(travelSeconds)}</td>
+          </tr>
+          <tr style="font-weight:bold;">
+            <td colspan="4" style="padding:6px 8px; text-align:right;">Total</td>
+            <td style="padding:6px 8px;">${fmtDuration(totalSeconds)}</td>
+          </tr>
+        </tfoot>
       </table>
     </div>
   `;
